@@ -45,6 +45,22 @@ type sizer interface {
 	Size() int
 }
 
+// REDQuerier는 RED 메트릭 집계를 지원하는 저장소 인터페이스다.
+// ClickHouseTraceStore가 구현하며, 메모리 스토어는 구현하지 않는다.
+type REDQuerier interface {
+	QueryRED(ctx context.Context, service string, fromMs, toMs int64) ([]map[string]any, error)
+}
+
+// TopologyQuerier는 서비스 토폴로지 조회를 지원하는 저장소 인터페이스다.
+type TopologyQuerier interface {
+	QueryTopology(ctx context.Context, fromMs, toMs int64) ([]map[string]any, error)
+}
+
+// ErrorLogQuerier는 에러 로그 집계를 지원하는 저장소 인터페이스다.
+type ErrorLogQuerier interface {
+	QueryErrorLogs(ctx context.Context, service string, fromMs, toMs int64) ([]map[string]any, error)
+}
+
 // HTTPServer는 OTLP/HTTP 수신 + REST 조회 API + 운영 엔드포인트 서버다.
 type HTTPServer struct {
 	ingester    *ingester.Ingester
@@ -78,6 +94,10 @@ func NewHTTPServer(addr string, ing *ingester.Ingester,
 	mux.HandleFunc("/api/collector/metrics", s.queryMetrics)
 	mux.HandleFunc("/api/collector/logs", s.queryLogs)
 	mux.HandleFunc("/api/collector/stats", s.stats)
+	// 대시보드용 집계 엔드포인트 (ClickHouse MV 기반)
+	mux.HandleFunc("/api/collector/red", s.queryRED)
+	mux.HandleFunc("/api/collector/topology", s.queryTopology)
+	mux.HandleFunc("/api/collector/error-logs", s.queryErrorLogs)
 
 	// 운영 엔드포인트
 	// /healthz: liveness probe — 프로세스가 살아있으면 200
@@ -187,8 +207,17 @@ func (s *HTTPServer) queryTraces(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	limit := queryLimit(r)
-	spans, err := s.traceStore.QuerySpans(r.Context(), limit)
+	setCORSHeaders(w)
+	q := store.SpanQuery{
+		Limit:         queryLimit(r),
+		FromMs:        queryInt64(r, "from"),
+		ToMs:          queryInt64(r, "to"),
+		ServiceName:   r.URL.Query().Get("service"),
+		TraceID:       r.URL.Query().Get("trace_id"),
+		StatusCode:    queryStatusCode(r),
+		MinDurationMs: queryInt64(r, "min_duration_ms"),
+	}
+	spans, err := s.traceStore.QuerySpans(r.Context(), q)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -201,8 +230,15 @@ func (s *HTTPServer) queryMetrics(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	limit := queryLimit(r)
-	metrics, err := s.metricStore.QueryMetrics(r.Context(), limit)
+	setCORSHeaders(w)
+	q := store.MetricQuery{
+		Limit:       queryLimit(r),
+		FromMs:      queryInt64(r, "from"),
+		ToMs:        queryInt64(r, "to"),
+		ServiceName: r.URL.Query().Get("service"),
+		Name:        r.URL.Query().Get("name"),
+	}
+	metrics, err := s.metricStore.QueryMetrics(r.Context(), q)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -215,13 +251,101 @@ func (s *HTTPServer) queryLogs(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	limit := queryLimit(r)
-	logs, err := s.logStore.QueryLogs(r.Context(), limit)
+	setCORSHeaders(w)
+	q := store.LogQuery{
+		Limit:        queryLimit(r),
+		FromMs:       queryInt64(r, "from"),
+		ToMs:         queryInt64(r, "to"),
+		ServiceName:  r.URL.Query().Get("service"),
+		SeverityText: r.URL.Query().Get("severity"),
+		TraceID:      r.URL.Query().Get("trace_id"),
+	}
+	logs, err := s.logStore.QueryLogs(r.Context(), q)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, logs)
+}
+
+// queryRED는 서비스별 RED 메트릭 (요청률/에러율/레이턴시)을 반환한다.
+// GET /api/collector/red?service=my-svc&from=<ms>&to=<ms>
+func (s *HTTPServer) queryRED(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	setCORSHeaders(w)
+
+	querier, ok := s.traceStore.(REDQuerier)
+	if !ok {
+		http.Error(w, "RED metrics not available (requires ClickHouse)", http.StatusNotImplemented)
+		return
+	}
+
+	result, err := querier.QueryRED(r.Context(),
+		r.URL.Query().Get("service"),
+		queryInt64(r, "from"),
+		queryInt64(r, "to"),
+	)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, result)
+}
+
+// queryTopology는 서비스 간 호출 관계 (토폴로지 맵)를 반환한다.
+// GET /api/collector/topology?from=<ms>&to=<ms>
+func (s *HTTPServer) queryTopology(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	setCORSHeaders(w)
+
+	querier, ok := s.traceStore.(TopologyQuerier)
+	if !ok {
+		http.Error(w, "topology not available (requires ClickHouse)", http.StatusNotImplemented)
+		return
+	}
+
+	result, err := querier.QueryTopology(r.Context(),
+		queryInt64(r, "from"),
+		queryInt64(r, "to"),
+	)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, result)
+}
+
+// queryErrorLogs는 서비스별 에러 로그 집계를 반환한다.
+// GET /api/collector/error-logs?service=my-svc&from=<ms>&to=<ms>
+func (s *HTTPServer) queryErrorLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	setCORSHeaders(w)
+
+	querier, ok := s.logStore.(ErrorLogQuerier)
+	if !ok {
+		http.Error(w, "error log aggregation not available (requires ClickHouse)", http.StatusNotImplemented)
+		return
+	}
+
+	result, err := querier.QueryErrorLogs(r.Context(),
+		r.URL.Query().Get("service"),
+		queryInt64(r, "from"),
+		queryInt64(r, "to"),
+	)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, result)
 }
 
 func (s *HTTPServer) stats(w http.ResponseWriter, r *http.Request) {
@@ -285,6 +409,40 @@ func queryLimit(r *http.Request) int {
 		return defaultLimit
 	}
 	return n
+}
+
+func queryInt64(r *http.Request, key string) int64 {
+	s := r.URL.Query().Get(key)
+	if s == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// queryStatusCode는 ?status=ok|error|unset 을 int32로 변환한다.
+// 지정되지 않으면 -1(필터 없음)을 반환한다.
+func queryStatusCode(r *http.Request) int32 {
+	switch r.URL.Query().Get("status") {
+	case "unset":
+		return 0
+	case "ok":
+		return 1
+	case "error":
+		return 2
+	default:
+		return -1
+	}
+}
+
+// setCORSHeaders는 대시보드(브라우저)에서 직접 쿼리할 수 있도록 CORS 헤더를 설정한다.
+func setCORSHeaders(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 }
 
 func storeSize(s any) int {

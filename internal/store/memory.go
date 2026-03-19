@@ -81,8 +81,38 @@ func (s *MemoryTraceStore) AppendSpans(_ context.Context, spans []*model.SpanDat
 	return nil
 }
 
-func (s *MemoryTraceStore) QuerySpans(_ context.Context, limit int) ([]*model.SpanData, error) {
-	return s.buf.latest(limit), nil
+func (s *MemoryTraceStore) QuerySpans(_ context.Context, q SpanQuery) ([]*model.SpanData, error) {
+	if q.Limit <= 0 {
+		q.Limit = 100
+	}
+	// 충분히 가져온 뒤 메모리에서 필터링한다.
+	candidates := s.buf.latest(q.Limit * 10)
+	var result []*model.SpanData
+	for _, sp := range candidates {
+		if q.FromMs > 0 && sp.ReceivedAtMs < q.FromMs {
+			continue
+		}
+		if q.ToMs > 0 && sp.ReceivedAtMs > q.ToMs {
+			continue
+		}
+		if q.ServiceName != "" && sp.ServiceName != q.ServiceName {
+			continue
+		}
+		if q.TraceID != "" && sp.TraceID != q.TraceID {
+			continue
+		}
+		if q.StatusCode >= 0 && sp.StatusCode != q.StatusCode {
+			continue
+		}
+		if q.MinDurationMs > 0 && sp.DurationNano() < q.MinDurationMs*1_000_000 {
+			continue
+		}
+		result = append(result, sp)
+		if len(result) >= q.Limit {
+			break
+		}
+	}
+	return result, nil
 }
 
 func (s *MemoryTraceStore) Close() error { return nil }
@@ -105,8 +135,31 @@ func (s *MemoryMetricStore) AppendMetrics(_ context.Context, metrics []*model.Me
 	return nil
 }
 
-func (s *MemoryMetricStore) QueryMetrics(_ context.Context, limit int) ([]*model.MetricData, error) {
-	return s.buf.latest(limit), nil
+func (s *MemoryMetricStore) QueryMetrics(_ context.Context, q MetricQuery) ([]*model.MetricData, error) {
+	if q.Limit <= 0 {
+		q.Limit = 100
+	}
+	candidates := s.buf.latest(q.Limit * 10)
+	var result []*model.MetricData
+	for _, m := range candidates {
+		if q.FromMs > 0 && m.ReceivedAtMs < q.FromMs {
+			continue
+		}
+		if q.ToMs > 0 && m.ReceivedAtMs > q.ToMs {
+			continue
+		}
+		if q.ServiceName != "" && m.ServiceName != q.ServiceName {
+			continue
+		}
+		if q.Name != "" && m.Name != q.Name {
+			continue
+		}
+		result = append(result, m)
+		if len(result) >= q.Limit {
+			break
+		}
+	}
+	return result, nil
 }
 
 func (s *MemoryMetricStore) Close() error { return nil }
@@ -129,8 +182,34 @@ func (s *MemoryLogStore) AppendLogs(_ context.Context, logs []*model.LogData) er
 	return nil
 }
 
-func (s *MemoryLogStore) QueryLogs(_ context.Context, limit int) ([]*model.LogData, error) {
-	return s.buf.latest(limit), nil
+func (s *MemoryLogStore) QueryLogs(_ context.Context, q LogQuery) ([]*model.LogData, error) {
+	if q.Limit <= 0 {
+		q.Limit = 100
+	}
+	candidates := s.buf.latest(q.Limit * 10)
+	var result []*model.LogData
+	for _, l := range candidates {
+		if q.FromMs > 0 && l.ReceivedAtMs < q.FromMs {
+			continue
+		}
+		if q.ToMs > 0 && l.ReceivedAtMs > q.ToMs {
+			continue
+		}
+		if q.ServiceName != "" && l.ServiceName != q.ServiceName {
+			continue
+		}
+		if q.SeverityText != "" && l.SeverityText != q.SeverityText {
+			continue
+		}
+		if q.TraceID != "" && l.TraceID != q.TraceID {
+			continue
+		}
+		result = append(result, l)
+		if len(result) >= q.Limit {
+			break
+		}
+	}
+	return result, nil
 }
 
 func (s *MemoryLogStore) Close() error { return nil }

@@ -1,4 +1,4 @@
-.PHONY: build run test lint docker-build docker-up docker-down dev
+.PHONY: build run test lint docker-build docker-up docker-down dev run-dev run-sampling run-prod
 
 BINARY := javi-collector
 BUILD_FLAGS := -trimpath -ldflags="-s -w"
@@ -32,6 +32,15 @@ docker-down:
 # ClickHouse만 실행 (로컬 개발용)
 ch-up:
 	docker compose up -d clickhouse
+
+run-dev:
+	./scripts/run.sh dev
+
+run-sampling:
+	./scripts/run.sh sampling
+
+run-prod:
+	./scripts/run.sh prod
 
 clean:
 	rm -f $(BINARY)

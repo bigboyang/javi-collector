@@ -24,6 +24,7 @@ import (
 
 	"github.com/kkc/javi-collector/internal/decoder"
 	"github.com/kkc/javi-collector/internal/model"
+	"github.com/kkc/javi-collector/internal/rag"
 	"github.com/kkc/javi-collector/internal/store"
 )
 
@@ -64,6 +65,8 @@ type Ingester struct {
 	traceStore  store.TraceStore
 	metricStore store.MetricStore
 	logStore    store.LogStore
+	embedPipe   *rag.EmbedPipeline    // nil이면 RAG 비활성화
+	docBuilder  rag.DocumentBuilder
 
 	// atomic 카운터: /api/collector/stats 조회용 (단조 증가, reset 없음)
 	traceReceived  atomic.Int64
@@ -72,8 +75,14 @@ type Ingester struct {
 }
 
 // New는 Ingester를 생성한다.
-func New(ts store.TraceStore, ms store.MetricStore, ls store.LogStore) *Ingester {
-	return &Ingester{traceStore: ts, metricStore: ms, logStore: ls}
+// embedPipeline은 nil이면 RAG 기능이 비활성화된다.
+func New(ts store.TraceStore, ms store.MetricStore, ls store.LogStore, embedPipeline *rag.EmbedPipeline) *Ingester {
+	return &Ingester{
+		traceStore:  ts,
+		metricStore: ms,
+		logStore:    ls,
+		embedPipe:   embedPipeline,
+	}
 }
 
 // ---- HTTP 경로: protobuf bytes 입력 ----
@@ -154,6 +163,18 @@ func (ing *Ingester) storeSpans(ctx context.Context, spans []*model.SpanData) (i
 	ing.traceReceived.Add(n)
 	spansIngestedTotal.Add(float64(n))
 	slog.Debug("traces ingested", "spans", n)
+
+	// RAG 파이프라인: ERROR span을 비동기로 임베딩 큐에 제출 (non-blocking)
+	if ing.embedPipe != nil {
+		for _, sp := range spans {
+			if sp.StatusCode == 2 { // 2=ERROR
+				if doc := ing.docBuilder.BuildFromSpan(sp, nil); doc != nil {
+					ing.embedPipe.Submit(doc)
+				}
+			}
+		}
+	}
+
 	return int(n), nil
 }
 

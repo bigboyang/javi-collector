@@ -13,6 +13,8 @@ import (
 
 	"github.com/kkc/javi-collector/internal/config"
 	"github.com/kkc/javi-collector/internal/ingester"
+	"github.com/kkc/javi-collector/internal/rag"
+	"github.com/kkc/javi-collector/internal/sampling"
 	"github.com/kkc/javi-collector/internal/server"
 	"github.com/kkc/javi-collector/internal/store"
 )
@@ -50,6 +52,7 @@ func main() {
 			BatchSize:     cfg.BatchSize,
 			FlushInterval: cfg.FlushInterval,
 			ChanBuffer:    cfg.ChannelBufferSize,
+			RetentionDays: cfg.RetentionDays,
 		}
 
 		ts, err := store.NewClickHouseTraceStore(chCfg)
@@ -83,9 +86,60 @@ func main() {
 		)
 	}
 
+	// Signal context: SIGINT/SIGTERM 수신 시 취소된다.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Tail Sampling + Adaptive Sampling 설정
+	// SAMPLING_ENABLED=false(기본)이면 TailSamplingStore는 전량 통과(no-op) 모드로 동작한다.
+	// REMOTE_CONFIG_URL이 설정되면 주기적으로 SamplingConfig를 폴링해 동적으로 반영한다.
+	initSamplingCfg := sampling.NewDefaultConfig(cfg.SamplingEnabled)
+	poller := sampling.NewRemoteConfigPoller(
+		cfg.RemoteConfigURL,
+		cfg.RemoteConfigPollInterval,
+		initSamplingCfg,
+	)
+	poller.Start(ctx)
+
+	tailStore := sampling.NewTailSamplingStore(traceStore, poller)
+	tailStore.Start(ctx)
+	tailStore.WatchConfig(poller.OnChange())
+
+	slog.Info("sampling initialized",
+		"enabled", cfg.SamplingEnabled,
+		"remote_config_url", cfg.RemoteConfigURL,
+		"poll_interval", cfg.RemoteConfigPollInterval,
+	)
+
+	// RAG 파이프라인 초기화 (EMBED_ENABLED=true 시)
+	// Ollama(nomic-embed-text) → Qdrant 벡터 저장 → 자연어 장애 검색
+	var embedPipeline *rag.EmbedPipeline
+	if cfg.EmbedEnabled {
+		embedClient := rag.NewOllamaEmbedClient(cfg.EmbedEndpoint, cfg.EmbedModel)
+		qdrantClient := rag.NewQdrantClient(cfg.QdrantEndpoint, cfg.QdrantCollection)
+		if err := qdrantClient.EnsureCollection(ctx, 768); err != nil {
+			slog.Warn("qdrant collection init failed (RAG disabled)", "err", err)
+		} else {
+			embedPipeline = rag.NewEmbedPipeline(embedClient, qdrantClient, 1024, 32, 10*time.Second)
+			embedPipeline.Start(ctx)
+			slog.Info("RAG embed pipeline started",
+				"endpoint", cfg.EmbedEndpoint,
+				"model", cfg.EmbedModel,
+				"qdrant", cfg.QdrantEndpoint,
+			)
+		}
+	}
+
+	ing := ingester.New(tailStore, metricStore, logStore, embedPipeline)
+
 	defer func() {
-		if err := traceStore.Close(); err != nil {
-			slog.Warn("trace store close error", "err", err)
+		if embedPipeline != nil {
+			embedPipeline.Close()
+		}
+		poller.Stop()
+		// tailStore.Close()가 내부적으로 downstream(traceStore)을 닫는다.
+		if err := tailStore.Close(); err != nil {
+			slog.Warn("tail store close error", "err", err)
 		}
 		if err := metricStore.Close(); err != nil {
 			slog.Warn("metric store close error", "err", err)
@@ -95,8 +149,6 @@ func main() {
 		}
 	}()
 
-	ing := ingester.New(traceStore, metricStore, logStore)
-
 	// HTTP 서버 (OTLP/HTTP + REST API + /healthz + /readyz + /metrics)
 	httpAddr := ":" + strconv.Itoa(cfg.HTTPPort)
 	httpSrv := server.NewHTTPServer(httpAddr, ing, traceStore, metricStore, logStore)
@@ -104,9 +156,6 @@ func main() {
 	// gRPC 서버 (OTLP/gRPC + Health + Reflection)
 	grpcAddr := ":" + strconv.Itoa(cfg.GRPCPort)
 	grpcSrv := server.NewGRPCServer(grpcAddr, ing)
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	// HTTP 서버 시작
 	go func() {

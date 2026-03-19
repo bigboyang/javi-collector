@@ -87,12 +87,20 @@ func convertNumberDataPoints(dps []*metricsv1.NumberDataPoint) []model.DataPoint
 func convertHistogramDataPoints(dps []*metricsv1.HistogramDataPoint) []model.DataPoint {
 	points := make([]model.DataPoint, 0, len(dps))
 	for _, dp := range dps {
+		// BucketCounts: P95/P99 계산에 필수. 기존 코드에서 유실되던 데이터.
+		// OTLP spec: bucket_counts[i] = 해당 bucket의 누적 카운트 (not cumulative)
+		buckets := make([]uint64, len(dp.BucketCounts))
+		for i, c := range dp.BucketCounts {
+			buckets[i] = c
+		}
 		points = append(points, model.DataPoint{
 			Attributes:     convertAttrs(dp.Attributes),
 			StartTimeNanos: int64(dp.StartTimeUnixNano),
 			TimeNanos:      int64(dp.TimeUnixNano),
 			Count:          int64(dp.Count),
 			Sum:            dp.GetSum(),
+			BucketCounts:   buckets,
+			ExplicitBounds: dp.ExplicitBounds,
 		})
 	}
 	return points
