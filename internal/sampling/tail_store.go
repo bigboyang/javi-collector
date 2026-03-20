@@ -120,10 +120,25 @@ func (ts *TailSamplingStore) QuerySpans(ctx context.Context, q store.SpanQuery) 
 	return ts.downstream.QuerySpans(ctx, q)
 }
 
-// Close는 goroutine을 중단하고 downstream을 닫는다.
+// Close는 goroutine을 중단하고, 버퍼 잔여 trace를 force-flush한 뒤 downstream을 닫는다.
+//
+// 종료 순서:
+//  1. stopCh 닫기 → expiryLoop 종료 신호
+//  2. doneCh 대기 → expiryLoop 완전 종료 확인
+//  3. FlushAll() → timeout 미만 잔여 trace 즉시 flush
+//  4. Wait() → 모든 in-flight onFlush goroutine 완료 대기
+//  5. downstream.Close()
 func (ts *TailSamplingStore) Close() error {
 	close(ts.stopCh)
-	<-ts.doneCh
+	<-ts.doneCh // expiryLoop 종료 보장 — 이후 FlushExpired 호출 없음
+
+	remaining := ts.buffer.Size()
+	if remaining > 0 {
+		slog.Info("tail sampler force-flushing remaining traces on shutdown", "traces", remaining)
+	}
+	ts.buffer.FlushAll() // 잔여 trace 방출 (만료 여부 무관)
+	ts.buffer.Wait()     // in-flight onFlush goroutine 완료 대기
+
 	return ts.downstream.Close()
 }
 

@@ -48,6 +48,7 @@ func (h *expiryHeap) Pop() any {
 //   - root span 수신 후 grace period 경과 시 즉시 flush (tryFlushComplete)
 //   - timeout 경과 시 expiryLoop에서 FlushExpired 호출
 //   - 버퍼 용량 초과 시 가장 오래된 trace 강제 flush
+//   - 프로세스 종료 시 FlushAll → Wait 호출로 잔여 trace 보장 전송
 type traceBuffer struct {
 	mu      sync.Mutex
 	entries map[string]*traceEntry
@@ -59,6 +60,10 @@ type traceBuffer struct {
 	// onFlush는 결정이 완료된 spans를 받는다.
 	// traceBuffer는 keep/drop 결정을 모른다 — 호출자(TailSamplingStore)가 담당.
 	onFlush func(spans []*model.SpanData)
+
+	// wg는 in-flight onFlush goroutine을 추적한다.
+	// Wait()로 모든 goroutine 완료를 보장할 수 있다.
+	wg sync.WaitGroup
 }
 
 func newTraceBuffer(maxSize int, timeout time.Duration, onFlush func([]*model.SpanData)) *traceBuffer {
@@ -146,14 +151,22 @@ func (b *traceBuffer) flushEntry(traceID string, entry *traceEntry) {
 		heap.Remove(&b.expHeap, entry.heapIdx)
 	}
 	spans := entry.spans
-	go b.onFlush(spans)
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		b.onFlush(spans)
+	}()
 }
 
 // flushEntryNoHeapRemove는 heap.Pop으로 이미 heap에서 제거된 entry를 flush할 때 사용한다.
 func (b *traceBuffer) flushEntryNoHeapRemove(traceID string, entry *traceEntry) {
 	delete(b.entries, traceID)
 	spans := entry.spans
-	go b.onFlush(spans)
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		b.onFlush(spans)
+	}()
 }
 
 // flushOldest는 heap의 root(가장 오래된 trace)를 강제 flush한다.
@@ -166,6 +179,33 @@ func (b *traceBuffer) flushOldest() {
 	if _, exists := b.entries[oldest.traceID]; exists {
 		b.flushEntryNoHeapRemove(oldest.traceID, oldest)
 	}
+}
+
+// FlushAll은 만료 여부와 관계없이 버퍼에 남은 모든 trace를 즉시 flush한다.
+// 프로세스 종료 시 expiryLoop 종료 후 호출해 데이터 유실을 방지한다.
+// Wait()를 함께 호출해 모든 in-flight goroutine 완료를 보장해야 한다.
+func (b *traceBuffer) FlushAll() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// heap 초기화 — 이후 entry 접근 시 heap 인덱스 참조를 방지한다.
+	b.expHeap = b.expHeap[:0]
+
+	for id, entry := range b.entries {
+		delete(b.entries, id)
+		spans := entry.spans
+		b.wg.Add(1)
+		go func() {
+			defer b.wg.Done()
+			b.onFlush(spans)
+		}()
+	}
+}
+
+// Wait는 모든 in-flight onFlush goroutine이 완료될 때까지 블록한다.
+// FlushAll 호출 후 downstream.Close() 전에 반드시 호출해야 한다.
+func (b *traceBuffer) Wait() {
+	b.wg.Wait()
 }
 
 // Size는 현재 버퍼에 보관 중인 trace 수를 반환한다.
