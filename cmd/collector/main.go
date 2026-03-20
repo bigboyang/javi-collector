@@ -45,15 +45,17 @@ func main() {
 		logStore = store.NewMemoryLogStore(cfg.MemoryBufferSize)
 	} else {
 		chCfg := store.ClickHouseConfig{
-			Addr:          cfg.ClickHouseAddr,
-			Database:      cfg.ClickHouseDB,
-			Username:      cfg.ClickHouseUser,
-			Password:      cfg.ClickHousePassword,
-			BatchSize:     cfg.BatchSize,
-			FlushInterval: cfg.FlushInterval,
-			ChanBuffer:    cfg.ChannelBufferSize,
-			RetentionDays: cfg.RetentionDays,
-			DLQDir:        cfg.DLQDir,
+			Addr:               cfg.ClickHouseAddr,
+			Database:           cfg.ClickHouseDB,
+			Username:           cfg.ClickHouseUser,
+			Password:           cfg.ClickHousePassword,
+			BatchSize:          cfg.BatchSize,
+			FlushInterval:      cfg.FlushInterval,
+			ChanBuffer:         cfg.ChannelBufferSize,
+			RetentionDays:      cfg.RetentionDays,
+			DLQDir:             cfg.DLQDir,
+			CBFailureThreshold: cfg.CBFailureThreshold,
+			CBCooldown:         cfg.CBCooldown,
 		}
 
 		// 상용 APM 패턴: 하나의 공유 커넥션 풀을 세 Store가 공유한다.
@@ -130,6 +132,20 @@ func main() {
 		"remote_config_url", cfg.RemoteConfigURL,
 		"poll_interval", cfg.RemoteConfigPollInterval,
 	)
+
+	// DLQ 자동 재적재 & 보관 기간 정리
+	// ClickHouse가 활성화돼 있고 DLQDir이 설정된 경우에만 실행한다.
+	// 재적재는 전날 이전 파일만 대상으로 하며, Sampling을 우회해 traceStore에 직접 쓴다.
+	if !cfg.DisableClickHouse && cfg.DLQDir != "" {
+		store.CleanupDLQFiles(cfg.DLQDir, cfg.DLQRetentionDays)
+		replayer := store.NewDLQReplayer(cfg.DLQDir, traceStore, metricStore, logStore, cfg.DLQReplayInterval)
+		replayer.Start(ctx)
+		slog.Info("DLQ replayer started",
+			"dir", cfg.DLQDir,
+			"replay_interval", cfg.DLQReplayInterval,
+			"retention_days", cfg.DLQRetentionDays,
+		)
+	}
 
 	// RAG 파이프라인 초기화 (EMBED_ENABLED=true 시)
 	// Ollama(nomic-embed-text) → Qdrant 벡터 저장 → 자연어 장애 검색

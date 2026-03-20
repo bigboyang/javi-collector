@@ -65,8 +65,20 @@ type Config struct {
 
 	// DLQDir: ClickHouse flush 실패 시 배치를 보존할 Dead Letter Queue 디렉터리.
 	// 비어 있으면 DLQ 비활성화 (flush 실패 데이터 유실 허용).
-	// DLQ 파일은 ClickHouse 복구 후 수동 재적재(replay)에 사용 가능하다.
 	DLQDir string
+
+	// DLQ 보관 기간 (일). 이 기간보다 오래된 JSONL 파일은 자동 삭제된다.
+	// 0 이면 자동 삭제 비활성화.
+	DLQRetentionDays int
+
+	// DLQ 자동 재적재 주기. 기동 시 한 번 실행 후 이 간격으로 반복한다.
+	// 0 이면 기동 시 한 번만 실행.
+	DLQReplayInterval time.Duration
+
+	// Circuit Breaker: 연속 flush 실패 시 ClickHouse flush를 일시 차단한다.
+	// CBFailureThreshold=0 이면 비활성화.
+	CBFailureThreshold int
+	CBCooldown         time.Duration // Open 상태 유지 시간 (기본 60s)
 }
 
 // Load는 환경변수에서 설정을 읽어 Config를 반환한다.
@@ -96,6 +108,10 @@ func Load() (*Config, error) {
 		BackupEnabled:            envBool("BACKUP_ENABLED", false),
 		BackupDir:                envStr("BACKUP_DIR", "./backup"),
 		DLQDir:                   envStr("DLQ_DIR", "./dlq"),
+		DLQRetentionDays:         envInt("DLQ_RETENTION_DAYS", 7),
+		DLQReplayInterval:        envDuration("DLQ_REPLAY_INTERVAL", 5*time.Minute),
+		CBFailureThreshold:       envInt("CB_FAILURE_THRESHOLD", 5),
+		CBCooldown:               envDuration("CB_COOLDOWN", 60*time.Second),
 	}
 
 	if err := cfg.validate(); err != nil {
