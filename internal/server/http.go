@@ -169,7 +169,8 @@ func (s *HTTPServer) handleTraces(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		slog.Warn("trace ingest error", "err", err)
-		// backpressure: 503으로 클라이언트가 재시도하도록 유도
+		// backpressure: Retry-After로 클라이언트가 적절한 간격 후 재시도하도록 유도
+		w.Header().Set("Retry-After", "1")
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
@@ -195,6 +196,7 @@ func (s *HTTPServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		slog.Warn("metric ingest error", "err", err)
+		w.Header().Set("Retry-After", "1")
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
@@ -220,6 +222,7 @@ func (s *HTTPServer) handleLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		slog.Warn("log ingest error", "err", err)
+		w.Header().Set("Retry-After", "1")
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}

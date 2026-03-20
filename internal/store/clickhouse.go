@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
@@ -164,10 +165,11 @@ func retryFlush(table string, fn func() error) error {
 
 // ClickHouseTraceStore는 SpanData를 apm.spans 테이블에 배치 insert한다.
 type ClickHouseTraceStore struct {
-	conn driver.Conn // 공유 커넥션 풀 (소유권 없음 — Close()에서 닫지 않는다)
-	ch   chan *model.SpanData
-	cfg  ClickHouseConfig
-	done chan struct{}
+	conn    driver.Conn // 공유 커넥션 풀 (소유권 없음 — Close()에서 닫지 않는다)
+	ch      chan *model.SpanData
+	cfg     ClickHouseConfig
+	done    chan struct{}
+	flushWg sync.WaitGroup // 비동기 flush 완료 대기용
 }
 
 // NewClickHouseTraceStore는 공유 커넥션을 받아 테이블 DDL을 적용하고 batchWriter를 시작한다.
@@ -188,24 +190,23 @@ func NewClickHouseTraceStore(conn driver.Conn, cfg ClickHouseConfig) (*ClickHous
 }
 
 // AppendSpans는 spans를 채널에 enqueue한다.
+// TOCTOU 경쟁 방지: pre-check 없이 non-blocking send만 사용한다.
+// 일부 항목만 삽입되면 나머지는 chDroppedTotal에 계상하고 nil을 반환한다.
+// 채널이 완전히 꽉 차서 0개도 삽입되지 않은 경우에만 error를 반환한다 (→ 503).
 func (s *ClickHouseTraceStore) AppendSpans(_ context.Context, spans []*model.SpanData) error {
-	available := cap(s.ch) - len(s.ch)
-	if available < len(spans) {
-		chDroppedTotal.WithLabelValues("spans").Add(float64(len(spans)))
-		chChannelDepth.WithLabelValues("spans").Set(float64(len(s.ch)))
-		return fmt.Errorf("trace channel full (capacity=%d, available=%d, need=%d): backpressure",
-			cap(s.ch), available, len(spans))
-	}
+	inserted := 0
 	for _, sp := range spans {
 		select {
 		case s.ch <- sp:
+			inserted++
 		default:
 			chDroppedTotal.WithLabelValues("spans").Inc()
-			chChannelDepth.WithLabelValues("spans").Set(float64(len(s.ch)))
-			return fmt.Errorf("trace channel full during append: backpressure")
 		}
 	}
 	chChannelDepth.WithLabelValues("spans").Set(float64(len(s.ch)))
+	if inserted == 0 && len(spans) > 0 {
+		return fmt.Errorf("trace channel full (capacity=%d): backpressure", cap(s.ch))
+	}
 	return nil
 }
 
@@ -436,10 +437,16 @@ func (s *ClickHouseTraceStore) Close() error {
 	return nil
 }
 
-// batchWriter는 채널에서 span을 읽어 배치를 구성하고 ClickHouse에 insert한다.
-// panic recovery로 goroutine 비정상 종료를 방지한다.
+// batchWriter는 채널에서 span을 읽어 배치를 구성하고 ClickHouse에 비동기 insert한다.
+//
+// 핵심 개선: flush를 별도 goroutine에서 실행하여 batchWriter가 ClickHouse I/O와
+// retry sleep(1s→2s→4s) 동안 블록되지 않는다. 채널은 flush 중에도 계속 소비된다.
+// flushMu로 동시 flush를 직렬화해 ClickHouse 커넥션 pool 고갈을 방지한다.
 func (s *ClickHouseTraceStore) batchWriter() {
-	defer close(s.done)
+	defer func() {
+		s.flushWg.Wait() // 비동기 flush 완료 대기 후 done 시그널
+		close(s.done)
+	}()
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("clickhouse trace batchWriter panic recovered", "panic", r)
@@ -450,32 +457,42 @@ func (s *ClickHouseTraceStore) batchWriter() {
 	defer ticker.Stop()
 
 	batch := make([]*model.SpanData, 0, s.cfg.BatchSize)
+	var flushMu sync.Mutex // flush를 직렬화: ClickHouse에 동시에 1개만 전송
 
-	flush := func() {
-		if len(batch) == 0 {
+	doFlush := func(b []*model.SpanData) {
+		if len(b) == 0 {
 			return
 		}
-		if err := retryFlush("spans", func() error { return s.flushSpans(batch) }); err != nil {
-			chFlushErrorsTotal.WithLabelValues("spans").Inc()
-			slog.Error("clickhouse span flush failed (all retries exhausted)", "err", err, "count", len(batch))
-		}
-		batch = batch[:0]
+		s.flushWg.Add(1)
+		go func(data []*model.SpanData) {
+			defer s.flushWg.Done()
+			flushMu.Lock()
+			defer flushMu.Unlock()
+			if err := retryFlush("spans", func() error { return s.flushSpans(data) }); err != nil {
+				chFlushErrorsTotal.WithLabelValues("spans").Inc()
+				slog.Error("clickhouse span flush failed (all retries exhausted)", "err", err, "count", len(data))
+			}
+		}(b)
 	}
 
 	for {
 		select {
 		case sp, ok := <-s.ch:
 			if !ok {
-				flush()
+				doFlush(batch)
 				return
 			}
 			batch = append(batch, sp)
 			if len(batch) >= s.cfg.BatchSize {
-				flush()
+				doFlush(batch)
+				batch = make([]*model.SpanData, 0, s.cfg.BatchSize)
 			}
 
 		case <-ticker.C:
-			flush()
+			if len(batch) > 0 {
+				doFlush(batch)
+				batch = make([]*model.SpanData, 0, s.cfg.BatchSize)
+			}
 		}
 	}
 }
@@ -544,10 +561,11 @@ func (s *ClickHouseTraceStore) flushSpans(spans []*model.SpanData) error {
 
 // ClickHouseMetricStore는 MetricData를 apm.metrics 테이블에 배치 insert한다.
 type ClickHouseMetricStore struct {
-	conn driver.Conn // 공유 커넥션 풀 (소유권 없음)
-	ch   chan *model.MetricData
-	cfg  ClickHouseConfig
-	done chan struct{}
+	conn    driver.Conn // 공유 커넥션 풀 (소유권 없음)
+	ch      chan *model.MetricData
+	cfg     ClickHouseConfig
+	done    chan struct{}
+	flushWg sync.WaitGroup // 비동기 flush 완료 대기용
 }
 
 func NewClickHouseMetricStore(conn driver.Conn, cfg ClickHouseConfig) (*ClickHouseMetricStore, error) {
@@ -566,23 +584,19 @@ func NewClickHouseMetricStore(conn driver.Conn, cfg ClickHouseConfig) (*ClickHou
 }
 
 func (s *ClickHouseMetricStore) AppendMetrics(_ context.Context, metrics []*model.MetricData) error {
-	available := cap(s.ch) - len(s.ch)
-	if available < len(metrics) {
-		chDroppedTotal.WithLabelValues("metrics").Add(float64(len(metrics)))
-		chChannelDepth.WithLabelValues("metrics").Set(float64(len(s.ch)))
-		return fmt.Errorf("metric channel full (capacity=%d, available=%d, need=%d): backpressure",
-			cap(s.ch), available, len(metrics))
-	}
+	inserted := 0
 	for _, m := range metrics {
 		select {
 		case s.ch <- m:
+			inserted++
 		default:
 			chDroppedTotal.WithLabelValues("metrics").Inc()
-			chChannelDepth.WithLabelValues("metrics").Set(float64(len(s.ch)))
-			return fmt.Errorf("metric channel full during append: backpressure")
 		}
 	}
 	chChannelDepth.WithLabelValues("metrics").Set(float64(len(s.ch)))
+	if inserted == 0 && len(metrics) > 0 {
+		return fmt.Errorf("metric channel full (capacity=%d): backpressure", cap(s.ch))
+	}
 	return nil
 }
 
@@ -669,7 +683,10 @@ func (s *ClickHouseMetricStore) Close() error {
 }
 
 func (s *ClickHouseMetricStore) batchWriter() {
-	defer close(s.done)
+	defer func() {
+		s.flushWg.Wait()
+		close(s.done)
+	}()
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("clickhouse metric batchWriter panic recovered", "panic", r)
@@ -680,31 +697,41 @@ func (s *ClickHouseMetricStore) batchWriter() {
 	defer ticker.Stop()
 
 	batch := make([]*model.MetricData, 0, s.cfg.BatchSize)
+	var flushMu sync.Mutex
 
-	flush := func() {
-		if len(batch) == 0 {
+	doFlush := func(b []*model.MetricData) {
+		if len(b) == 0 {
 			return
 		}
-		if err := retryFlush("metrics", func() error { return s.flushMetrics(batch) }); err != nil {
-			chFlushErrorsTotal.WithLabelValues("metrics").Inc()
-			slog.Error("clickhouse metric flush failed (all retries exhausted)", "err", err, "count", len(batch))
-		}
-		batch = batch[:0]
+		s.flushWg.Add(1)
+		go func(data []*model.MetricData) {
+			defer s.flushWg.Done()
+			flushMu.Lock()
+			defer flushMu.Unlock()
+			if err := retryFlush("metrics", func() error { return s.flushMetrics(data) }); err != nil {
+				chFlushErrorsTotal.WithLabelValues("metrics").Inc()
+				slog.Error("clickhouse metric flush failed (all retries exhausted)", "err", err, "count", len(data))
+			}
+		}(b)
 	}
 
 	for {
 		select {
 		case m, ok := <-s.ch:
 			if !ok {
-				flush()
+				doFlush(batch)
 				return
 			}
 			batch = append(batch, m)
 			if len(batch) >= s.cfg.BatchSize {
-				flush()
+				doFlush(batch)
+				batch = make([]*model.MetricData, 0, s.cfg.BatchSize)
 			}
 		case <-ticker.C:
-			flush()
+			if len(batch) > 0 {
+				doFlush(batch)
+				batch = make([]*model.MetricData, 0, s.cfg.BatchSize)
+			}
 		}
 	}
 }
@@ -846,10 +873,11 @@ func (s *ClickHouseMetricStore) flushHistogramMetrics(metrics []*model.MetricDat
 
 // ClickHouseLogStore는 LogData를 apm.logs 테이블에 배치 insert한다.
 type ClickHouseLogStore struct {
-	conn driver.Conn // 공유 커넥션 풀 (소유권 없음)
-	ch   chan *model.LogData
-	cfg  ClickHouseConfig
-	done chan struct{}
+	conn    driver.Conn // 공유 커넥션 풀 (소유권 없음)
+	ch      chan *model.LogData
+	cfg     ClickHouseConfig
+	done    chan struct{}
+	flushWg sync.WaitGroup // 비동기 flush 완료 대기용
 }
 
 func NewClickHouseLogStore(conn driver.Conn, cfg ClickHouseConfig) (*ClickHouseLogStore, error) {
@@ -868,23 +896,19 @@ func NewClickHouseLogStore(conn driver.Conn, cfg ClickHouseConfig) (*ClickHouseL
 }
 
 func (s *ClickHouseLogStore) AppendLogs(_ context.Context, logs []*model.LogData) error {
-	available := cap(s.ch) - len(s.ch)
-	if available < len(logs) {
-		chDroppedTotal.WithLabelValues("logs").Add(float64(len(logs)))
-		chChannelDepth.WithLabelValues("logs").Set(float64(len(s.ch)))
-		return fmt.Errorf("log channel full (capacity=%d, available=%d, need=%d): backpressure",
-			cap(s.ch), available, len(logs))
-	}
+	inserted := 0
 	for _, l := range logs {
 		select {
 		case s.ch <- l:
+			inserted++
 		default:
 			chDroppedTotal.WithLabelValues("logs").Inc()
-			chChannelDepth.WithLabelValues("logs").Set(float64(len(s.ch)))
-			return fmt.Errorf("log channel full during append: backpressure")
 		}
 	}
 	chChannelDepth.WithLabelValues("logs").Set(float64(len(s.ch)))
+	if inserted == 0 && len(logs) > 0 {
+		return fmt.Errorf("log channel full (capacity=%d): backpressure", cap(s.ch))
+	}
 	return nil
 }
 
@@ -1031,7 +1055,10 @@ func (s *ClickHouseLogStore) Close() error {
 }
 
 func (s *ClickHouseLogStore) batchWriter() {
-	defer close(s.done)
+	defer func() {
+		s.flushWg.Wait()
+		close(s.done)
+	}()
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("clickhouse log batchWriter panic recovered", "panic", r)
@@ -1042,31 +1069,41 @@ func (s *ClickHouseLogStore) batchWriter() {
 	defer ticker.Stop()
 
 	batch := make([]*model.LogData, 0, s.cfg.BatchSize)
+	var flushMu sync.Mutex
 
-	flush := func() {
-		if len(batch) == 0 {
+	doFlush := func(b []*model.LogData) {
+		if len(b) == 0 {
 			return
 		}
-		if err := retryFlush("logs", func() error { return s.flushLogs(batch) }); err != nil {
-			chFlushErrorsTotal.WithLabelValues("logs").Inc()
-			slog.Error("clickhouse log flush failed (all retries exhausted)", "err", err, "count", len(batch))
-		}
-		batch = batch[:0]
+		s.flushWg.Add(1)
+		go func(data []*model.LogData) {
+			defer s.flushWg.Done()
+			flushMu.Lock()
+			defer flushMu.Unlock()
+			if err := retryFlush("logs", func() error { return s.flushLogs(data) }); err != nil {
+				chFlushErrorsTotal.WithLabelValues("logs").Inc()
+				slog.Error("clickhouse log flush failed (all retries exhausted)", "err", err, "count", len(data))
+			}
+		}(b)
 	}
 
 	for {
 		select {
 		case l, ok := <-s.ch:
 			if !ok {
-				flush()
+				doFlush(batch)
 				return
 			}
 			batch = append(batch, l)
 			if len(batch) >= s.cfg.BatchSize {
-				flush()
+				doFlush(batch)
+				batch = make([]*model.LogData, 0, s.cfg.BatchSize)
 			}
 		case <-ticker.C:
-			flush()
+			if len(batch) > 0 {
+				doFlush(batch)
+				batch = make([]*model.LogData, 0, s.cfg.BatchSize)
+			}
 		}
 	}
 }
