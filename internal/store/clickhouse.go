@@ -1221,9 +1221,9 @@ CREATE TABLE IF NOT EXISTS %s.mv_red_1m_state (
     minute       DateTime,
     total_count  SimpleAggregateFunction(sum, UInt64),
     error_count  SimpleAggregateFunction(sum, UInt64),
-    duration_p50 AggregateFunction(quantileTDigest(0.001), Float64),
-    duration_p95 AggregateFunction(quantileTDigest(0.001), Float64),
-    duration_p99 AggregateFunction(quantileTDigest(0.001), Float64),
+    duration_p50 AggregateFunction(quantileTDigest(0.5), Float64),
+    duration_p95 AggregateFunction(quantileTDigest(0.95), Float64),
+    duration_p99 AggregateFunction(quantileTDigest(0.99), Float64),
     duration_sum SimpleAggregateFunction(sum, Float64),
     dt Date
 ) ENGINE = AggregatingMergeTree()
@@ -1244,9 +1244,9 @@ AS SELECT
     toStartOfMinute(fromUnixTimestamp64Nano(start_time_nano))        AS minute,
     toUInt64(count())                                                 AS total_count,
     toUInt64(countIf(status_code = 2))                               AS error_count,
-    quantileTDigestState(0.001)(toFloat64(duration_nano))             AS duration_p50,
-    quantileTDigestState(0.001)(toFloat64(duration_nano))             AS duration_p95,
-    quantileTDigestState(0.001)(toFloat64(duration_nano))             AS duration_p99,
+    quantileTDigestState(0.5)(toFloat64(duration_nano))              AS duration_p50,
+    quantileTDigestState(0.95)(toFloat64(duration_nano))             AS duration_p95,
+    quantileTDigestState(0.99)(toFloat64(duration_nano))             AS duration_p99,
     toFloat64(sum(duration_nano))                                     AS duration_sum,
     dt
 FROM %s.spans
@@ -1484,7 +1484,7 @@ AS SELECT
     service_name,
     exception_type,
     toStartOfMinute(fromUnixTimestamp64Nano(timestamp_nano)) AS minute,
-    toUInt64(1) AS error_count,
+    toUInt64(count()) AS error_count,
     dt
 FROM %s.logs
 WHERE severity_number >= 17
