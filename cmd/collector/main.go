@@ -56,6 +56,7 @@ func main() {
 			DLQDir:             cfg.DLQDir,
 			CBFailureThreshold: cfg.CBFailureThreshold,
 			CBCooldown:         cfg.CBCooldown,
+			FlushWorkers:       cfg.FlushWorkers,
 		}
 
 		// 상용 APM 패턴: 하나의 공유 커넥션 풀을 세 Store가 공유한다.
@@ -105,6 +106,7 @@ func main() {
 			"db", cfg.ClickHouseDB,
 			"batch_size", cfg.BatchSize,
 			"flush_interval", cfg.FlushInterval,
+			"flush_workers", cfg.FlushWorkers,
 		)
 	}
 

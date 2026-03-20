@@ -4,11 +4,12 @@
 //
 //	AppendSpans/Metrics/Logs
 //	  → 채널에 enqueue (backpressure: ResourceExhausted 반환)
-//	  → batchWriter goroutine: size-trigger 또는 time-trigger 로 flush
-//	  → ClickHouse native protocol batch insert
+//	  → batchWriter goroutine: size-trigger 또는 time-trigger 로 flushCh에 배치 전송
+//	  → N개 flushWorker goroutine: flushCh에서 배치를 수신해 ClickHouse에 병렬 insert
 //
 // 상용 APM best-practice 적용:
 //   - 공유 커넥션 풀: OpenConn으로 1개 pool 생성 후 3개 store가 공유
+//   - Flush worker pool: FlushWorkers개 goroutine이 배치를 병렬 처리 (병목 해소)
 //   - Retry with backoff: flush 실패 시 최대 3회 재시도 (1s→2s→4s)
 //   - Drop counter: backpressure로 드롭된 항목 Prometheus 계측
 //   - Panic recovery: batchWriter goroutine 비정상 종료 방지
@@ -102,6 +103,24 @@ var (
 		Name:      "dlq_written_total",
 		Help:      "Total number of items written to DLQ after flush failure.",
 	}, []string{"table"})
+
+	// chFlushWorkerPoolSize: 테이블별 flush worker goroutine 수.
+	// FlushWorkers 설정값을 반영하며 운영 중에는 고정된다.
+	chFlushWorkerPoolSize = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "javi",
+		Subsystem: "clickhouse",
+		Name:      "flush_worker_pool_size",
+		Help:      "Number of flush worker goroutines configured per table.",
+	}, []string{"table"})
+
+	// chFlushQueueDepth: flushCh에 대기 중인 배치 수.
+	// 높은 값은 flush worker가 포화 상태임을 시사한다.
+	chFlushQueueDepth = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "javi",
+		Subsystem: "clickhouse",
+		Name:      "flush_queue_depth",
+		Help:      "Number of batches waiting in the flush queue (flushCh).",
+	}, []string{"table"})
 )
 
 // ClickHouseConfig는 ClickHouse 연결 및 배치 설정이다.
@@ -124,6 +143,12 @@ type ClickHouseConfig struct {
 	// CBFailureThreshold=0 이면 비활성화 (기본 동작 유지).
 	CBFailureThreshold int           // Open으로 전환하는 연속 실패 횟수 (기본 5)
 	CBCooldown         time.Duration // Open → HalfOpen 전환 대기 시간 (기본 60s)
+
+	// FlushWorkers: 테이블별 flush worker goroutine 수.
+	// 1이면 단일 직렬 flush, N이면 N개 goroutine이 배치를 병렬로 처리한다.
+	// 0 또는 미설정 시 기본값 1이 적용된다.
+	// 고부하 환경: 4–8 권장. ClickHouse MaxOpenConns(10)보다 작게 유지할 것.
+	FlushWorkers int
 }
 
 // OpenConn은 ClickHouse native protocol 공유 연결 풀을 연다.
@@ -184,16 +209,17 @@ func retryFlush(table string, fn func() error) error {
 
 // ClickHouseTraceStore는 SpanData를 apm.spans 테이블에 배치 insert한다.
 type ClickHouseTraceStore struct {
-	conn    driver.Conn // 공유 커넥션 풀 (소유권 없음 — Close()에서 닫지 않는다)
-	ch      chan *model.SpanData
+	conn    driver.Conn            // 공유 커넥션 풀 (소유권 없음 — Close()에서 닫지 않는다)
+	ch      chan *model.SpanData   // 수신 데이터 채널
+	flushCh chan []*model.SpanData // 조립된 배치를 flush worker에 전달하는 큐
 	cfg     ClickHouseConfig
-	done    chan struct{}
-	flushWg sync.WaitGroup   // 비동기 flush 완료 대기용
+	done    chan struct{}     // 모든 flushWorker 종료 시 닫힘
 	dlq     *FileBackupWriter // flush 실패 시 배치 보존 (nil이면 비활성화)
 	cb      *circuitBreaker   // 연속 실패 시 flush 차단 (nil이면 비활성화)
 }
 
-// NewClickHouseTraceStore는 공유 커넥션을 받아 테이블 DDL을 적용하고 batchWriter를 시작한다.
+// NewClickHouseTraceStore는 공유 커넥션을 받아 테이블 DDL을 적용하고
+// batchWriter 및 FlushWorkers개의 flushWorker goroutine을 시작한다.
 // conn 소유권은 호출자가 가진다 — Close()를 호출해도 conn은 닫히지 않는다.
 func NewClickHouseTraceStore(conn driver.Conn, cfg ClickHouseConfig) (*ClickHouseTraceStore, error) {
 	if err := ensureSpansTable(conn, cfg.Database, cfg.RetentionDays); err != nil {
@@ -214,14 +240,35 @@ func NewClickHouseTraceStore(conn driver.Conn, cfg ClickHouseConfig) (*ClickHous
 		cb = newCircuitBreaker("spans", cfg.CBFailureThreshold, cfg.CBCooldown)
 	}
 
-	s := &ClickHouseTraceStore{
-		conn: conn,
-		ch:   make(chan *model.SpanData, cfg.ChanBuffer),
-		cfg:  cfg,
-		done: make(chan struct{}),
-		dlq:  dlq,
-		cb:   cb,
+	workers := cfg.FlushWorkers
+	if workers < 1 {
+		workers = 1
 	}
+
+	s := &ClickHouseTraceStore{
+		conn:    conn,
+		ch:      make(chan *model.SpanData, cfg.ChanBuffer),
+		flushCh: make(chan []*model.SpanData, workers*2),
+		cfg:     cfg,
+		done:    make(chan struct{}),
+		dlq:     dlq,
+		cb:      cb,
+	}
+
+	chFlushWorkerPoolSize.WithLabelValues("spans").Set(float64(workers))
+
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.flushWorker()
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(s.done)
+	}()
 	go s.batchWriter()
 	return s, nil
 }
@@ -479,16 +526,11 @@ func (s *ClickHouseTraceStore) Close() error {
 	return nil
 }
 
-// batchWriter는 채널에서 span을 읽어 배치를 구성하고 ClickHouse에 비동기 insert한다.
-//
-// 핵심 개선: flush를 별도 goroutine에서 실행하여 batchWriter가 ClickHouse I/O와
-// retry sleep(1s→2s→4s) 동안 블록되지 않는다. 채널은 flush 중에도 계속 소비된다.
-// flushMu로 동시 flush를 직렬화해 ClickHouse 커넥션 pool 고갈을 방지한다.
+// batchWriter는 채널에서 span을 읽어 배치를 조립하고 flushCh로 전달한다.
+// 실제 ClickHouse I/O는 flushWorker goroutine 풀이 담당한다.
+// batchWriter 종료 시 flushCh를 닫아 worker들이 drain 후 종료하도록 신호한다.
 func (s *ClickHouseTraceStore) batchWriter() {
-	defer func() {
-		s.flushWg.Wait() // 비동기 flush 완료 대기 후 done 시그널
-		close(s.done)
-	}()
+	defer close(s.flushCh) // flushWorker들에게 종료 신호
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("clickhouse trace batchWriter panic recovered", "panic", r)
@@ -499,50 +541,13 @@ func (s *ClickHouseTraceStore) batchWriter() {
 	defer ticker.Stop()
 
 	batch := make([]*model.SpanData, 0, s.cfg.BatchSize)
-	var flushMu sync.Mutex // flush를 직렬화: ClickHouse에 동시에 1개만 전송
 
 	doFlush := func(b []*model.SpanData) {
 		if len(b) == 0 {
 			return
 		}
-		s.flushWg.Add(1)
-		go func(data []*model.SpanData) {
-			defer s.flushWg.Done()
-			flushMu.Lock()
-			defer flushMu.Unlock()
-
-			// Circuit breaker: Open 상태이면 DLQ로 직행해 ClickHouse 과부하 방지
-			if s.cb != nil && !s.cb.Allow() {
-				slog.Warn("clickhouse span flush blocked by circuit breaker — routing to DLQ", "count", len(data))
-				chFlushErrorsTotal.WithLabelValues("spans").Inc()
-				if s.dlq != nil {
-					if dlqErr := s.dlq.WriteSpans(data); dlqErr != nil {
-						slog.Error("clickhouse span DLQ write failed — data lost", "err", dlqErr, "count", len(data))
-					} else {
-						chDLQWrittenTotal.WithLabelValues("spans").Add(float64(len(data)))
-					}
-				}
-				return
-			}
-
-			if err := retryFlush("spans", func() error { return s.flushSpans(data) }); err != nil {
-				chFlushErrorsTotal.WithLabelValues("spans").Inc()
-				if s.cb != nil {
-					s.cb.RecordFailure()
-				}
-				slog.Error("clickhouse span flush failed (all retries exhausted)", "err", err, "count", len(data))
-				if s.dlq != nil {
-					if dlqErr := s.dlq.WriteSpans(data); dlqErr != nil {
-						slog.Error("clickhouse span DLQ write failed — data lost", "err", dlqErr, "count", len(data))
-					} else {
-						chDLQWrittenTotal.WithLabelValues("spans").Add(float64(len(data)))
-						slog.Warn("clickhouse span flush failed; batch saved to DLQ", "count", len(data), "dlq_dir", s.cfg.DLQDir)
-					}
-				}
-			} else if s.cb != nil {
-				s.cb.RecordSuccess()
-			}
-		}(b)
+		chFlushQueueDepth.WithLabelValues("spans").Set(float64(len(s.flushCh) + 1))
+		s.flushCh <- b
 	}
 
 	for {
@@ -563,6 +568,46 @@ func (s *ClickHouseTraceStore) batchWriter() {
 				doFlush(batch)
 				batch = make([]*model.SpanData, 0, s.cfg.BatchSize)
 			}
+		}
+	}
+}
+
+// flushWorker는 flushCh에서 배치를 수신해 Circuit Breaker → retry → DLQ 순으로 처리한다.
+// FlushWorkers개의 goroutine이 병렬로 실행되어 고부하 쓰기 병목을 해소한다.
+func (s *ClickHouseTraceStore) flushWorker() {
+	for data := range s.flushCh {
+		chFlushQueueDepth.WithLabelValues("spans").Set(float64(len(s.flushCh)))
+
+		// Circuit breaker: Open 상태이면 DLQ로 직행해 ClickHouse 과부하 방지
+		if s.cb != nil && !s.cb.Allow() {
+			slog.Warn("clickhouse span flush blocked by circuit breaker — routing to DLQ", "count", len(data))
+			chFlushErrorsTotal.WithLabelValues("spans").Inc()
+			if s.dlq != nil {
+				if dlqErr := s.dlq.WriteSpans(data); dlqErr != nil {
+					slog.Error("clickhouse span DLQ write failed — data lost", "err", dlqErr, "count", len(data))
+				} else {
+					chDLQWrittenTotal.WithLabelValues("spans").Add(float64(len(data)))
+				}
+			}
+			continue
+		}
+
+		if err := retryFlush("spans", func() error { return s.flushSpans(data) }); err != nil {
+			chFlushErrorsTotal.WithLabelValues("spans").Inc()
+			if s.cb != nil {
+				s.cb.RecordFailure()
+			}
+			slog.Error("clickhouse span flush failed (all retries exhausted)", "err", err, "count", len(data))
+			if s.dlq != nil {
+				if dlqErr := s.dlq.WriteSpans(data); dlqErr != nil {
+					slog.Error("clickhouse span DLQ write failed — data lost", "err", dlqErr, "count", len(data))
+				} else {
+					chDLQWrittenTotal.WithLabelValues("spans").Add(float64(len(data)))
+					slog.Warn("clickhouse span flush failed; batch saved to DLQ", "count", len(data), "dlq_dir", s.cfg.DLQDir)
+				}
+			}
+		} else if s.cb != nil {
+			s.cb.RecordSuccess()
 		}
 	}
 }
@@ -631,11 +676,11 @@ func (s *ClickHouseTraceStore) flushSpans(spans []*model.SpanData) error {
 
 // ClickHouseMetricStore는 MetricData를 apm.metrics 테이블에 배치 insert한다.
 type ClickHouseMetricStore struct {
-	conn    driver.Conn // 공유 커넥션 풀 (소유권 없음)
-	ch      chan *model.MetricData
+	conn    driver.Conn              // 공유 커넥션 풀 (소유권 없음)
+	ch      chan *model.MetricData   // 수신 데이터 채널
+	flushCh chan []*model.MetricData // 조립된 배치를 flush worker에 전달하는 큐
 	cfg     ClickHouseConfig
-	done    chan struct{}
-	flushWg sync.WaitGroup   // 비동기 flush 완료 대기용
+	done    chan struct{}     // 모든 flushWorker 종료 시 닫힘
 	dlq     *FileBackupWriter // flush 실패 시 배치 보존 (nil이면 비활성화)
 	cb      *circuitBreaker   // 연속 실패 시 flush 차단 (nil이면 비활성화)
 }
@@ -659,14 +704,35 @@ func NewClickHouseMetricStore(conn driver.Conn, cfg ClickHouseConfig) (*ClickHou
 		cbM = newCircuitBreaker("metrics", cfg.CBFailureThreshold, cfg.CBCooldown)
 	}
 
-	s := &ClickHouseMetricStore{
-		conn: conn,
-		ch:   make(chan *model.MetricData, cfg.ChanBuffer),
-		cfg:  cfg,
-		done: make(chan struct{}),
-		dlq:  dlq,
-		cb:   cbM,
+	workers := cfg.FlushWorkers
+	if workers < 1 {
+		workers = 1
 	}
+
+	s := &ClickHouseMetricStore{
+		conn:    conn,
+		ch:      make(chan *model.MetricData, cfg.ChanBuffer),
+		flushCh: make(chan []*model.MetricData, workers*2),
+		cfg:     cfg,
+		done:    make(chan struct{}),
+		dlq:     dlq,
+		cb:      cbM,
+	}
+
+	chFlushWorkerPoolSize.WithLabelValues("metrics").Set(float64(workers))
+
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.flushWorker()
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(s.done)
+	}()
 	go s.batchWriter()
 	return s, nil
 }
@@ -776,10 +842,7 @@ func (s *ClickHouseMetricStore) Close() error {
 }
 
 func (s *ClickHouseMetricStore) batchWriter() {
-	defer func() {
-		s.flushWg.Wait()
-		close(s.done)
-	}()
+	defer close(s.flushCh)
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("clickhouse metric batchWriter panic recovered", "panic", r)
@@ -790,50 +853,13 @@ func (s *ClickHouseMetricStore) batchWriter() {
 	defer ticker.Stop()
 
 	batch := make([]*model.MetricData, 0, s.cfg.BatchSize)
-	var flushMu sync.Mutex
 
 	doFlush := func(b []*model.MetricData) {
 		if len(b) == 0 {
 			return
 		}
-		s.flushWg.Add(1)
-		go func(data []*model.MetricData) {
-			defer s.flushWg.Done()
-			flushMu.Lock()
-			defer flushMu.Unlock()
-
-			// Circuit breaker: Open 상태이면 DLQ로 직행
-			if s.cb != nil && !s.cb.Allow() {
-				slog.Warn("clickhouse metric flush blocked by circuit breaker — routing to DLQ", "count", len(data))
-				chFlushErrorsTotal.WithLabelValues("metrics").Inc()
-				if s.dlq != nil {
-					if dlqErr := s.dlq.WriteMetrics(data); dlqErr != nil {
-						slog.Error("clickhouse metric DLQ write failed — data lost", "err", dlqErr, "count", len(data))
-					} else {
-						chDLQWrittenTotal.WithLabelValues("metrics").Add(float64(len(data)))
-					}
-				}
-				return
-			}
-
-			if err := retryFlush("metrics", func() error { return s.flushMetrics(data) }); err != nil {
-				chFlushErrorsTotal.WithLabelValues("metrics").Inc()
-				if s.cb != nil {
-					s.cb.RecordFailure()
-				}
-				slog.Error("clickhouse metric flush failed (all retries exhausted)", "err", err, "count", len(data))
-				if s.dlq != nil {
-					if dlqErr := s.dlq.WriteMetrics(data); dlqErr != nil {
-						slog.Error("clickhouse metric DLQ write failed — data lost", "err", dlqErr, "count", len(data))
-					} else {
-						chDLQWrittenTotal.WithLabelValues("metrics").Add(float64(len(data)))
-						slog.Warn("clickhouse metric flush failed; batch saved to DLQ", "count", len(data), "dlq_dir", s.cfg.DLQDir)
-					}
-				}
-			} else if s.cb != nil {
-				s.cb.RecordSuccess()
-			}
-		}(b)
+		chFlushQueueDepth.WithLabelValues("metrics").Set(float64(len(s.flushCh) + 1))
+		s.flushCh <- b
 	}
 
 	for {
@@ -853,6 +879,43 @@ func (s *ClickHouseMetricStore) batchWriter() {
 				doFlush(batch)
 				batch = make([]*model.MetricData, 0, s.cfg.BatchSize)
 			}
+		}
+	}
+}
+
+func (s *ClickHouseMetricStore) flushWorker() {
+	for data := range s.flushCh {
+		chFlushQueueDepth.WithLabelValues("metrics").Set(float64(len(s.flushCh)))
+
+		if s.cb != nil && !s.cb.Allow() {
+			slog.Warn("clickhouse metric flush blocked by circuit breaker — routing to DLQ", "count", len(data))
+			chFlushErrorsTotal.WithLabelValues("metrics").Inc()
+			if s.dlq != nil {
+				if dlqErr := s.dlq.WriteMetrics(data); dlqErr != nil {
+					slog.Error("clickhouse metric DLQ write failed — data lost", "err", dlqErr, "count", len(data))
+				} else {
+					chDLQWrittenTotal.WithLabelValues("metrics").Add(float64(len(data)))
+				}
+			}
+			continue
+		}
+
+		if err := retryFlush("metrics", func() error { return s.flushMetrics(data) }); err != nil {
+			chFlushErrorsTotal.WithLabelValues("metrics").Inc()
+			if s.cb != nil {
+				s.cb.RecordFailure()
+			}
+			slog.Error("clickhouse metric flush failed (all retries exhausted)", "err", err, "count", len(data))
+			if s.dlq != nil {
+				if dlqErr := s.dlq.WriteMetrics(data); dlqErr != nil {
+					slog.Error("clickhouse metric DLQ write failed — data lost", "err", dlqErr, "count", len(data))
+				} else {
+					chDLQWrittenTotal.WithLabelValues("metrics").Add(float64(len(data)))
+					slog.Warn("clickhouse metric flush failed; batch saved to DLQ", "count", len(data), "dlq_dir", s.cfg.DLQDir)
+				}
+			}
+		} else if s.cb != nil {
+			s.cb.RecordSuccess()
 		}
 	}
 }
@@ -994,11 +1057,11 @@ func (s *ClickHouseMetricStore) flushHistogramMetrics(metrics []*model.MetricDat
 
 // ClickHouseLogStore는 LogData를 apm.logs 테이블에 배치 insert한다.
 type ClickHouseLogStore struct {
-	conn    driver.Conn // 공유 커넥션 풀 (소유권 없음)
-	ch      chan *model.LogData
+	conn    driver.Conn            // 공유 커넥션 풀 (소유권 없음)
+	ch      chan *model.LogData    // 수신 데이터 채널
+	flushCh chan []*model.LogData  // 조립된 배치를 flush worker에 전달하는 큐
 	cfg     ClickHouseConfig
-	done    chan struct{}
-	flushWg sync.WaitGroup   // 비동기 flush 완료 대기용
+	done    chan struct{}     // 모든 flushWorker 종료 시 닫힘
 	dlq     *FileBackupWriter // flush 실패 시 배치 보존 (nil이면 비활성화)
 	cb      *circuitBreaker   // 연속 실패 시 flush 차단 (nil이면 비활성화)
 }
@@ -1022,14 +1085,35 @@ func NewClickHouseLogStore(conn driver.Conn, cfg ClickHouseConfig) (*ClickHouseL
 		cbL = newCircuitBreaker("logs", cfg.CBFailureThreshold, cfg.CBCooldown)
 	}
 
-	s := &ClickHouseLogStore{
-		conn: conn,
-		ch:   make(chan *model.LogData, cfg.ChanBuffer),
-		cfg:  cfg,
-		done: make(chan struct{}),
-		dlq:  dlq,
-		cb:   cbL,
+	workers := cfg.FlushWorkers
+	if workers < 1 {
+		workers = 1
 	}
+
+	s := &ClickHouseLogStore{
+		conn:    conn,
+		ch:      make(chan *model.LogData, cfg.ChanBuffer),
+		flushCh: make(chan []*model.LogData, workers*2),
+		cfg:     cfg,
+		done:    make(chan struct{}),
+		dlq:     dlq,
+		cb:      cbL,
+	}
+
+	chFlushWorkerPoolSize.WithLabelValues("logs").Set(float64(workers))
+
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.flushWorker()
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(s.done)
+	}()
 	go s.batchWriter()
 	return s, nil
 }
@@ -1199,10 +1283,7 @@ func (s *ClickHouseLogStore) Close() error {
 }
 
 func (s *ClickHouseLogStore) batchWriter() {
-	defer func() {
-		s.flushWg.Wait()
-		close(s.done)
-	}()
+	defer close(s.flushCh)
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("clickhouse log batchWriter panic recovered", "panic", r)
@@ -1213,50 +1294,13 @@ func (s *ClickHouseLogStore) batchWriter() {
 	defer ticker.Stop()
 
 	batch := make([]*model.LogData, 0, s.cfg.BatchSize)
-	var flushMu sync.Mutex
 
 	doFlush := func(b []*model.LogData) {
 		if len(b) == 0 {
 			return
 		}
-		s.flushWg.Add(1)
-		go func(data []*model.LogData) {
-			defer s.flushWg.Done()
-			flushMu.Lock()
-			defer flushMu.Unlock()
-
-			// Circuit breaker: Open 상태이면 DLQ로 직행
-			if s.cb != nil && !s.cb.Allow() {
-				slog.Warn("clickhouse log flush blocked by circuit breaker — routing to DLQ", "count", len(data))
-				chFlushErrorsTotal.WithLabelValues("logs").Inc()
-				if s.dlq != nil {
-					if dlqErr := s.dlq.WriteLogs(data); dlqErr != nil {
-						slog.Error("clickhouse log DLQ write failed — data lost", "err", dlqErr, "count", len(data))
-					} else {
-						chDLQWrittenTotal.WithLabelValues("logs").Add(float64(len(data)))
-					}
-				}
-				return
-			}
-
-			if err := retryFlush("logs", func() error { return s.flushLogs(data) }); err != nil {
-				chFlushErrorsTotal.WithLabelValues("logs").Inc()
-				if s.cb != nil {
-					s.cb.RecordFailure()
-				}
-				slog.Error("clickhouse log flush failed (all retries exhausted)", "err", err, "count", len(data))
-				if s.dlq != nil {
-					if dlqErr := s.dlq.WriteLogs(data); dlqErr != nil {
-						slog.Error("clickhouse log DLQ write failed — data lost", "err", dlqErr, "count", len(data))
-					} else {
-						chDLQWrittenTotal.WithLabelValues("logs").Add(float64(len(data)))
-						slog.Warn("clickhouse log flush failed; batch saved to DLQ", "count", len(data), "dlq_dir", s.cfg.DLQDir)
-					}
-				}
-			} else if s.cb != nil {
-				s.cb.RecordSuccess()
-			}
-		}(b)
+		chFlushQueueDepth.WithLabelValues("logs").Set(float64(len(s.flushCh) + 1))
+		s.flushCh <- b
 	}
 
 	for {
@@ -1276,6 +1320,43 @@ func (s *ClickHouseLogStore) batchWriter() {
 				doFlush(batch)
 				batch = make([]*model.LogData, 0, s.cfg.BatchSize)
 			}
+		}
+	}
+}
+
+func (s *ClickHouseLogStore) flushWorker() {
+	for data := range s.flushCh {
+		chFlushQueueDepth.WithLabelValues("logs").Set(float64(len(s.flushCh)))
+
+		if s.cb != nil && !s.cb.Allow() {
+			slog.Warn("clickhouse log flush blocked by circuit breaker — routing to DLQ", "count", len(data))
+			chFlushErrorsTotal.WithLabelValues("logs").Inc()
+			if s.dlq != nil {
+				if dlqErr := s.dlq.WriteLogs(data); dlqErr != nil {
+					slog.Error("clickhouse log DLQ write failed — data lost", "err", dlqErr, "count", len(data))
+				} else {
+					chDLQWrittenTotal.WithLabelValues("logs").Add(float64(len(data)))
+				}
+			}
+			continue
+		}
+
+		if err := retryFlush("logs", func() error { return s.flushLogs(data) }); err != nil {
+			chFlushErrorsTotal.WithLabelValues("logs").Inc()
+			if s.cb != nil {
+				s.cb.RecordFailure()
+			}
+			slog.Error("clickhouse log flush failed (all retries exhausted)", "err", err, "count", len(data))
+			if s.dlq != nil {
+				if dlqErr := s.dlq.WriteLogs(data); dlqErr != nil {
+					slog.Error("clickhouse log DLQ write failed — data lost", "err", dlqErr, "count", len(data))
+				} else {
+					chDLQWrittenTotal.WithLabelValues("logs").Add(float64(len(data)))
+					slog.Warn("clickhouse log flush failed; batch saved to DLQ", "count", len(data), "dlq_dir", s.cfg.DLQDir)
+				}
+			}
+		} else if s.cb != nil {
+			s.cb.RecordSuccess()
 		}
 	}
 }

@@ -79,6 +79,11 @@ type Config struct {
 	// CBFailureThreshold=0 이면 비활성화.
 	CBFailureThreshold int
 	CBCooldown         time.Duration // Open 상태 유지 시간 (기본 60s)
+
+	// FlushWorkers: 테이블별 ClickHouse flush 병렬 worker 수.
+	// 1이면 단일 직렬 flush (이전 동작), N이면 N개 goroutine이 동시에 flush한다.
+	// 기본값 2. 고부하 환경에서 4-8로 늘리면 쓰기 병목을 해소할 수 있다.
+	FlushWorkers int
 }
 
 // Load는 환경변수에서 설정을 읽어 Config를 반환한다.
@@ -112,6 +117,7 @@ func Load() (*Config, error) {
 		DLQReplayInterval:        envDuration("DLQ_REPLAY_INTERVAL", 5*time.Minute),
 		CBFailureThreshold:       envInt("CB_FAILURE_THRESHOLD", 5),
 		CBCooldown:               envDuration("CB_COOLDOWN", 60*time.Second),
+		FlushWorkers:             envInt("FLUSH_WORKERS", 2),
 	}
 
 	if err := cfg.validate(); err != nil {
