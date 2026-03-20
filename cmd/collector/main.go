@@ -55,28 +55,47 @@ func main() {
 			RetentionDays: cfg.RetentionDays,
 		}
 
-		ts, err := store.NewClickHouseTraceStore(chCfg)
+		// 상용 APM 패턴: 하나의 공유 커넥션 풀을 세 Store가 공유한다.
+		// 이전에는 Store마다 openConn을 호출해 최대 3×MaxOpenConns 커넥션이 생성됐다.
+		chConn, err := store.OpenConn(chCfg)
 		if err != nil {
-			slog.Error("clickhouse trace store init failed", "err", err)
+			slog.Error("clickhouse connection failed", "err", err)
 			os.Exit(1)
 		}
-		ms, err := store.NewClickHouseMetricStore(chCfg)
+
+		ts, err := store.NewClickHouseTraceStore(chConn, chCfg)
+		if err != nil {
+			slog.Error("clickhouse trace store init failed", "err", err)
+			_ = chConn.Close()
+			os.Exit(1)
+		}
+		ms, err := store.NewClickHouseMetricStore(chConn, chCfg)
 		if err != nil {
 			slog.Error("clickhouse metric store init failed", "err", err)
 			_ = ts.Close()
+			_ = chConn.Close()
 			os.Exit(1)
 		}
-		ls, err := store.NewClickHouseLogStore(chCfg)
+		ls, err := store.NewClickHouseLogStore(chConn, chCfg)
 		if err != nil {
 			slog.Error("clickhouse log store init failed", "err", err)
 			_ = ts.Close()
 			_ = ms.Close()
+			_ = chConn.Close()
 			os.Exit(1)
 		}
 
 		traceStore = ts
 		metricStore = ms
 		logStore = ls
+
+		// 공유 커넥션은 모든 store가 drain된 후 닫아야 한다.
+		// defer 실행 순서(LIFO)를 이용: store Close() → conn Close()
+		defer func() {
+			if err := chConn.Close(); err != nil {
+				slog.Warn("clickhouse conn close error", "err", err)
+			}
+		}()
 
 		slog.Info("ClickHouse store initialized",
 			"addr", cfg.ClickHouseAddr,

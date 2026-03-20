@@ -117,6 +117,36 @@ func (ing *Ingester) IngestLogs(ctx context.Context, body []byte) (int, error) {
 	return ing.storeLogs(ctx, logs)
 }
 
+// IngestTracesJSON은 OTLP/HTTP JSON 경로의 ExportTraceServiceRequest를 처리한다.
+func (ing *Ingester) IngestTracesJSON(ctx context.Context, body []byte) (int, error) {
+	spans, err := decoder.DecodeTracesJSON(body)
+	if err != nil {
+		ingestErrorsTotal.WithLabelValues("traces").Inc()
+		return 0, err
+	}
+	return ing.storeSpans(ctx, spans)
+}
+
+// IngestMetricsJSON은 OTLP/HTTP JSON 경로의 ExportMetricsServiceRequest를 처리한다.
+func (ing *Ingester) IngestMetricsJSON(ctx context.Context, body []byte) (int, error) {
+	metrics, err := decoder.DecodeMetricsJSON(body)
+	if err != nil {
+		ingestErrorsTotal.WithLabelValues("metrics").Inc()
+		return 0, err
+	}
+	return ing.storeMetrics(ctx, metrics)
+}
+
+// IngestLogsJSON은 OTLP/HTTP JSON 경로의 ExportLogsServiceRequest를 처리한다.
+func (ing *Ingester) IngestLogsJSON(ctx context.Context, body []byte) (int, error) {
+	logs, err := decoder.DecodeLogsJSON(body)
+	if err != nil {
+		ingestErrorsTotal.WithLabelValues("logs").Inc()
+		return 0, err
+	}
+	return ing.storeLogs(ctx, logs)
+}
+
 // ---- gRPC 경로: 파싱된 proto 구조체 직접 전달 ----
 //
 // gRPC 프레임워크가 이미 Unmarshal을 완료한 구조체를 재직렬화하지 않고

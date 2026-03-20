@@ -12,6 +12,7 @@ services:
       CLICKHOUSE_PASSWORD: ""
     volumes:
       - clickhouse-data:/var/lib/clickhouse
+      - ./docker/clickhouse/users_override.xml:/etc/clickhouse-server/users.d/users_override.xml:ro
     healthcheck:
       test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
       interval: 5s

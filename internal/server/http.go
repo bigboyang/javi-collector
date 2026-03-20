@@ -21,12 +21,16 @@
 package server
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
@@ -35,10 +39,17 @@ import (
 )
 
 const (
-	protoContentType = "application/x-protobuf"
-	defaultLimit     = 100
-	maxBodyBytes     = 16 << 20 // 16 MiB
+	jsonContentType = "application/json"
+	defaultLimit    = 100
+	maxBodyBytes    = 16 << 20 // 16 MiB
 )
+
+// gzipReaderPool은 요청마다 gzip.Reader를 새로 할당하지 않고 재사용한다.
+// OTel Java Agent / OTel Collector 등 대부분의 APM exporter가 기본적으로
+// Content-Encoding: gzip으로 전송하므로, 고TPS 환경에서 GC pressure 절감 효과가 크다.
+var gzipReaderPool = sync.Pool{
+	New: func() any { return new(gzip.Reader) },
+}
 
 // sizer는 버퍼 크기를 조회할 수 있는 저장소 구현체를 위한 선택적 인터페이스다.
 type sizer interface {
@@ -111,7 +122,7 @@ func NewHTTPServer(addr string, ing *ingester.Ingester,
 		Addr:    addr,
 		Handler: mux,
 		// ReadHeaderTimeout: DoS 방어 (slowloris 공격 대응)
-		ReadHeaderTimeout: 10,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 	return s
 }
@@ -149,7 +160,12 @@ func (s *HTTPServer) handleTraces(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	count, err := s.ingester.IngestTraces(r.Context(), body)
+	var count int
+	if isJSON(r) {
+		count, err = s.ingester.IngestTracesJSON(r.Context(), body)
+	} else {
+		count, err = s.ingester.IngestTraces(r.Context(), body)
+	}
 	if err != nil {
 		slog.Warn("trace ingest error", "err", err)
 		// backpressure: 503으로 클라이언트가 재시도하도록 유도
@@ -170,7 +186,12 @@ func (s *HTTPServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	count, err := s.ingester.IngestMetrics(r.Context(), body)
+	var count int
+	if isJSON(r) {
+		count, err = s.ingester.IngestMetricsJSON(r.Context(), body)
+	} else {
+		count, err = s.ingester.IngestMetrics(r.Context(), body)
+	}
 	if err != nil {
 		slog.Warn("metric ingest error", "err", err)
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -190,7 +211,12 @@ func (s *HTTPServer) handleLogs(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	count, err := s.ingester.IngestLogs(r.Context(), body)
+	var count int
+	if isJSON(r) {
+		count, err = s.ingester.IngestLogsJSON(r.Context(), body)
+	} else {
+		count, err = s.ingester.IngestLogs(r.Context(), body)
+	}
 	if err != nil {
 		slog.Warn("log ingest error", "err", err)
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -395,8 +421,30 @@ func (s *HTTPServer) readyz(w http.ResponseWriter, r *http.Request) {
 
 // ---- 헬퍼 ----
 
+// readProtoBody는 HTTP 요청 body를 읽어 반환한다.
+// Content-Encoding: gzip인 경우 압축을 해제한다 (OTel exporter 기본값).
+// gzip.Reader는 sync.Pool에서 재사용해 GC 부담을 줄인다.
+// zip-bomb 방어: 압축 전/후 모두 maxBodyBytes로 제한한다.
 func readProtoBody(r *http.Request) ([]byte, error) {
-	return io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
+	reader := io.LimitReader(r.Body, maxBodyBytes)
+	if strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
+		gz := gzipReaderPool.Get().(*gzip.Reader)
+		if err := gz.Reset(reader); err != nil {
+			gzipReaderPool.Put(gz)
+			return nil, err
+		}
+		defer func() {
+			gz.Close()
+			gzipReaderPool.Put(gz)
+		}()
+		reader = io.LimitReader(gz, maxBodyBytes)
+	}
+	return io.ReadAll(reader)
+}
+
+func isJSON(r *http.Request) bool {
+	ct := r.Header.Get("Content-Type")
+	return len(ct) >= len(jsonContentType) && ct[:len(jsonContentType)] == jsonContentType
 }
 
 func queryLimit(r *http.Request) int {

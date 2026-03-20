@@ -5,6 +5,7 @@ import (
 	"time"
 
 	collectortracev1 "go.opentelemetry.io/proto/otlp/collector/trace/v1"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/kkc/javi-collector/internal/model"
@@ -50,4 +51,17 @@ func DecodeTraces(b []byte) ([]*model.SpanData, error) {
 		}
 	}
 	return spans, nil
+}
+
+// DecodeTracesJSON parses OTLP ExportTraceServiceRequest JSON bytes into SpanData slice.
+func DecodeTracesJSON(b []byte) ([]*model.SpanData, error) {
+	req := &collectortracev1.ExportTraceServiceRequest{}
+	if err := protojson.Unmarshal(b, req); err != nil {
+		return nil, err
+	}
+	pb, err := proto.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	return DecodeTraces(pb)
 }

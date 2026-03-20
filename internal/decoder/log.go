@@ -5,6 +5,7 @@ import (
 	"time"
 
 	collectorlogsv1 "go.opentelemetry.io/proto/otlp/collector/logs/v1"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/kkc/javi-collector/internal/model"
@@ -47,4 +48,17 @@ func DecodeLogs(b []byte) ([]*model.LogData, error) {
 		}
 	}
 	return logs, nil
+}
+
+// DecodeLogsJSON parses OTLP ExportLogsServiceRequest JSON bytes into LogData slice.
+func DecodeLogsJSON(b []byte) ([]*model.LogData, error) {
+	req := &collectorlogsv1.ExportLogsServiceRequest{}
+	if err := protojson.Unmarshal(b, req); err != nil {
+		return nil, err
+	}
+	pb, err := proto.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	return DecodeLogs(pb)
 }

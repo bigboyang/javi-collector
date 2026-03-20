@@ -5,6 +5,7 @@ import (
 
 	collectormetricsv1 "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	metricsv1 "go.opentelemetry.io/proto/otlp/metrics/v1"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/kkc/javi-collector/internal/model"
@@ -104,4 +105,17 @@ func convertHistogramDataPoints(dps []*metricsv1.HistogramDataPoint) []model.Dat
 		})
 	}
 	return points
+}
+
+// DecodeMetricsJSON parses OTLP ExportMetricsServiceRequest JSON bytes into MetricData slice.
+func DecodeMetricsJSON(b []byte) ([]*model.MetricData, error) {
+	req := &collectormetricsv1.ExportMetricsServiceRequest{}
+	if err := protojson.Unmarshal(b, req); err != nil {
+		return nil, err
+	}
+	pb, err := proto.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	return DecodeMetrics(pb)
 }
