@@ -21,6 +21,7 @@ import (
 //   - 폴링 실패 시 이전 config를 유지한다 (fail-safe)
 //   - Stop()은 goroutine이 완전히 종료될 때까지 블로킹한다 (goroutine leak 방지)
 //   - url이 빈 문자열이면 폴링하지 않고 initial config를 유지한다
+//   - ETag 조건부 GET: 서버가 304 반환 시 body 읽기·JSON 파싱을 건너뛴다
 //
 // ConfigProvider 인터페이스를 구현하므로 TailSamplingStore에 직접 주입 가능하다.
 type RemoteConfigPoller struct {
@@ -31,6 +32,10 @@ type RemoteConfigPoller struct {
 	// atomic.Pointer: 읽기 경로(hot path)에서 lock-free O(1) 접근
 	// 쓰기는 poller goroutine 하나만 수행 → race-free
 	current atomic.Pointer[SamplingConfig]
+
+	// lastETag: 직전 성공 응답의 ETag 값.
+	// poller goroutine에서만 읽고 씀 → 별도 동기화 불필요
+	lastETag string
 
 	// onChange: config 변경 시 TailSamplingStore가 AdaptiveController를 업데이트하도록 알림
 	// 버퍼 1: 빠른 연속 변경 시 poller 블로킹 방지
@@ -109,15 +114,32 @@ func (p *RemoteConfigPoller) Stop() {
 	<-p.doneCh
 }
 
-// poll은 HTTP GET으로 config를 가져와 atomic 교체한다.
+// poll은 ETag 조건부 GET으로 config를 가져와 atomic 교체한다.
+// 서버가 304 Not Modified를 반환하면 body 읽기·JSON 파싱을 건너뛴다.
 // 실패 시 경고 로그만 남기고 이전 config를 유지한다.
 func (p *RemoteConfigPoller) poll() {
-	resp, err := p.httpClient.Get(p.url)
+	req, err := http.NewRequest(http.MethodGet, p.url, nil)
+	if err != nil {
+		slog.Warn("remote config request build failed", "url", p.url, "err", err)
+		return
+	}
+
+	// ETag가 있으면 조건부 GET: 변경 없을 때 304로 body 전송을 생략한다.
+	if p.lastETag != "" {
+		req.Header.Set("If-None-Match", p.lastETag)
+	}
+
+	resp, err := p.httpClient.Do(req)
 	if err != nil {
 		slog.Warn("remote config poll failed", "url", p.url, "err", err)
 		return
 	}
 	defer resp.Body.Close()
+
+	// 304 Not Modified: config 미변경 → body 파싱 불필요
+	if resp.StatusCode == http.StatusNotModified {
+		return
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		slog.Warn("remote config non-200", "url", p.url, "status", resp.StatusCode)
@@ -135,6 +157,11 @@ func (p *RemoteConfigPoller) poll() {
 	if err != nil {
 		slog.Warn("remote config parse failed", "err", err, "body_len", len(body))
 		return
+	}
+
+	// 성공 시 ETag 갱신 (서버가 ETag를 제공하는 경우에만)
+	if etag := resp.Header.Get("ETag"); etag != "" {
+		p.lastETag = etag
 	}
 
 	old := p.current.Load()
