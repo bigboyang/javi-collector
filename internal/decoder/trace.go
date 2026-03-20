@@ -59,9 +59,5 @@ func DecodeTracesJSON(b []byte) ([]*model.SpanData, error) {
 	if err := protojson.Unmarshal(b, req); err != nil {
 		return nil, err
 	}
-	pb, err := proto.Marshal(req)
-	if err != nil {
-		return nil, err
-	}
-	return DecodeTraces(pb)
+	return DecodeTracesFromRequest(req), nil
 }

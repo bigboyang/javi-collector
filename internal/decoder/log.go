@@ -56,9 +56,5 @@ func DecodeLogsJSON(b []byte) ([]*model.LogData, error) {
 	if err := protojson.Unmarshal(b, req); err != nil {
 		return nil, err
 	}
-	pb, err := proto.Marshal(req)
-	if err != nil {
-		return nil, err
-	}
-	return DecodeLogs(pb)
+	return DecodeLogsFromRequest(req), nil
 }

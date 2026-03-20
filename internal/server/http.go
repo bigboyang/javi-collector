@@ -21,6 +21,7 @@
 package server
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -422,24 +423,42 @@ func (s *HTTPServer) readyz(w http.ResponseWriter, r *http.Request) {
 // ---- 헬퍼 ----
 
 // readProtoBody는 HTTP 요청 body를 읽어 반환한다.
-// Content-Encoding: gzip인 경우 압축을 해제한다 (OTel exporter 기본값).
+// Content-Encoding: gzip이거나 gzip 매직 바이트(0x1f 0x8b)로 시작하면 압축을 해제한다.
+// 일부 OTel exporter가 gzip 압축은 하지만 Content-Encoding 헤더를 누락하는 경우를 방어한다.
 // gzip.Reader는 sync.Pool에서 재사용해 GC 부담을 줄인다.
 // zip-bomb 방어: 압축 전/후 모두 maxBodyBytes로 제한한다.
 func readProtoBody(r *http.Request) ([]byte, error) {
-	reader := io.LimitReader(r.Body, maxBodyBytes)
 	if strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
-		gz := gzipReaderPool.Get().(*gzip.Reader)
-		if err := gz.Reset(reader); err != nil {
-			gzipReaderPool.Put(gz)
-			return nil, err
-		}
-		defer func() {
-			gz.Close()
-			gzipReaderPool.Put(gz)
-		}()
-		reader = io.LimitReader(gz, maxBodyBytes)
+		return decompressGzip(io.LimitReader(r.Body, maxBodyBytes))
 	}
-	return io.ReadAll(reader)
+
+	b, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
+	if err != nil {
+		return nil, err
+	}
+
+	// Fallback: gzip 매직 바이트(0x1f 0x8b) 스니핑.
+	// Content-Encoding 헤더 없이 gzip 전송하는 클라이언트 대응.
+	// 해당 바이트를 proto.Unmarshal에 그대로 전달하면 wire type 7 오류 발생.
+	if len(b) >= 2 && b[0] == 0x1f && b[1] == 0x8b {
+		return decompressGzip(bytes.NewReader(b))
+	}
+
+	return b, nil
+}
+
+// decompressGzip은 gzip 스트림을 해제해 원본 bytes를 반환한다.
+func decompressGzip(r io.Reader) ([]byte, error) {
+	gz := gzipReaderPool.Get().(*gzip.Reader)
+	if err := gz.Reset(r); err != nil {
+		gzipReaderPool.Put(gz)
+		return nil, err
+	}
+	defer func() {
+		gz.Close()
+		gzipReaderPool.Put(gz)
+	}()
+	return io.ReadAll(io.LimitReader(gz, maxBodyBytes))
 }
 
 func isJSON(r *http.Request) bool {

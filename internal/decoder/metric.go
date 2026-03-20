@@ -113,9 +113,5 @@ func DecodeMetricsJSON(b []byte) ([]*model.MetricData, error) {
 	if err := protojson.Unmarshal(b, req); err != nil {
 		return nil, err
 	}
-	pb, err := proto.Marshal(req)
-	if err != nil {
-		return nil, err
-	}
-	return DecodeMetrics(pb)
+	return DecodeMetricsFromRequest(req), nil
 }
