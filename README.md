@@ -59,3 +59,8 @@ gRPC 포트 4317에서 OTLP TraceService / MetricsService / LogsService 지원.
 | `FLUSH_INTERVAL` | `2s` | 타이머 flush 주기 |
 | `CHANNEL_BUFFER_SIZE` | `8192` | 채널 버퍼 깊이 |
 | `DISABLE_CLICKHOUSE` | `false` | 인메모리 fallback |
+| `SAMPLING_ENABLED` | `false` | Tail Sampling 활성화 |
+| `SELF_URL` | `` | 현재 인스턴스 HTTP base URL (멀티 인스턴스 라우팅용, e.g. `http://collector-0:4318`) |
+| `PEER_URLS` | `` | 다른 인스턴스 URL 목록 (콤마 구분, e.g. `http://collector-1:4318,http://collector-2:4318`) |
+| `PEER_CB_FAILURE_THRESHOLD` | `5` | 피어 전달 연속 실패 시 Circuit Breaker 열기 임계값 (0=비활성화) |
+| `PEER_CB_COOLDOWN` | `30s` | 피어 Circuit Breaker open 유지 시간 |

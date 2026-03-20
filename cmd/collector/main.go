@@ -197,6 +197,24 @@ func main() {
 
 	ing := ingester.New(ingestTraceStore, ingestMetricStore, ingestLogStore, embedPipeline)
 
+	// TraceRouter: SAMPLING_ENABLED=true이고 SELF_URL이 설정된 경우 활성화.
+	// 멀티 인스턴스 배포 시 traceID 기반 일관 해시로 동일 trace의 spans를
+	// 항상 같은 인스턴스로 모아 TailSampling이 완전한 trace 데이터로 결정하도록 한다.
+	var traceRouter *sampling.TraceRouter
+	if cfg.SamplingEnabled && cfg.SelfURL != "" {
+		traceRouter = sampling.NewTraceRouter(cfg.SelfURL, cfg.PeerURLs,
+			cfg.PeerCBFailureThreshold, cfg.PeerCBCooldown)
+		if traceRouter.Enabled() {
+			slog.Info("trace routing enabled",
+				"self", cfg.SelfURL,
+				"peers", cfg.PeerURLs,
+				"total_nodes", len(cfg.PeerURLs)+1,
+				"cb_threshold", cfg.PeerCBFailureThreshold,
+				"cb_cooldown", cfg.PeerCBCooldown,
+			)
+		}
+	}
+
 	defer func() {
 		if embedPipeline != nil {
 			embedPipeline.Close()
@@ -221,6 +239,12 @@ func main() {
 	// gRPC 서버 (OTLP/gRPC + Health + Reflection)
 	grpcAddr := ":" + strconv.Itoa(cfg.GRPCPort)
 	grpcSrv := server.NewGRPCServer(grpcAddr, ing)
+
+	// TraceRouter를 HTTP/gRPC 서버 양쪽에 주입
+	if traceRouter != nil && traceRouter.Enabled() {
+		httpSrv.SetTraceRouter(traceRouter)
+		grpcSrv.SetTraceRouter(traceRouter)
+	}
 
 	// HTTP 서버 시작
 	go func() {

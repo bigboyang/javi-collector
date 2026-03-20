@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -84,6 +85,24 @@ type Config struct {
 	// 1이면 단일 직렬 flush (이전 동작), N이면 N개 goroutine이 동시에 flush한다.
 	// 기본값 2. 고부하 환경에서 4-8로 늘리면 쓰기 병목을 해소할 수 있다.
 	FlushWorkers int
+
+	// SelfURL: 현재 인스턴스의 HTTP base URL (멀티 인스턴스 Tail Sampling 라우팅용).
+	// e.g., "http://collector-0:4318"
+	// 비어 있으면 TraceRouter가 비활성화된다.
+	SelfURL string
+
+	// PeerURLs: 다른 컬렉터 인스턴스들의 HTTP base URL 목록 (콤마 구분).
+	// SAMPLING_ENABLED=true이고 SelfURL이 설정된 경우에만 라우팅이 활성화된다.
+	// e.g., "http://collector-1:4318,http://collector-2:4318"
+	PeerURLs []string
+
+	// PeerCBFailureThreshold: 피어 전달 연속 실패 횟수 임계값.
+	// 이 횟수만큼 연속 실패하면 해당 피어로의 전달을 일시 차단한다.
+	// 0이면 Circuit Breaker 비활성화. (기본 5)
+	PeerCBFailureThreshold int
+
+	// PeerCBCooldown: 피어 Circuit Breaker open 유지 시간. (기본 30s)
+	PeerCBCooldown time.Duration
 }
 
 // Load는 환경변수에서 설정을 읽어 Config를 반환한다.
@@ -118,6 +137,10 @@ func Load() (*Config, error) {
 		CBFailureThreshold:       envInt("CB_FAILURE_THRESHOLD", 5),
 		CBCooldown:               envDuration("CB_COOLDOWN", 60*time.Second),
 		FlushWorkers:             envInt("FLUSH_WORKERS", 2),
+		SelfURL:                  envStr("SELF_URL", ""),
+		PeerURLs:                 envStringSlice("PEER_URLS", nil),
+		PeerCBFailureThreshold:   envInt("PEER_CB_FAILURE_THRESHOLD", 5),
+		PeerCBCooldown:           envDuration("PEER_CB_COOLDOWN", 30*time.Second),
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -192,4 +215,19 @@ func envBool(key string, def bool) bool {
 		return def
 	}
 	return b
+}
+
+func envStringSlice(key string, def []string) []string {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	var result []string
+	for _, part := range strings.Split(v, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			result = append(result, part)
+		}
+	}
+	return result
 }

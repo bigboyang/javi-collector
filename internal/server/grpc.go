@@ -35,6 +35,7 @@ import (
 	collectortracev1 "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 
 	"github.com/kkc/javi-collector/internal/ingester"
+	"github.com/kkc/javi-collector/internal/sampling"
 )
 
 // ---- Prometheus 지표 ----
@@ -58,10 +59,11 @@ var (
 // GRPCServer는 OTLP/gRPC 수신 서버다.
 // TraceService, MetricsService, LogsService, Health, Reflection을 단일 grpc.Server에 등록한다.
 type GRPCServer struct {
-	srv      *grpc.Server
-	health   *health.Server
-	ingester *ingester.Ingester
-	addr     string
+	srv         *grpc.Server
+	health      *health.Server
+	ingester    *ingester.Ingester
+	addr        string
+	traceSvc    *traceServiceServer // SetTraceRouter에서 router 주입용
 }
 
 // NewGRPCServer는 OTLP gRPC 서버를 생성하고 서비스를 등록한다.
@@ -90,10 +92,11 @@ func NewGRPCServer(addr string, ing *ingester.Ingester) *GRPCServer {
 	healthSrv.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
 	healthSrv.SetServingStatus("otlp.collector", grpc_health_v1.HealthCheckResponse_SERVING)
 
-	s := &GRPCServer{srv: srv, health: healthSrv, ingester: ing, addr: addr}
+	traceSvc := &traceServiceServer{ing: ing}
+	s := &GRPCServer{srv: srv, health: healthSrv, ingester: ing, addr: addr, traceSvc: traceSvc}
 
 	// OTLP 서비스 등록
-	collectortracev1.RegisterTraceServiceServer(srv, &traceServiceServer{ing: ing})
+	collectortracev1.RegisterTraceServiceServer(srv, traceSvc)
 	collectormetricsv1.RegisterMetricsServiceServer(srv, &metricsServiceServer{ing: ing})
 	collectorlogsv1.RegisterLogsServiceServer(srv, &logsServiceServer{ing: ing})
 
@@ -104,6 +107,12 @@ func NewGRPCServer(addr string, ing *ingester.Ingester) *GRPCServer {
 	reflection.Register(srv)
 
 	return s
+}
+
+// SetTraceRouter는 멀티 인스턴스 Tail Sampling용 TraceRouter를 설정한다.
+// Start() 전에 호출해야 한다.
+func (g *GRPCServer) SetTraceRouter(r *sampling.TraceRouter) {
+	g.traceSvc.router = r
 }
 
 // Start는 TCP 리스너를 열고 gRPC 서버를 블로킹 실행한다.
@@ -127,19 +136,39 @@ func (g *GRPCServer) Stop() {
 
 type traceServiceServer struct {
 	collectortracev1.UnimplementedTraceServiceServer
-	ing *ingester.Ingester
+	ing    *ingester.Ingester
+	router *sampling.TraceRouter // nil이면 라우팅 비활성화
 }
 
 // Export는 Java APM 에이전트가 보낸 ExportTraceServiceRequest를 처리한다.
 // gRPC 프레임워크가 이미 Unmarshal한 *req를 직접 ingester에 전달해
 // proto.Marshal → proto.Unmarshal 왕복을 제거한다.
+//
+// TraceRouter가 활성화된 경우 traceID 기반 일관 해시로 spans를 라우팅한다.
+// 비담당 spans는 해당 피어의 HTTP /v1/traces로 비동기 전달하고,
+// 담당 spans만 ingester로 처리한다.
 func (s *traceServiceServer) Export(
 	ctx context.Context,
 	req *collectortracev1.ExportTraceServiceRequest,
 ) (*collectortracev1.ExportTraceServiceResponse, error) {
 	grpcRequestsTotal.WithLabelValues("TraceService").Inc()
 
-	count, err := s.ing.IngestTracesFromProto(ctx, req)
+	var count int
+	var err error
+
+	if s.router != nil && s.router.Enabled() {
+		localReq, remoteMap := s.router.Route(ctx, req)
+		// 비담당 spans 비동기 전달: gRPC context는 RPC 완료 후 취소되므로 Background 사용
+		for peerURL, remoteReq := range remoteMap {
+			go s.router.Forward(context.Background(), peerURL, remoteReq)
+		}
+		if len(localReq.GetResourceSpans()) > 0 {
+			count, err = s.ing.IngestTracesFromProto(ctx, localReq)
+		}
+	} else {
+		count, err = s.ing.IngestTracesFromProto(ctx, req)
+	}
+
 	if err != nil {
 		grpcErrorsTotal.WithLabelValues("TraceService").Inc()
 		slog.Warn("gRPC trace ingest error", "err", err)

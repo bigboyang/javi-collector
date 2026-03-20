@@ -34,8 +34,11 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	collectortracev1 "go.opentelemetry.io/proto/otlp/collector/trace/v1"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/kkc/javi-collector/internal/ingester"
+	"github.com/kkc/javi-collector/internal/sampling"
 	"github.com/kkc/javi-collector/internal/store"
 )
 
@@ -81,6 +84,10 @@ type HTTPServer struct {
 	logStore    store.LogStore
 	srv         *http.Server
 	ready       chan struct{} // close되면 readyz가 200을 반환한다
+
+	// traceRouter는 멀티 인스턴스 Tail Sampling 시 traceID 기반 라우팅을 담당한다.
+	// nil이면 라우팅 비활성화 (단일 인스턴스 또는 Sampling 미사용 배포).
+	traceRouter *sampling.TraceRouter
 }
 
 func NewHTTPServer(addr string, ing *ingester.Ingester,
@@ -128,6 +135,12 @@ func NewHTTPServer(addr string, ing *ingester.Ingester,
 	return s
 }
 
+// SetTraceRouter는 멀티 인스턴스 Tail Sampling용 TraceRouter를 설정한다.
+// Start() 전에 호출해야 한다.
+func (s *HTTPServer) SetTraceRouter(r *sampling.TraceRouter) {
+	s.traceRouter = r
+}
+
 // MarkReady는 서버가 트래픽을 받을 준비가 되었음을 신호한다.
 // main에서 모든 초기화(store 연결 등)가 완료된 후 호출해야 한다.
 // 쿠버네티스 readiness probe가 이 상태를 확인한다.
@@ -161,12 +174,24 @@ func (s *HTTPServer) handleTraces(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+
 	var count int
-	if isJSON(r) {
+	switch {
+	case isJSON(r):
+		// JSON 경로: 라우팅 미지원 (JSON exporter는 일반적으로 테스트/개발용)
 		count, err = s.ingester.IngestTracesJSON(r.Context(), body)
-	} else {
+
+	case s.traceRouter != nil && s.traceRouter.Enabled() && r.Header.Get(sampling.RoutedHeader) == "":
+		// Protobuf + 라우팅 활성화 + 직접 수신(forwarded 아님):
+		// traceID 기반 일관 해시로 spans를 owner 인스턴스별로 분리.
+		// 비담당 spans는 해당 피어로 비동기 전달하고, 담당 spans만 로컬에서 처리.
+		count, err = s.routeAndIngestTraces(r.Context(), body)
+
+	default:
+		// 단일 인스턴스 또는 이미 라우팅된 요청: 직접 처리
 		count, err = s.ingester.IngestTraces(r.Context(), body)
 	}
+
 	if err != nil {
 		slog.Warn("trace ingest error", "err", err)
 		// backpressure: Retry-After로 클라이언트가 적절한 간격 후 재시도하도록 유도
@@ -176,6 +201,32 @@ func (s *HTTPServer) handleTraces(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Debug("POST /v1/traces", "spans", count, "bytes", len(body))
 	w.WriteHeader(http.StatusOK)
+}
+
+// routeAndIngestTraces는 OTLP protobuf 요청을 traceID 기반으로 라우팅한다.
+//
+// 1. proto.Unmarshal로 요청을 파싱
+// 2. TraceRouter.Route로 spans를 owner별로 분리
+// 3. 비담당 spans를 각 피어로 비동기 전달 (context.Background 사용 — HTTP 응답 후에도 전달 완료)
+// 4. 담당 spans만 ingester로 처리
+func (s *HTTPServer) routeAndIngestTraces(ctx context.Context, body []byte) (int, error) {
+	req := &collectortracev1.ExportTraceServiceRequest{}
+	if err := proto.Unmarshal(body, req); err != nil {
+		return 0, err
+	}
+
+	localReq, remoteMap := s.traceRouter.Route(ctx, req)
+
+	// 비담당 spans 비동기 전달: HTTP 응답 전송 후 context가 취소될 수 있으므로
+	// context.Background()를 사용해 전달이 완전히 완료되도록 한다.
+	for peerURL, remoteReq := range remoteMap {
+		go s.traceRouter.Forward(context.Background(), peerURL, remoteReq)
+	}
+
+	if len(localReq.GetResourceSpans()) == 0 {
+		return 0, nil
+	}
+	return s.ingester.IngestTracesFromProto(ctx, localReq)
 }
 
 func (s *HTTPServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
