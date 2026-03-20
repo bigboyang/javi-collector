@@ -57,6 +57,11 @@ type Config struct {
 	EmbedModel       string // e.g. nomic-embed-text
 	QdrantEndpoint   string // e.g. http://localhost:6333
 	QdrantCollection string
+
+	// 파일 백업 설정 (BACKUP_ENABLED=true 시 활성화)
+	// 수신된 trace/metric/log를 JSONL 파일로 백업한다.
+	BackupEnabled bool
+	BackupDir     string // 백업 파일 저장 디렉터리 (기본: ./backup)
 }
 
 // Load는 환경변수에서 설정을 읽어 Config를 반환한다.
@@ -83,6 +88,8 @@ func Load() (*Config, error) {
 		EmbedModel:               envStr("EMBED_MODEL", "nomic-embed-text"),
 		QdrantEndpoint:           envStr("QDRANT_ENDPOINT", "http://localhost:6333"),
 		QdrantCollection:         envStr("QDRANT_COLLECTION", "apm_errors"),
+		BackupEnabled:            envBool("BACKUP_ENABLED", false),
+		BackupDir:                envStr("BACKUP_DIR", "./backup"),
 	}
 
 	if err := cfg.validate(); err != nil {

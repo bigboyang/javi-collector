@@ -149,7 +149,34 @@ func main() {
 		}
 	}
 
-	ing := ingester.New(tailStore, metricStore, logStore, embedPipeline)
+	// 파일 백업: BACKUP_ENABLED=true이면 ingester에 전달되는 store를
+	// Backup 데코레이터로 감싼다. tailStore 자체는 *TailSamplingStore 타입을
+	// 유지해야 하므로(Start/Close 메서드 사용) 인터페이스 변수를 별도로 선언한다.
+	// 백업 쓰기 실패가 수신 파이프라인을 막지 않도록 내부에서 warn-only 처리한다.
+	var (
+		ingestTraceStore  store.TraceStore  = tailStore
+		ingestMetricStore store.MetricStore = metricStore
+		ingestLogStore    store.LogStore    = logStore
+	)
+
+	if cfg.BackupEnabled {
+		backupWriter, err := store.NewFileBackupWriter(cfg.BackupDir)
+		if err != nil {
+			slog.Error("backup writer init failed", "err", err)
+			os.Exit(1)
+		}
+		defer func() {
+			if err := backupWriter.Close(); err != nil {
+				slog.Warn("backup writer close error", "err", err)
+			}
+		}()
+		ingestTraceStore = store.NewBackupTraceStore(tailStore, backupWriter)
+		ingestMetricStore = store.NewBackupMetricStore(metricStore, backupWriter)
+		ingestLogStore = store.NewBackupLogStore(logStore, backupWriter)
+		slog.Info("file backup enabled", "dir", cfg.BackupDir)
+	}
+
+	ing := ingester.New(ingestTraceStore, ingestMetricStore, ingestLogStore, embedPipeline)
 
 	defer func() {
 		if embedPipeline != nil {
