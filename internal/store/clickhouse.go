@@ -93,6 +93,15 @@ var (
 		Name:      "flush_retries_total",
 		Help:      "Total number of flush retry attempts.",
 	}, []string{"table"})
+
+	// chDLQWrittenTotal: flush 실패 후 DLQ 파일에 보존된 항목 수.
+	// DLQ 파일은 ClickHouse 복구 후 수동 재적재(replay)에 사용된다.
+	chDLQWrittenTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "javi",
+		Subsystem: "clickhouse",
+		Name:      "dlq_written_total",
+		Help:      "Total number of items written to DLQ after flush failure.",
+	}, []string{"table"})
 )
 
 // ClickHouseConfig는 ClickHouse 연결 및 배치 설정이다.
@@ -105,6 +114,11 @@ type ClickHouseConfig struct {
 	FlushInterval time.Duration
 	ChanBuffer    int
 	RetentionDays int // 데이터 보관 기간 (일), TTL로 적용
+
+	// DLQDir: flush 실패 배치를 보존할 Dead Letter Queue 디렉터리.
+	// 비어 있으면 DLQ 비활성화 (데이터 유실 허용).
+	// DLQ 파일(traces/metrics/logs-YYYY-MM-DD.jsonl)은 ClickHouse 복구 후 수동 재적재 가능.
+	DLQDir string
 }
 
 // OpenConn은 ClickHouse native protocol 공유 연결 풀을 연다.
@@ -170,6 +184,7 @@ type ClickHouseTraceStore struct {
 	cfg     ClickHouseConfig
 	done    chan struct{}
 	flushWg sync.WaitGroup // 비동기 flush 완료 대기용
+	dlq     *FileBackupWriter // flush 실패 시 배치 보존 (nil이면 비활성화)
 }
 
 // NewClickHouseTraceStore는 공유 커넥션을 받아 테이블 DDL을 적용하고 batchWriter를 시작한다.
@@ -179,11 +194,21 @@ func NewClickHouseTraceStore(conn driver.Conn, cfg ClickHouseConfig) (*ClickHous
 		return nil, fmt.Errorf("clickhouse trace DDL: %w", err)
 	}
 
+	var dlq *FileBackupWriter
+	if cfg.DLQDir != "" {
+		var err error
+		dlq, err = NewFileBackupWriter(cfg.DLQDir)
+		if err != nil {
+			return nil, fmt.Errorf("clickhouse trace DLQ init: %w", err)
+		}
+	}
+
 	s := &ClickHouseTraceStore{
 		conn: conn,
 		ch:   make(chan *model.SpanData, cfg.ChanBuffer),
 		cfg:  cfg,
 		done: make(chan struct{}),
+		dlq:  dlq,
 	}
 	go s.batchWriter()
 	return s, nil
@@ -434,6 +459,11 @@ func (s *ClickHouseTraceStore) Close() error {
 	case <-time.After(closeTimeout):
 		slog.Warn("clickhouse trace store close timeout: drain incomplete")
 	}
+	if s.dlq != nil {
+		if err := s.dlq.Close(); err != nil {
+			slog.Warn("clickhouse trace DLQ close error", "err", err)
+		}
+	}
 	return nil
 }
 
@@ -471,6 +501,14 @@ func (s *ClickHouseTraceStore) batchWriter() {
 			if err := retryFlush("spans", func() error { return s.flushSpans(data) }); err != nil {
 				chFlushErrorsTotal.WithLabelValues("spans").Inc()
 				slog.Error("clickhouse span flush failed (all retries exhausted)", "err", err, "count", len(data))
+				if s.dlq != nil {
+					if dlqErr := s.dlq.WriteSpans(data); dlqErr != nil {
+						slog.Error("clickhouse span DLQ write failed — data lost", "err", dlqErr, "count", len(data))
+					} else {
+						chDLQWrittenTotal.WithLabelValues("spans").Add(float64(len(data)))
+						slog.Warn("clickhouse span flush failed; batch saved to DLQ", "count", len(data), "dlq_dir", s.cfg.DLQDir)
+					}
+				}
 			}
 		}(b)
 	}
@@ -566,6 +604,7 @@ type ClickHouseMetricStore struct {
 	cfg     ClickHouseConfig
 	done    chan struct{}
 	flushWg sync.WaitGroup // 비동기 flush 완료 대기용
+	dlq     *FileBackupWriter // flush 실패 시 배치 보존 (nil이면 비활성화)
 }
 
 func NewClickHouseMetricStore(conn driver.Conn, cfg ClickHouseConfig) (*ClickHouseMetricStore, error) {
@@ -573,11 +612,21 @@ func NewClickHouseMetricStore(conn driver.Conn, cfg ClickHouseConfig) (*ClickHou
 		return nil, fmt.Errorf("clickhouse metric DDL: %w", err)
 	}
 
+	var dlq *FileBackupWriter
+	if cfg.DLQDir != "" {
+		var err error
+		dlq, err = NewFileBackupWriter(cfg.DLQDir)
+		if err != nil {
+			return nil, fmt.Errorf("clickhouse metric DLQ init: %w", err)
+		}
+	}
+
 	s := &ClickHouseMetricStore{
 		conn: conn,
 		ch:   make(chan *model.MetricData, cfg.ChanBuffer),
 		cfg:  cfg,
 		done: make(chan struct{}),
+		dlq:  dlq,
 	}
 	go s.batchWriter()
 	return s, nil
@@ -679,6 +728,11 @@ func (s *ClickHouseMetricStore) Close() error {
 	case <-time.After(closeTimeout):
 		slog.Warn("clickhouse metric store close timeout: drain incomplete")
 	}
+	if s.dlq != nil {
+		if err := s.dlq.Close(); err != nil {
+			slog.Warn("clickhouse metric DLQ close error", "err", err)
+		}
+	}
 	return nil
 }
 
@@ -711,6 +765,14 @@ func (s *ClickHouseMetricStore) batchWriter() {
 			if err := retryFlush("metrics", func() error { return s.flushMetrics(data) }); err != nil {
 				chFlushErrorsTotal.WithLabelValues("metrics").Inc()
 				slog.Error("clickhouse metric flush failed (all retries exhausted)", "err", err, "count", len(data))
+				if s.dlq != nil {
+					if dlqErr := s.dlq.WriteMetrics(data); dlqErr != nil {
+						slog.Error("clickhouse metric DLQ write failed — data lost", "err", dlqErr, "count", len(data))
+					} else {
+						chDLQWrittenTotal.WithLabelValues("metrics").Add(float64(len(data)))
+						slog.Warn("clickhouse metric flush failed; batch saved to DLQ", "count", len(data), "dlq_dir", s.cfg.DLQDir)
+					}
+				}
 			}
 		}(b)
 	}
@@ -878,6 +940,7 @@ type ClickHouseLogStore struct {
 	cfg     ClickHouseConfig
 	done    chan struct{}
 	flushWg sync.WaitGroup // 비동기 flush 완료 대기용
+	dlq     *FileBackupWriter // flush 실패 시 배치 보존 (nil이면 비활성화)
 }
 
 func NewClickHouseLogStore(conn driver.Conn, cfg ClickHouseConfig) (*ClickHouseLogStore, error) {
@@ -885,11 +948,21 @@ func NewClickHouseLogStore(conn driver.Conn, cfg ClickHouseConfig) (*ClickHouseL
 		return nil, fmt.Errorf("clickhouse log DDL: %w", err)
 	}
 
+	var dlq *FileBackupWriter
+	if cfg.DLQDir != "" {
+		var err error
+		dlq, err = NewFileBackupWriter(cfg.DLQDir)
+		if err != nil {
+			return nil, fmt.Errorf("clickhouse log DLQ init: %w", err)
+		}
+	}
+
 	s := &ClickHouseLogStore{
 		conn: conn,
 		ch:   make(chan *model.LogData, cfg.ChanBuffer),
 		cfg:  cfg,
 		done: make(chan struct{}),
+		dlq:  dlq,
 	}
 	go s.batchWriter()
 	return s, nil
@@ -1051,6 +1124,11 @@ func (s *ClickHouseLogStore) Close() error {
 	case <-time.After(closeTimeout):
 		slog.Warn("clickhouse log store close timeout: drain incomplete")
 	}
+	if s.dlq != nil {
+		if err := s.dlq.Close(); err != nil {
+			slog.Warn("clickhouse log DLQ close error", "err", err)
+		}
+	}
 	return nil
 }
 
@@ -1083,6 +1161,14 @@ func (s *ClickHouseLogStore) batchWriter() {
 			if err := retryFlush("logs", func() error { return s.flushLogs(data) }); err != nil {
 				chFlushErrorsTotal.WithLabelValues("logs").Inc()
 				slog.Error("clickhouse log flush failed (all retries exhausted)", "err", err, "count", len(data))
+				if s.dlq != nil {
+					if dlqErr := s.dlq.WriteLogs(data); dlqErr != nil {
+						slog.Error("clickhouse log DLQ write failed — data lost", "err", dlqErr, "count", len(data))
+					} else {
+						chDLQWrittenTotal.WithLabelValues("logs").Add(float64(len(data)))
+						slog.Warn("clickhouse log flush failed; batch saved to DLQ", "count", len(data), "dlq_dir", s.cfg.DLQDir)
+					}
+				}
 			}
 		}(b)
 	}

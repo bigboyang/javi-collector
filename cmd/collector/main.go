@@ -53,6 +53,7 @@ func main() {
 			FlushInterval: cfg.FlushInterval,
 			ChanBuffer:    cfg.ChannelBufferSize,
 			RetentionDays: cfg.RetentionDays,
+			DLQDir:        cfg.DLQDir,
 		}
 
 		// 상용 APM 패턴: 하나의 공유 커넥션 풀을 세 Store가 공유한다.

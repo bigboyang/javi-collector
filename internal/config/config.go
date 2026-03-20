@@ -62,6 +62,11 @@ type Config struct {
 	// 수신된 trace/metric/log를 JSONL 파일로 백업한다.
 	BackupEnabled bool
 	BackupDir     string // 백업 파일 저장 디렉터리 (기본: ./backup)
+
+	// DLQDir: ClickHouse flush 실패 시 배치를 보존할 Dead Letter Queue 디렉터리.
+	// 비어 있으면 DLQ 비활성화 (flush 실패 데이터 유실 허용).
+	// DLQ 파일은 ClickHouse 복구 후 수동 재적재(replay)에 사용 가능하다.
+	DLQDir string
 }
 
 // Load는 환경변수에서 설정을 읽어 Config를 반환한다.
@@ -90,6 +95,7 @@ func Load() (*Config, error) {
 		QdrantCollection:         envStr("QDRANT_COLLECTION", "apm_errors"),
 		BackupEnabled:            envBool("BACKUP_ENABLED", false),
 		BackupDir:                envStr("BACKUP_DIR", "./backup"),
+		DLQDir:                   envStr("DLQ_DIR", "./dlq"),
 	}
 
 	if err := cfg.validate(); err != nil {
