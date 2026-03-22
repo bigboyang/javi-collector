@@ -19,7 +19,6 @@ package store
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -355,20 +354,18 @@ func (s *ClickHouseTraceStore) QuerySpans(ctx context.Context, q SpanQuery) ([]*
 	for rows.Next() {
 		var (
 			sp           model.SpanData
-			attrsJSON    string
+			attrsMap     map[string]string
 			durationNano int64
 		)
 		if err := rows.Scan(
 			&sp.TraceID, &sp.SpanID, &sp.ParentSpanID, &sp.Name, &sp.Kind,
 			&sp.StartTimeNano, &sp.EndTimeNano, &durationNano,
-			&attrsJSON, &sp.StatusCode, &sp.StatusMessage,
+			&attrsMap, &sp.StatusCode, &sp.StatusMessage,
 			&sp.ServiceName, &sp.ScopeName, &sp.ReceivedAtMs,
 		); err != nil {
 			return nil, err
 		}
-		if attrsJSON != "" && attrsJSON != "{}" {
-			_ = json.Unmarshal([]byte(attrsJSON), &sp.Attributes)
-		}
+		sp.Attributes = fromStringMap(attrsMap)
 		result = append(result, &sp)
 	}
 	return result, rows.Err()
@@ -403,12 +400,12 @@ SELECT
     span_name,
     http_route,
     minute,
-    sumMerge(total_count)                                AS rps,
-    sumMerge(error_count)                                AS errors,
-    sumMerge(error_count) / sumMerge(total_count) * 100 AS error_rate_pct,
-    quantileTDigestMerge(0.50)(duration_p50) / 1e6      AS p50_ms,
-    quantileTDigestMerge(0.95)(duration_p95) / 1e6      AS p95_ms,
-    quantileTDigestMerge(0.99)(duration_p99) / 1e6      AS p99_ms
+    sumMerge(total_count)                                              AS rps,
+    sumMerge(error_count)                                             AS errors,
+    sumMerge(error_count) / sumMerge(total_count) * 100              AS error_rate_pct,
+    quantilesMerge(0.5, 0.95, 0.99)(duration_quantiles)[1] / 1e6    AS p50_ms,
+    quantilesMerge(0.5, 0.95, 0.99)(duration_quantiles)[2] / 1e6    AS p95_ms,
+    quantilesMerge(0.5, 0.95, 0.99)(duration_quantiles)[3] / 1e6    AS p99_ms
 FROM %s.mv_red_1m_state
 %s
 GROUP BY service_name, span_name, http_route, minute
@@ -633,7 +630,6 @@ func (s *ClickHouseTraceStore) flushSpans(spans []*model.SpanData) error {
 	}
 
 	for _, sp := range spans {
-		attrsJSON, _ := json.Marshal(sp.Attributes)
 		attrs := sp.Attributes
 		if attrs == nil {
 			attrs = map[string]any{}
@@ -641,7 +637,7 @@ func (s *ClickHouseTraceStore) flushSpans(spans []*model.SpanData) error {
 		if err := batch.Append(
 			sp.TraceID, sp.SpanID, sp.ParentSpanID, sp.Name, sp.Kind,
 			sp.StartTimeNano, sp.EndTimeNano, sp.DurationNano(),
-			string(attrsJSON), sp.StatusCode, sp.StatusMessage,
+			toStringMap(attrs), sp.StatusCode, sp.StatusMessage,
 			sp.ServiceName, sp.ScopeName, sp.ReceivedAtMs,
 			strAttr(attrs, "http.request.method"),
 			strAttr(attrs, "http.route"),
@@ -802,16 +798,13 @@ func (s *ClickHouseMetricStore) QueryMetrics(ctx context.Context, q MetricQuery)
 	var result []*model.MetricData
 	for rows.Next() {
 		var (
-			name, mtype, attrsJSON, serviceName string
-			value                               float64
-			timestampNano, receivedAtMs         int64
+			name, mtype, serviceName string
+			attrsMap                 map[string]string
+			value                    float64
+			timestampNano, receivedAtMs int64
 		)
-		if err := rows.Scan(&name, &mtype, &value, &attrsJSON, &serviceName, &timestampNano, &receivedAtMs); err != nil {
+		if err := rows.Scan(&name, &mtype, &value, &attrsMap, &serviceName, &timestampNano, &receivedAtMs); err != nil {
 			return nil, err
-		}
-		var attrs map[string]any
-		if attrsJSON != "" {
-			_ = json.Unmarshal([]byte(attrsJSON), &attrs)
 		}
 		result = append(result, &model.MetricData{
 			Name:         name,
@@ -819,7 +812,7 @@ func (s *ClickHouseMetricStore) QueryMetrics(ctx context.Context, q MetricQuery)
 			ServiceName:  serviceName,
 			ReceivedAtMs: receivedAtMs,
 			DataPoints: []model.DataPoint{
-				{Attributes: attrs, TimeNanos: timestampNano, Value: value},
+				{Attributes: fromStringMap(attrsMap), TimeNanos: timestampNano, Value: value},
 			},
 		})
 	}
@@ -968,7 +961,6 @@ func (s *ClickHouseMetricStore) flushScalarMetrics(metrics []*model.MetricData) 
 	rowCount := 0
 	for _, m := range metrics {
 		for _, dp := range m.DataPoints {
-			attrsJSON, _ := json.Marshal(dp.Attributes)
 			var value float64
 			if m.Type == model.MetricTypeHistogram {
 				value = dp.Sum
@@ -977,7 +969,7 @@ func (s *ClickHouseMetricStore) flushScalarMetrics(metrics []*model.MetricData) 
 			}
 			if err := batch.Append(
 				m.Name, string(m.Type), value,
-				string(attrsJSON), m.ServiceName,
+				toStringMap(dp.Attributes), m.ServiceName,
 				dp.TimeNanos, m.ReceivedAtMs,
 			); err != nil {
 				return 0, fmt.Errorf("batch append scalar metric: %w", err)
@@ -1029,14 +1021,13 @@ func (s *ClickHouseMetricStore) flushHistogramMetrics(metrics []*model.MetricDat
 			continue
 		}
 		for _, dp := range m.DataPoints {
-			attrsJSON, _ := json.Marshal(dp.Attributes)
 			buckets := make([]uint64, len(dp.BucketCounts))
 			copy(buckets, dp.BucketCounts)
 			if err := batch.Append(
 				m.ServiceName, m.Name, dp.TimeNanos,
 				dp.ExplicitBounds, buckets,
 				uint64(dp.Count), dp.Sum,
-				string(attrsJSON), m.ReceivedAtMs,
+				toStringMap(dp.Attributes), m.ReceivedAtMs,
 			); err != nil {
 				return 0, fmt.Errorf("batch append histogram: %w", err)
 			}
@@ -1188,19 +1179,17 @@ func (s *ClickHouseLogStore) QueryLogs(ctx context.Context, q LogQuery) ([]*mode
 	var result []*model.LogData
 	for rows.Next() {
 		var (
-			l         model.LogData
-			attrsJSON string
+			l        model.LogData
+			attrsMap map[string]string
 		)
 		if err := rows.Scan(
-			&l.SeverityText, &l.SeverityNumber, &l.Body, &attrsJSON,
+			&l.SeverityText, &l.SeverityNumber, &l.Body, &attrsMap,
 			&l.ServiceName, &l.TraceID, &l.SpanID,
 			&l.TimestampNanos, &l.ReceivedAtMs,
 		); err != nil {
 			return nil, err
 		}
-		if attrsJSON != "" {
-			_ = json.Unmarshal([]byte(attrsJSON), &l.Attributes)
-		}
+		l.Attributes = fromStringMap(attrsMap)
 		result = append(result, &l)
 	}
 	return result, rows.Err()
@@ -1377,14 +1366,13 @@ func (s *ClickHouseLogStore) flushLogs(logs []*model.LogData) error {
 	}
 
 	for _, l := range logs {
-		attrsJSON, _ := json.Marshal(l.Attributes)
 		attrs := l.Attributes
 		if attrs == nil {
 			attrs = map[string]any{}
 		}
 		if err := batch.Append(
 			l.SeverityText, l.SeverityNumber, l.Body,
-			string(attrsJSON), l.ServiceName,
+			toStringMap(attrs), l.ServiceName,
 			l.TraceID, l.SpanID, l.TimestampNanos, l.ReceivedAtMs,
 			strAttr(attrs, "exception.type"),
 			strAttr(attrs, "logger.name"),
@@ -1405,6 +1393,35 @@ func (s *ClickHouseLogStore) flushLogs(logs []*model.LogData) error {
 }
 
 // ---- OTel 속성 추출 헬퍼 ----
+
+// toStringMap은 map[string]any를 ClickHouse Map(String,String) 타입에 맞게 변환한다.
+// 비문자열 값은 fmt.Sprintf("%v")로 직렬화한다.
+func toStringMap(attrs map[string]any) map[string]string {
+	if len(attrs) == 0 {
+		return map[string]string{}
+	}
+	m := make(map[string]string, len(attrs))
+	for k, v := range attrs {
+		if s, ok := v.(string); ok {
+			m[k] = s
+		} else {
+			m[k] = fmt.Sprintf("%v", v)
+		}
+	}
+	return m
+}
+
+// fromStringMap은 ClickHouse Map(String,String)을 map[string]any로 변환한다.
+func fromStringMap(m map[string]string) map[string]any {
+	if len(m) == 0 {
+		return nil
+	}
+	attrs := make(map[string]any, len(m))
+	for k, v := range m {
+		attrs[k] = v
+	}
+	return attrs
+}
 
 func strAttr(attrs map[string]any, key string) string {
 	if v, ok := attrs[key]; ok {
@@ -1449,7 +1466,7 @@ CREATE TABLE IF NOT EXISTS %s.spans (
     start_time_nano  Int64,
     end_time_nano    Int64,
     duration_nano    Int64,
-    attributes       String,
+    attributes       Map(String, String),
     status_code      Int32,
     status_message   String,
     service_name     LowCardinality(String),
@@ -1491,10 +1508,12 @@ TTL dt + INTERVAL %d DAY;
 		fmt.Sprintf("ALTER TABLE %s.spans ADD COLUMN IF NOT EXISTS exception_type String DEFAULT ''", db),
 		fmt.Sprintf("ALTER TABLE %s.spans ADD COLUMN IF NOT EXISTS exception_message String DEFAULT ''", db),
 		fmt.Sprintf("ALTER TABLE %s.spans ADD COLUMN IF NOT EXISTS exception_stacktrace String DEFAULT ''", db),
+		// #6: attributes String → Map(String,String) 마이그레이션 (기존 테이블 대상)
+		fmt.Sprintf("ALTER TABLE %s.spans MODIFY COLUMN IF EXISTS attributes Map(String, String)", db),
 	}
 	for _, q := range alterCols {
 		if err := conn.Exec(ctx, q); err != nil {
-			return fmt.Errorf("alter spans column: %w", err)
+			slog.Warn("alter spans column skipped", "query", q, "err", err)
 		}
 	}
 
@@ -1503,18 +1522,27 @@ TTL dt + INTERVAL %d DAY;
 		return err
 	}
 
+	// #6: RED MV quantile 버그 수정 — 기존 뷰/테이블을 새 스키마로 재생성.
+	// mv_red_1m MV → mv_red_1m_state 순으로 DROP해야 참조 무결성이 유지된다.
+	for _, dropQ := range []string{
+		fmt.Sprintf("DROP VIEW IF EXISTS %s.mv_red_1m", db),
+		fmt.Sprintf("DROP TABLE IF EXISTS %s.mv_red_1m_state", db),
+	} {
+		if err := conn.Exec(ctx, dropQ); err != nil {
+			return fmt.Errorf("drop mv_red: %w", err)
+		}
+	}
+
 	if err := conn.Exec(ctx, fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s.mv_red_1m_state (
-    service_name LowCardinality(String),
-    span_name    LowCardinality(String),
-    http_route   LowCardinality(String),
-    minute       DateTime,
-    total_count  SimpleAggregateFunction(sum, UInt64),
-    error_count  SimpleAggregateFunction(sum, UInt64),
-    duration_p50 AggregateFunction(quantileTDigest(0.5), Float64),
-    duration_p95 AggregateFunction(quantileTDigest(0.95), Float64),
-    duration_p99 AggregateFunction(quantileTDigest(0.99), Float64),
-    duration_sum SimpleAggregateFunction(sum, Float64),
+    service_name       LowCardinality(String),
+    span_name          LowCardinality(String),
+    http_route         LowCardinality(String),
+    minute             DateTime,
+    total_count        SimpleAggregateFunction(sum, UInt64),
+    error_count        SimpleAggregateFunction(sum, UInt64),
+    duration_quantiles AggregateFunction(quantiles(0.5, 0.95, 0.99), Float64),
+    duration_sum       SimpleAggregateFunction(sum, Float64),
     dt Date
 ) ENGINE = AggregatingMergeTree()
 PARTITION BY dt
@@ -1534,9 +1562,7 @@ AS SELECT
     toStartOfMinute(fromUnixTimestamp64Nano(start_time_nano))        AS minute,
     toUInt64(count())                                                 AS total_count,
     toUInt64(countIf(status_code = 2))                               AS error_count,
-    quantileTDigestState(0.5)(toFloat64(duration_nano))              AS duration_p50,
-    quantileTDigestState(0.95)(toFloat64(duration_nano))             AS duration_p95,
-    quantileTDigestState(0.99)(toFloat64(duration_nano))             AS duration_p99,
+    quantilesState(0.5, 0.95, 0.99)(toFloat64(duration_nano))       AS duration_quantiles,
     toFloat64(sum(duration_nano))                                     AS duration_sum,
     dt
 FROM %s.spans
@@ -1640,7 +1666,7 @@ CREATE TABLE IF NOT EXISTS %s.metrics (
     name           LowCardinality(String),
     type           LowCardinality(String),
     value          Float64,
-    attributes     String,
+    attributes     Map(String, String),
     service_name   LowCardinality(String),
     timestamp_nano Int64,
     received_at_ms Int64,
@@ -1656,6 +1682,15 @@ TTL dt + INTERVAL %d DAY;
 		`ALTER TABLE %s.metrics MODIFY TTL dt + INTERVAL %d DAY`, db, retentionDays)); err != nil {
 		return err
 	}
+	// #6: attributes String → Map(String,String) 마이그레이션
+	for _, q := range []string{
+		fmt.Sprintf("ALTER TABLE %s.metrics MODIFY COLUMN IF EXISTS attributes Map(String, String)", db),
+		fmt.Sprintf("ALTER TABLE %s.metric_histograms MODIFY COLUMN IF EXISTS attributes Map(String, String)", db),
+	} {
+		if err := conn.Exec(ctx, q); err != nil {
+			slog.Warn("alter metrics attributes column skipped", "query", q, "err", err)
+		}
+	}
 
 	if err := conn.Exec(ctx, fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s.metric_histograms (
@@ -1666,7 +1701,7 @@ CREATE TABLE IF NOT EXISTS %s.metric_histograms (
     bucket_counts   Array(UInt64),
     total_count     UInt64,
     total_sum       Float64,
-    attributes      String,
+    attributes      Map(String, String),
     received_at_ms  Int64,
     dt Date DEFAULT toDate(fromUnixTimestamp64Milli(received_at_ms))
 ) ENGINE = MergeTree()
@@ -1720,7 +1755,7 @@ CREATE TABLE IF NOT EXISTS %s.logs (
     severity_text   LowCardinality(String),
     severity_number Int32,
     body            String,
-    attributes      String,
+    attributes      Map(String, String),
     service_name    LowCardinality(String),
     trace_id        String,
     span_id         String,
@@ -1740,10 +1775,12 @@ TTL dt + INTERVAL %d DAY;
 	alterCols := []string{
 		fmt.Sprintf("ALTER TABLE %s.logs ADD COLUMN IF NOT EXISTS exception_type LowCardinality(String) DEFAULT ''", db),
 		fmt.Sprintf("ALTER TABLE %s.logs ADD COLUMN IF NOT EXISTS logger_name LowCardinality(String) DEFAULT ''", db),
+		// #6: attributes String → Map(String,String) 마이그레이션
+		fmt.Sprintf("ALTER TABLE %s.logs MODIFY COLUMN IF EXISTS attributes Map(String, String)", db),
 	}
 	for _, q := range alterCols {
 		if err := conn.Exec(ctx, q); err != nil {
-			return fmt.Errorf("alter logs column: %w", err)
+			slog.Warn("alter logs column skipped", "query", q, "err", err)
 		}
 	}
 
