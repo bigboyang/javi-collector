@@ -103,6 +103,12 @@ type Config struct {
 
 	// PeerCBCooldown: 피어 Circuit Breaker open 유지 시간. (기본 30s)
 	PeerCBCooldown time.Duration
+
+	// AIOps Phase 1: RED Baseline 자동 집계
+	// BaselineEnabled=true이면 BaselineComputer 고루틴이 BaselineInterval마다
+	// red_baseline 테이블을 갱신한다. DisableClickHouse=true이면 무시된다.
+	BaselineEnabled  bool
+	BaselineInterval time.Duration
 }
 
 // Load는 환경변수에서 설정을 읽어 Config를 반환한다.
@@ -141,6 +147,8 @@ func Load() (*Config, error) {
 		PeerURLs:                 envStringSlice("PEER_URLS", nil),
 		PeerCBFailureThreshold:   envInt("PEER_CB_FAILURE_THRESHOLD", 5),
 		PeerCBCooldown:           envDuration("PEER_CB_COOLDOWN", 30*time.Second),
+		BaselineEnabled:          envBool("BASELINE_ENABLED", true),
+		BaselineInterval:         envDuration("BASELINE_INTERVAL", time.Hour),
 	}
 
 	if err := cfg.validate(); err != nil {

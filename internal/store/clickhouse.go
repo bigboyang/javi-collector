@@ -1719,6 +1719,67 @@ WHERE status_code = 2 AND status_message != '';
 		return fmt.Errorf("create mv_rag_from_spans: %w", err)
 	}
 
+	if err := ensureAIopsSchema(conn, db); err != nil {
+		return fmt.Errorf("aiops schema: %w", err)
+	}
+
+	return nil
+}
+
+// ensureAIopsSchema는 AIOps Phase 1에 필요한 두 테이블을 생성한다.
+//
+//   - red_baseline: 서비스/오퍼레이션별 요일+시간대 정상 성능 기준선.
+//     BaselineComputer가 매시간 spans 테이블 28일치를 집계해 upsert한다.
+//     ReplacingMergeTree(computed_at) → 동일 키에 대해 최신 computed_at만 유지.
+//
+//   - anomalies: 이상 감지 결과 기록 테이블.
+//     Phase 2(Python Z-score)나 Phase 3(Go RCAEngine)이 INSERT한다.
+func ensureAIopsSchema(conn driver.Conn, db string) error {
+	ctx := context.Background()
+
+	if err := conn.Exec(ctx, fmt.Sprintf(`
+CREATE TABLE IF NOT EXISTS %s.red_baseline (
+    service_name   LowCardinality(String),
+    span_name      LowCardinality(String),
+    http_route     LowCardinality(String),
+    day_of_week    UInt8,       -- 1=Mon .. 7=Sun  (toDayOfWeek 기준)
+    hour_of_day    UInt8,       -- 0–23
+    p50_ms         Float64,
+    p95_ms         Float64,
+    p99_ms         Float64,
+    error_rate     Float64,     -- 0.0–1.0
+    avg_rps        Float64,     -- requests per second
+    sample_count   UInt64,      -- 기준 샘플 수 (신뢰도 지표)
+    computed_at    DateTime,
+    dt             Date DEFAULT today()
+) ENGINE = ReplacingMergeTree(computed_at)
+ORDER BY (service_name, span_name, http_route, day_of_week, hour_of_day)
+TTL dt + INTERVAL 90 DAY;
+`, db)); err != nil {
+		return fmt.Errorf("create red_baseline: %w", err)
+	}
+
+	if err := conn.Exec(ctx, fmt.Sprintf(`
+CREATE TABLE IF NOT EXISTS %s.anomalies (
+    id             String,      -- generateUUIDv4()
+    service_name   LowCardinality(String),
+    span_name      LowCardinality(String),
+    anomaly_type   LowCardinality(String), -- 'latency_p95_spike' | 'error_rate_spike' | 'traffic_drop'
+    minute         DateTime,
+    current_value  Float64,     -- 감지 시점 실측값
+    baseline_value Float64,     -- 해당 요일+시간대 기준값
+    z_score        Float64,     -- 편차 (표준편차 배수)
+    severity       LowCardinality(String), -- 'warning' | 'critical'
+    detected_at    DateTime DEFAULT now(),
+    dt             Date DEFAULT toDate(minute)
+) ENGINE = MergeTree()
+PARTITION BY dt
+ORDER BY (service_name, detected_at)
+TTL dt + INTERVAL 90 DAY;
+`, db)); err != nil {
+		return fmt.Errorf("create anomalies: %w", err)
+	}
+
 	return nil
 }
 

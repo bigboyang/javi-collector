@@ -108,6 +108,19 @@ func main() {
 			"flush_interval", cfg.FlushInterval,
 			"flush_workers", cfg.FlushWorkers,
 		)
+
+		// AIOps Phase 1: RED Baseline 자동 집계
+		// BaselineComputer는 공유 커넥션으로 매 BaselineInterval마다
+		// red_baseline 테이블을 갱신한다.
+		if cfg.BaselineEnabled {
+			bc := store.NewBaselineComputer(chConn, cfg.ClickHouseDB, cfg.BaselineInterval)
+			bc.Start()
+			defer bc.Stop()
+			slog.Info("baseline computer started",
+				"interval", cfg.BaselineInterval,
+				"db", cfg.ClickHouseDB,
+			)
+		}
 	}
 
 	// Signal context: SIGINT/SIGTERM 수신 시 취소된다.
