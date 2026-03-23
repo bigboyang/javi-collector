@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kkc/javi-collector/internal/anomaly"
 	"github.com/kkc/javi-collector/internal/config"
 	"github.com/kkc/javi-collector/internal/ingester"
 	"github.com/kkc/javi-collector/internal/rag"
@@ -119,6 +120,32 @@ func main() {
 			slog.Info("baseline computer started",
 				"interval", cfg.BaselineInterval,
 				"db", cfg.ClickHouseDB,
+			)
+		}
+
+		// AIOps Phase 2: Z-score + IsolationForest 이상 탐지
+		// Detector는 AnomalyInterval마다 mv_red_1m_state와 red_baseline을 비교해
+		// latency_p95_spike / error_rate_spike / traffic_drop / multivariate_anomaly를
+		// anomalies 테이블에 기록한다.
+		if cfg.AnomalyEnabled {
+			anomalyCfg := anomaly.Config{
+				Interval:      cfg.AnomalyInterval,
+				TrainInterval: cfg.AnomalyTrainInterval,
+				NTrees:        cfg.AnomalyNTrees,
+				MaxSamples:    cfg.AnomalyMaxSamples,
+				ZWarn:         cfg.AnomalyZWarn,
+				ZCritical:     cfg.AnomalyZCritical,
+				IFThreshold:   cfg.AnomalyIFThreshold,
+			}
+			det := anomaly.NewDetector(chConn, cfg.ClickHouseDB, anomalyCfg)
+			det.Start()
+			defer det.Stop()
+			slog.Info("anomaly detector started",
+				"interval", anomalyCfg.Interval,
+				"train_interval", anomalyCfg.TrainInterval,
+				"z_warn", anomalyCfg.ZWarn,
+				"z_critical", anomalyCfg.ZCritical,
+				"if_threshold", anomalyCfg.IFThreshold,
 			)
 		}
 	}

@@ -109,6 +109,18 @@ type Config struct {
 	// red_baseline 테이블을 갱신한다. DisableClickHouse=true이면 무시된다.
 	BaselineEnabled  bool
 	BaselineInterval time.Duration
+
+	// AIOps Phase 2: Z-score + IsolationForest 이상 탐지
+	// AnomalyEnabled=true이면 Detector 고루틴이 AnomalyInterval마다
+	// mv_red_1m_state와 red_baseline을 비교해 anomalies 테이블에 기록한다.
+	AnomalyEnabled       bool
+	AnomalyInterval      time.Duration // 탐지 주기 (기본 1m)
+	AnomalyTrainInterval time.Duration // IForest 재학습 주기 (기본 6h)
+	AnomalyNTrees        int           // IForest 트리 수 (기본 100)
+	AnomalyMaxSamples    int           // IForest 부분집합 크기 (기본 256)
+	AnomalyZWarn         float64       // Z-score 경고 임계값 (기본 2.0)
+	AnomalyZCritical     float64       // Z-score 위험 임계값 (기본 3.0)
+	AnomalyIFThreshold   float64       // IForest 이상 점수 임계값 (기본 0.65)
 }
 
 // Load는 환경변수에서 설정을 읽어 Config를 반환한다.
@@ -149,6 +161,14 @@ func Load() (*Config, error) {
 		PeerCBCooldown:           envDuration("PEER_CB_COOLDOWN", 30*time.Second),
 		BaselineEnabled:          envBool("BASELINE_ENABLED", true),
 		BaselineInterval:         envDuration("BASELINE_INTERVAL", time.Hour),
+		AnomalyEnabled:           envBool("ANOMALY_ENABLED", true),
+		AnomalyInterval:          envDuration("ANOMALY_INTERVAL", time.Minute),
+		AnomalyTrainInterval:     envDuration("ANOMALY_TRAIN_INTERVAL", 6*time.Hour),
+		AnomalyNTrees:            envInt("ANOMALY_N_TREES", 100),
+		AnomalyMaxSamples:        envInt("ANOMALY_MAX_SAMPLES", 256),
+		AnomalyZWarn:             envFloat64("ANOMALY_Z_WARN", 2.0),
+		AnomalyZCritical:         envFloat64("ANOMALY_Z_CRITICAL", 3.0),
+		AnomalyIFThreshold:       envFloat64("ANOMALY_IF_THRESHOLD", 0.65),
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -223,6 +243,18 @@ func envBool(key string, def bool) bool {
 		return def
 	}
 	return b
+}
+
+func envFloat64(key string, def float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return def
+	}
+	return f
 }
 
 func envStringSlice(key string, def []string) []string {
