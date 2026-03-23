@@ -1,10 +1,23 @@
 package decoder
 
 import (
+	"encoding/hex"
 	"fmt"
 
 	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
 )
+
+// encodeID converts a byte slice to a hex string.
+// Root span의 ParentSpanId처럼 모든 바이트가 0인 경우 빈 문자열을 반환한다.
+// hex.EncodeToString([]byte{0,0,...})은 "0000..."을 반환해 root span 감지를 방해하기 때문이다.
+func encodeID(b []byte) string {
+	for _, v := range b {
+		if v != 0 {
+			return hex.EncodeToString(b)
+		}
+	}
+	return ""
+}
 
 func extractServiceName(attrs []*commonv1.KeyValue) string {
 	for _, kv := range attrs {

@@ -40,7 +40,7 @@ func DecodeTracesFromRequest(req *collectortracev1.ExportTraceServiceRequest) []
 				spans = append(spans, &model.SpanData{
 					TraceID:       hex.EncodeToString(s.TraceId),
 					SpanID:        hex.EncodeToString(s.SpanId),
-					ParentSpanID:  hex.EncodeToString(s.ParentSpanId),
+					ParentSpanID:  encodeID(s.ParentSpanId),
 					Name:          s.Name,
 					Kind:          int32(s.Kind),
 					StartTimeNano: int64(s.StartTimeUnixNano),

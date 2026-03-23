@@ -780,6 +780,7 @@ func (s *ClickHouseMetricStore) QueryMetrics(ctx context.Context, q MetricQuery)
 		where = "WHERE " + strings.Join(conds, " AND ")
 	}
 
+	// metrics 테이블 (GAUGE / SUM / SUMMARY)
 	sql := fmt.Sprintf(
 		`SELECT name, type, value, attributes, service_name, timestamp_nano, received_at_ms
 		 FROM %s.metrics
@@ -816,7 +817,81 @@ func (s *ClickHouseMetricStore) QueryMetrics(ctx context.Context, q MetricQuery)
 			},
 		})
 	}
-	return result, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// metric_histograms 테이블 (HISTOGRAM)
+	// metric_name 컬럼으로 필터한다 (metrics 테이블의 name과 동일 역할).
+	var histConds []string
+	var histArgs []any
+	if q.FromMs > 0 {
+		histConds = append(histConds, "received_at_ms >= ?")
+		histArgs = append(histArgs, q.FromMs)
+	}
+	if q.ToMs > 0 {
+		histConds = append(histConds, "received_at_ms <= ?")
+		histArgs = append(histArgs, q.ToMs)
+	}
+	if q.ServiceName != "" {
+		histConds = append(histConds, "service_name = ?")
+		histArgs = append(histArgs, q.ServiceName)
+	}
+	if q.Name != "" {
+		histConds = append(histConds, "metric_name = ?")
+		histArgs = append(histArgs, q.Name)
+	}
+	histWhere := ""
+	if len(histConds) > 0 {
+		histWhere = "WHERE " + strings.Join(histConds, " AND ")
+	}
+
+	histSQL := fmt.Sprintf(
+		`SELECT metric_name, bounds, bucket_counts, total_count, total_sum, attributes, service_name, timestamp_nano, received_at_ms
+		 FROM %s.metric_histograms
+		 %s
+		 ORDER BY received_at_ms DESC
+		 LIMIT %d`,
+		s.cfg.Database, histWhere, q.Limit,
+	)
+
+	hrows, err := s.conn.Query(ctx, histSQL, histArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer hrows.Close()
+
+	for hrows.Next() {
+		var (
+			metricName, serviceName string
+			bounds                  []float64
+			bucketCounts            []uint64
+			totalCount              uint64
+			totalSum                float64
+			attrsMap                map[string]string
+			timestampNano, receivedAtMs int64
+		)
+		if err := hrows.Scan(&metricName, &bounds, &bucketCounts, &totalCount, &totalSum, &attrsMap, &serviceName, &timestampNano, &receivedAtMs); err != nil {
+			return nil, err
+		}
+		result = append(result, &model.MetricData{
+			Name:         metricName,
+			Type:         model.MetricTypeHistogram,
+			ServiceName:  serviceName,
+			ReceivedAtMs: receivedAtMs,
+			DataPoints: []model.DataPoint{
+				{
+					Attributes:     fromStringMap(attrsMap),
+					TimeNanos:      timestampNano,
+					Count:          int64(totalCount),
+					Sum:            totalSum,
+					BucketCounts:   bucketCounts,
+					ExplicitBounds: bounds,
+				},
+			},
+		})
+	}
+	return result, hrows.Err()
 }
 
 func (s *ClickHouseMetricStore) Close() error {
@@ -1520,17 +1595,6 @@ TTL dt + INTERVAL %d DAY;
 	if err := conn.Exec(ctx, fmt.Sprintf(
 		`ALTER TABLE %s.spans MODIFY TTL dt + INTERVAL %d DAY`, db, retentionDays)); err != nil {
 		return err
-	}
-
-	// #6: RED MV quantile 버그 수정 — 기존 뷰/테이블을 새 스키마로 재생성.
-	// mv_red_1m MV → mv_red_1m_state 순으로 DROP해야 참조 무결성이 유지된다.
-	for _, dropQ := range []string{
-		fmt.Sprintf("DROP VIEW IF EXISTS %s.mv_red_1m", db),
-		fmt.Sprintf("DROP TABLE IF EXISTS %s.mv_red_1m_state", db),
-	} {
-		if err := conn.Exec(ctx, dropQ); err != nil {
-			return fmt.Errorf("drop mv_red: %w", err)
-		}
 	}
 
 	if err := conn.Exec(ctx, fmt.Sprintf(`

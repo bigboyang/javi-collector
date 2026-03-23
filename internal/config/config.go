@@ -129,7 +129,7 @@ func Load() (*Config, error) {
 		EmbedModel:               envStr("EMBED_MODEL", "nomic-embed-text"),
 		QdrantEndpoint:           envStr("QDRANT_ENDPOINT", "http://localhost:6333"),
 		QdrantCollection:         envStr("QDRANT_COLLECTION", "apm_errors"),
-		BackupEnabled:            envBool("BACKUP_ENABLED", false),
+		BackupEnabled:            envBool("BACKUP_ENABLED", true),
 		BackupDir:                envStr("BACKUP_DIR", "./backup"),
 		DLQDir:                   envStr("DLQ_DIR", "./dlq"),
 		DLQRetentionDays:         envInt("DLQ_RETENTION_DAYS", 7),
