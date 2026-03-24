@@ -11,10 +11,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+	"github.com/kkc/javi-collector/internal/alerter"
 	"github.com/kkc/javi-collector/internal/anomaly"
 	"github.com/kkc/javi-collector/internal/config"
 	"github.com/kkc/javi-collector/internal/ingester"
 	"github.com/kkc/javi-collector/internal/rag"
+	"github.com/kkc/javi-collector/internal/rca"
 	"github.com/kkc/javi-collector/internal/sampling"
 	"github.com/kkc/javi-collector/internal/server"
 	"github.com/kkc/javi-collector/internal/store"
@@ -37,6 +40,7 @@ func main() {
 		traceStore  store.TraceStore
 		metricStore store.MetricStore
 		logStore    store.LogStore
+		chConn      driver.Conn // ClickHouse 공유 커넥션 (RCA Engine 등에서 재사용)
 	)
 
 	if cfg.DisableClickHouse {
@@ -62,7 +66,8 @@ func main() {
 
 		// 상용 APM 패턴: 하나의 공유 커넥션 풀을 세 Store가 공유한다.
 		// 이전에는 Store마다 openConn을 호출해 최대 3×MaxOpenConns 커넥션이 생성됐다.
-		chConn, err := store.OpenConn(chCfg)
+		var err error
+		chConn, err = store.OpenConn(chCfg)
 		if err != nil {
 			slog.Error("clickhouse connection failed", "err", err)
 			os.Exit(1)
@@ -192,6 +197,7 @@ func main() {
 	// RAG 파이프라인 초기화 (EMBED_ENABLED=true 시)
 	// Ollama(nomic-embed-text) → Qdrant 벡터 저장 → 자연어 장애 검색
 	var embedPipeline *rag.EmbedPipeline
+	var ragSearcher *rag.RAGSearcher
 	if cfg.EmbedEnabled {
 		embedClient := rag.NewOllamaEmbedClient(cfg.EmbedEndpoint, cfg.EmbedModel)
 		qdrantClient := rag.NewQdrantClient(cfg.QdrantEndpoint, cfg.QdrantCollection)
@@ -200,12 +206,49 @@ func main() {
 		} else {
 			embedPipeline = rag.NewEmbedPipeline(embedClient, qdrantClient, 1024, 32, 10*time.Second)
 			embedPipeline.Start(ctx)
+			ragSearcher = rag.NewRAGSearcher(embedClient, qdrantClient)
 			slog.Info("RAG embed pipeline started",
 				"endpoint", cfg.EmbedEndpoint,
 				"model", cfg.EmbedModel,
 				"qdrant", cfg.QdrantEndpoint,
 			)
 		}
+	}
+
+	// AIOps Alert: Webhook / Slack Push Alerter
+	// anomalies 테이블을 폴링해 신규 이상 이벤트를 외부로 Push한다.
+	// ALERT_WEBHOOK_URL 또는 ALERT_SLACK_WEBHOOK_URL 중 하나라도 설정하면 활성화된다.
+	if !cfg.DisableClickHouse {
+		alertCfg := alerter.Config{
+			WebhookURL:      cfg.AlertWebhookURL,
+			SlackWebhookURL: cfg.AlertSlackWebhookURL,
+			Interval:        cfg.AlertInterval,
+			MinSeverity:     cfg.AlertMinSeverity,
+		}
+		al := alerter.New(chConn, cfg.ClickHouseDB, alertCfg)
+		if al.Enabled() {
+			al.Start()
+			defer al.Stop()
+			slog.Info("alerter started",
+				"interval", cfg.AlertInterval,
+				"min_severity", cfg.AlertMinSeverity,
+				"slack", cfg.AlertSlackWebhookURL != "",
+				"webhook", cfg.AlertWebhookURL != "",
+			)
+		}
+	}
+
+	// AIOps Phase 3: RCA Engine
+	// anomalies 테이블을 폴링해 연관 spans + RAG 유사 사례를 결합한 rca_reports를 생성한다.
+	if !cfg.DisableClickHouse && cfg.RCAEnabled {
+		rcaCfg := rca.Config{Interval: cfg.RCAInterval}
+		rcaEngine := rca.NewEngine(chConn, cfg.ClickHouseDB, rcaCfg, ragSearcher)
+		rcaEngine.Start()
+		defer rcaEngine.Stop()
+		slog.Info("rca engine started",
+			"interval", cfg.RCAInterval,
+			"rag_enabled", ragSearcher != nil,
+		)
 	}
 
 	// 파일 백업: BACKUP_ENABLED=true이면 ingester에 전달되는 store를

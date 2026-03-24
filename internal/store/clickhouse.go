@@ -506,6 +506,78 @@ ORDER BY total_calls DESC`, s.cfg.Database, where)
 	return result, rows.Err()
 }
 
+// QueryAnomalies는 anomalies 테이블에서 이상 이벤트 목록을 반환한다.
+// GET /api/collector/anomalies?service=&severity=&from=<ms>&to=<ms>&limit=
+func (s *ClickHouseTraceStore) QueryAnomalies(ctx context.Context, service, severity string, fromMs, toMs int64, limit int) ([]map[string]any, error) {
+	var conds []string
+	var args []any
+
+	if fromMs > 0 {
+		conds = append(conds, "detected_at >= ?")
+		args = append(args, time.UnixMilli(fromMs))
+	}
+	if toMs > 0 {
+		conds = append(conds, "detected_at <= ?")
+		args = append(args, time.UnixMilli(toMs))
+	}
+	if service != "" {
+		conds = append(conds, "service_name = ?")
+		args = append(args, service)
+	}
+	if severity != "" {
+		conds = append(conds, "severity = ?")
+		args = append(args, severity)
+	}
+
+	where := ""
+	if len(conds) > 0 {
+		where = "WHERE " + strings.Join(conds, " AND ")
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+
+	q := fmt.Sprintf(`
+SELECT id, service_name, span_name, anomaly_type, minute,
+       current_value, baseline_value, z_score, severity, detected_at
+FROM %s.anomalies
+%s
+ORDER BY detected_at DESC
+LIMIT %d`, s.cfg.Database, where, limit)
+
+	rows, err := s.conn.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []map[string]any
+	for rows.Next() {
+		var (
+			id, serviceName, spanName, anomalyType, sev string
+			minute, detectedAt                          time.Time
+			currentValue, baselineValue, zScore         float64
+		)
+		if err := rows.Scan(&id, &serviceName, &spanName, &anomalyType, &minute,
+			&currentValue, &baselineValue, &zScore, &sev, &detectedAt); err != nil {
+			return nil, err
+		}
+		result = append(result, map[string]any{
+			"id":             id,
+			"service_name":   serviceName,
+			"span_name":      spanName,
+			"anomaly_type":   anomalyType,
+			"minute":         minute.UnixMilli(),
+			"current_value":  currentValue,
+			"baseline_value": baselineValue,
+			"z_score":        zScore,
+			"severity":       sev,
+			"detected_at":    detectedAt.UnixMilli(),
+		})
+	}
+	return result, rows.Err()
+}
+
 // Close는 채널을 닫고 batchWriter가 남은 항목을 flush할 때까지 대기한다.
 // conn은 공유 자원이므로 닫지 않는다 — 호출자가 직접 conn.Close()를 호출해야 한다.
 func (s *ClickHouseTraceStore) Close() error {
@@ -1778,6 +1850,30 @@ ORDER BY (service_name, detected_at)
 TTL dt + INTERVAL 90 DAY;
 `, db)); err != nil {
 		return fmt.Errorf("create anomalies: %w", err)
+	}
+
+	// AIOps Phase 3: RCA 결과 저장 테이블
+	if err := conn.Exec(ctx, fmt.Sprintf(`
+CREATE TABLE IF NOT EXISTS %s.rca_reports (
+    id                String,
+    anomaly_id        String,
+    service_name      LowCardinality(String),
+    span_name         LowCardinality(String),
+    anomaly_type      LowCardinality(String),
+    minute            DateTime,
+    severity          LowCardinality(String),
+    z_score           Float64,
+    correlated_spans  String,  -- JSON array of CorrelatedSpan
+    similar_incidents String,  -- JSON array of SimilarIncident
+    hypothesis        String,
+    created_at        DateTime DEFAULT now(),
+    dt                Date DEFAULT toDate(minute)
+) ENGINE = MergeTree()
+PARTITION BY dt
+ORDER BY (service_name, created_at)
+TTL dt + INTERVAL 90 DAY;
+`, db)); err != nil {
+		return fmt.Errorf("create rca_reports: %w", err)
 	}
 
 	return nil

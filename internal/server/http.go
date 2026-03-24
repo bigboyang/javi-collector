@@ -76,6 +76,11 @@ type ErrorLogQuerier interface {
 	QueryErrorLogs(ctx context.Context, service string, fromMs, toMs int64) ([]map[string]any, error)
 }
 
+// AnomalyQuerier는 이상 감지 결과 조회를 지원하는 저장소 인터페이스다.
+type AnomalyQuerier interface {
+	QueryAnomalies(ctx context.Context, service, severity string, fromMs, toMs int64, limit int) ([]map[string]any, error)
+}
+
 // HTTPServer는 OTLP/HTTP 수신 + REST 조회 API + 운영 엔드포인트 서버다.
 type HTTPServer struct {
 	ingester    *ingester.Ingester
@@ -117,6 +122,7 @@ func NewHTTPServer(addr string, ing *ingester.Ingester,
 	mux.HandleFunc("/api/collector/red", s.queryRED)
 	mux.HandleFunc("/api/collector/topology", s.queryTopology)
 	mux.HandleFunc("/api/collector/error-logs", s.queryErrorLogs)
+	mux.HandleFunc("/api/collector/anomalies", s.queryAnomalies)
 
 	// 운영 엔드포인트
 	// /healthz: liveness probe — 프로세스가 살아있으면 200
@@ -421,6 +427,35 @@ func (s *HTTPServer) queryErrorLogs(w http.ResponseWriter, r *http.Request) {
 		r.URL.Query().Get("service"),
 		queryInt64(r, "from"),
 		queryInt64(r, "to"),
+	)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, result)
+}
+
+// queryAnomalies는 AIOps Phase 2 이상 감지 결과를 반환한다.
+// GET /api/collector/anomalies?service=my-svc&severity=critical&from=<ms>&to=<ms>&limit=100
+func (s *HTTPServer) queryAnomalies(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	setCORSHeaders(w)
+
+	querier, ok := s.traceStore.(AnomalyQuerier)
+	if !ok {
+		http.Error(w, "anomaly queries not available (requires ClickHouse)", http.StatusNotImplemented)
+		return
+	}
+
+	result, err := querier.QueryAnomalies(r.Context(),
+		r.URL.Query().Get("service"),
+		r.URL.Query().Get("severity"),
+		queryInt64(r, "from"),
+		queryInt64(r, "to"),
+		queryLimit(r),
 	)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

@@ -121,6 +121,21 @@ type Config struct {
 	AnomalyZWarn         float64       // Z-score 경고 임계값 (기본 2.0)
 	AnomalyZCritical     float64       // Z-score 위험 임계값 (기본 3.0)
 	AnomalyIFThreshold   float64       // IForest 이상 점수 임계값 (기본 0.65)
+
+	// AIOps Phase 3: RCA Engine
+	// RCAEnabled=true이면 RCA Engine 고루틴이 RCAInterval마다
+	// anomalies 테이블을 폴링해 rca_reports 테이블에 근본 원인 분석 결과를 기록한다.
+	// EMBED_ENABLED=true이면 RAG 유사 사례 검색도 수행한다.
+	RCAEnabled  bool
+	RCAInterval time.Duration // RCA 폴링 주기 (기본 2m)
+
+	// Alert: 이상 감지 알림 설정
+	// AlertWebhookURL 또는 AlertSlackWebhookURL 중 하나라도 설정하면 활성화된다.
+	// Alerter는 AlertInterval마다 anomalies 테이블을 폴링해 신규 이벤트를 Push한다.
+	AlertWebhookURL      string        // 일반 JSON webhook URL (ALERT_WEBHOOK_URL)
+	AlertSlackWebhookURL string        // Slack Incoming Webhook URL (ALERT_SLACK_WEBHOOK_URL)
+	AlertInterval        time.Duration // 폴링 주기 (기본 1m)
+	AlertMinSeverity     string        // 최소 severity: "warning" | "critical" (기본 "warning")
 }
 
 // Load는 환경변수에서 설정을 읽어 Config를 반환한다.
@@ -169,6 +184,12 @@ func Load() (*Config, error) {
 		AnomalyZWarn:             envFloat64("ANOMALY_Z_WARN", 2.0),
 		AnomalyZCritical:         envFloat64("ANOMALY_Z_CRITICAL", 3.0),
 		AnomalyIFThreshold:       envFloat64("ANOMALY_IF_THRESHOLD", 0.65),
+		RCAEnabled:               envBool("RCA_ENABLED", true),
+		RCAInterval:              envDuration("RCA_INTERVAL", 2*time.Minute),
+		AlertWebhookURL:          envStr("ALERT_WEBHOOK_URL", ""),
+		AlertSlackWebhookURL:     envStr("ALERT_SLACK_WEBHOOK_URL", ""),
+		AlertInterval:            envDuration("ALERT_INTERVAL", time.Minute),
+		AlertMinSeverity:         envStr("ALERT_MIN_SEVERITY", "warning"),
 	}
 
 	if err := cfg.validate(); err != nil {

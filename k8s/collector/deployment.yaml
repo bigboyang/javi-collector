@@ -1,0 +1,98 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: javi-collector
+  namespace: apm
+  labels:
+    app: javi-collector
+    version: latest
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: javi-collector
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0   # 항상 2개 이상 유지
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: javi-collector
+        version: latest
+      annotations:
+        # ConfigMap/Secret 변경 시 자동 롤링 업데이트 트리거
+        checksum/config: "change-me-on-deploy"
+    spec:
+      terminationGracePeriodSeconds: 30
+
+      # ClickHouse가 준비된 후에 시작
+      initContainers:
+        - name: wait-clickhouse
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z clickhouse-svc 9000; do
+                echo "waiting for clickhouse..."; sleep 2
+              done
+
+      containers:
+        - name: collector
+          image: javi-collector:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: grpc-otlp
+              containerPort: 4317
+              protocol: TCP
+            - name: http-otlp
+              containerPort: 4318
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: collector-config
+            - secretRef:
+                name: collector-secret
+          volumeMounts:
+            - name: collector-data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 4318
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 4318
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+      volumes:
+        - name: collector-data
+          persistentVolumeClaim:
+            claimName: collector-data
+
+      # 여러 replica를 서로 다른 노드에 배치 (가용성 향상)
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: javi-collector
+                topologyKey: kubernetes.io/hostname

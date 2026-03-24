@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse
+  namespace: apm
+  labels:
+    app: clickhouse
+spec:
+  # Headless service — StatefulSet Pod DNS: clickhouse-0.clickhouse.apm.svc.cluster.local
+  clusterIP: None
+  selector:
+    app: clickhouse
+  ports:
+    - name: native
+      port: 9000
+      targetPort: 9000
+    - name: http
+      port: 8123
+      targetPort: 8123
+---
+# ClusterIP alias for collector → clickhouse:9000
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse-svc
+  namespace: apm
+  labels:
+    app: clickhouse
+spec:
+  selector:
+    app: clickhouse
+  ports:
+    - name: native
+      port: 9000
+      targetPort: 9000
+    - name: http
+      port: 8123
+      targetPort: 8123
