@@ -25,6 +25,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -81,6 +82,18 @@ type AnomalyQuerier interface {
 	QueryAnomalies(ctx context.Context, service, severity string, fromMs, toMs int64, limit int) ([]map[string]any, error)
 }
 
+// RawQuerier는 화이트리스트를 통과한 SELECT SQL을 직접 실행하는 인터페이스다.
+// ClickHouseTraceStore가 구현하며, 메모리 스토어는 구현하지 않는다.
+type RawQuerier interface {
+	QueryRaw(ctx context.Context, sql string) ([]map[string]any, error)
+}
+
+// ReadinessChecker는 /readyz 상세 상태 조회를 위한 인터페이스다.
+type ReadinessChecker interface {
+	Ping(ctx context.Context) error
+	ChannelStatus() map[string]any
+}
+
 // HTTPServer는 OTLP/HTTP 수신 + REST 조회 API + 운영 엔드포인트 서버다.
 type HTTPServer struct {
 	ingester    *ingester.Ingester
@@ -123,6 +136,8 @@ func NewHTTPServer(addr string, ing *ingester.Ingester,
 	mux.HandleFunc("/api/collector/topology", s.queryTopology)
 	mux.HandleFunc("/api/collector/error-logs", s.queryErrorLogs)
 	mux.HandleFunc("/api/collector/anomalies", s.queryAnomalies)
+	// ClickHouse 직접 쿼리 (화이트리스트 SELECT)
+	mux.HandleFunc("/api/query", s.queryRaw)
 
 	// 운영 엔드포인트
 	// /healthz: liveness probe — 프로세스가 살아있으면 200
@@ -297,6 +312,7 @@ func (s *HTTPServer) queryTraces(w http.ResponseWriter, r *http.Request) {
 	setCORSHeaders(w)
 	q := store.SpanQuery{
 		Limit:         queryLimit(r),
+		Offset:        queryOffset(r),
 		FromMs:        queryInt64(r, "from"),
 		ToMs:          queryInt64(r, "to"),
 		ServiceName:   r.URL.Query().Get("service"),
@@ -320,6 +336,7 @@ func (s *HTTPServer) queryMetrics(w http.ResponseWriter, r *http.Request) {
 	setCORSHeaders(w)
 	q := store.MetricQuery{
 		Limit:       queryLimit(r),
+		Offset:      queryOffset(r),
 		FromMs:      queryInt64(r, "from"),
 		ToMs:        queryInt64(r, "to"),
 		ServiceName: r.URL.Query().Get("service"),
@@ -341,6 +358,7 @@ func (s *HTTPServer) queryLogs(w http.ResponseWriter, r *http.Request) {
 	setCORSHeaders(w)
 	q := store.LogQuery{
 		Limit:        queryLimit(r),
+		Offset:       queryOffset(r),
 		FromMs:       queryInt64(r, "from"),
 		ToMs:         queryInt64(r, "to"),
 		ServiceName:  r.URL.Query().Get("service"),
@@ -464,6 +482,57 @@ func (s *HTTPServer) queryAnomalies(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, result)
 }
 
+// queryRaw는 화이트리스트를 통과한 SELECT SQL을 ClickHouse에 직접 실행한다.
+// GET /api/query?sql=SELECT+service_name,+count()+FROM+apm.spans+GROUP+BY+service_name
+//
+// 보안: SELECT로 시작하지 않거나 위험 키워드가 포함된 쿼리는 400을 반환한다.
+func (s *HTTPServer) queryRaw(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	setCORSHeaders(w)
+
+	querier, ok := s.traceStore.(RawQuerier)
+	if !ok {
+		http.Error(w, "raw query not available (requires ClickHouse)", http.StatusNotImplemented)
+		return
+	}
+
+	sql := strings.TrimSpace(r.URL.Query().Get("sql"))
+	if err := validateRawSQL(sql); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	result, err := querier.QueryRaw(r.Context(), sql)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, result)
+}
+
+// validateRawSQL은 SELECT 이외의 구문 및 위험 키워드를 차단한다.
+func validateRawSQL(sql string) error {
+	if sql == "" {
+		return fmt.Errorf("sql parameter required")
+	}
+	upper := strings.ToUpper(sql)
+	// SELECT로 시작하지 않으면 거부
+	if !strings.HasPrefix(upper, "SELECT") {
+		return fmt.Errorf("only SELECT queries are allowed")
+	}
+	// 위험 구문 차단
+	for _, kw := range []string{"DROP", "DELETE", "ALTER", "INSERT", "UPDATE", "CREATE",
+		"TRUNCATE", "SYSTEM", "KILL", "ATTACH", "DETACH", "RENAME"} {
+		if strings.Contains(upper, kw) {
+			return fmt.Errorf("keyword %q not allowed", kw)
+		}
+	}
+	return nil
+}
+
 func (s *HTTPServer) stats(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -498,12 +567,28 @@ func (s *HTTPServer) healthz(w http.ResponseWriter, r *http.Request) {
 
 // readyz는 readiness probe 엔드포인트다.
 // MarkReady()가 호출된 이후에만 200을 반환한다.
-// 쿠버네티스가 이 엔드포인트를 통해 트래픽 수신 가능 여부를 확인한다.
+// ReadinessChecker 인터페이스를 구현한 traceStore가 있으면 상세 JSON을 함께 반환한다.
+//
+// 응답 예시:
+//
+//	{"ready":true,"clickhouse":"ok","channel":{"ch_len":12,"ch_cap":1000,"cb_state":"closed"}}
 func (s *HTTPServer) readyz(w http.ResponseWriter, r *http.Request) {
 	select {
 	case <-s.ready:
+		// ready 상태: 상세 진단 정보 포함
+		status := map[string]any{"ready": true}
+		if checker, ok := s.traceStore.(ReadinessChecker); ok {
+			pingCtx := r.Context()
+			if err := checker.Ping(pingCtx); err != nil {
+				status["clickhouse"] = "error: " + err.Error()
+			} else {
+				status["clickhouse"] = "ok"
+			}
+			status["channel"] = checker.ChannelStatus()
+		}
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ready"))
+		_ = json.NewEncoder(w).Encode(status)
 	default:
 		http.Error(w, "not ready", http.StatusServiceUnavailable)
 	}
@@ -553,6 +638,18 @@ func decompressGzip(r io.Reader) ([]byte, error) {
 func isJSON(r *http.Request) bool {
 	ct := r.Header.Get("Content-Type")
 	return len(ct) >= len(jsonContentType) && ct[:len(jsonContentType)] == jsonContentType
+}
+
+func queryOffset(r *http.Request) int {
+	s := r.URL.Query().Get("offset")
+	if s == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 func queryLimit(r *http.Request) int {

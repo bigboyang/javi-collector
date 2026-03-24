@@ -340,8 +340,8 @@ func (s *ClickHouseTraceStore) QuerySpans(ctx context.Context, q SpanQuery) ([]*
 		 FROM %s.spans
 		 %s
 		 ORDER BY received_at_ms DESC
-		 LIMIT %d`,
-		s.cfg.Database, where, q.Limit,
+		 LIMIT %d OFFSET %d`,
+		s.cfg.Database, where, q.Limit, q.Offset,
 	)
 
 	rows, err := s.conn.Query(ctx, sql, args...)
@@ -576,6 +576,63 @@ LIMIT %d`, s.cfg.Database, where, limit)
 		})
 	}
 	return result, rows.Err()
+}
+
+// QueryRaw는 화이트리스트를 통과한 SELECT 쿼리를 ClickHouse에 직접 실행하고
+// []map[string]any 형태로 결과를 반환한다.
+// 컬럼 이름과 값은 ClickHouse driver의 타입을 그대로 사용한다.
+func (s *ClickHouseTraceStore) QueryRaw(ctx context.Context, sql string) ([]map[string]any, error) {
+	rows, err := s.conn.Query(ctx, sql)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	cols := rows.Columns()
+	var result []map[string]any
+	for rows.Next() {
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, err
+		}
+		row := make(map[string]any, len(cols))
+		for i, col := range cols {
+			row[col] = vals[i]
+		}
+		result = append(result, row)
+	}
+	return result, rows.Err()
+}
+
+// ChannelStatus는 readyz 상세 응답에 포함할 채널 포화도와 서킷 브레이커 상태를 반환한다.
+func (s *ClickHouseTraceStore) ChannelStatus() map[string]any {
+	cbState := "disabled"
+	if s.cb != nil {
+		s.cb.mu.Lock()
+		switch s.cb.state {
+		case cbStateClosed:
+			cbState = "closed"
+		case cbStateOpen:
+			cbState = "open"
+		case cbStateHalfOpen:
+			cbState = "half_open"
+		}
+		s.cb.mu.Unlock()
+	}
+	return map[string]any{
+		"ch_len":   len(s.ch),
+		"ch_cap":   cap(s.ch),
+		"cb_state": cbState,
+	}
+}
+
+// Ping은 ClickHouse 연결 상태를 확인한다.
+func (s *ClickHouseTraceStore) Ping(ctx context.Context) error {
+	return s.conn.Ping(ctx)
 }
 
 // Close는 채널을 닫고 batchWriter가 남은 항목을 flush할 때까지 대기한다.
@@ -858,8 +915,8 @@ func (s *ClickHouseMetricStore) QueryMetrics(ctx context.Context, q MetricQuery)
 		 FROM %s.metrics
 		 %s
 		 ORDER BY received_at_ms DESC
-		 LIMIT %d`,
-		s.cfg.Database, where, q.Limit,
+		 LIMIT %d OFFSET %d`,
+		s.cfg.Database, where, q.Limit, q.Offset,
 	)
 
 	rows, err := s.conn.Query(ctx, sql, args...)
@@ -1313,8 +1370,8 @@ func (s *ClickHouseLogStore) QueryLogs(ctx context.Context, q LogQuery) ([]*mode
 		 FROM %s.logs
 		 %s
 		 ORDER BY received_at_ms DESC
-		 LIMIT %d`,
-		s.cfg.Database, where, q.Limit,
+		 LIMIT %d OFFSET %d`,
+		s.cfg.Database, where, q.Limit, q.Offset,
 	)
 
 	rows, err := s.conn.Query(ctx, sql, args...)

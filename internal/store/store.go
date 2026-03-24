@@ -20,6 +20,7 @@ import (
 // 빈 값(0 또는 빈 문자열)인 필드는 필터링에서 제외된다.
 type SpanQuery struct {
 	Limit         int    // 최대 행 수 (기본 100)
+	Offset        int    // 건너뛸 행 수 (커서 페이지네이션용, 0: 처음부터)
 	FromMs        int64  // 시작 시간 Unix ms (0: 필터 없음)
 	ToMs          int64  // 종료 시간 Unix ms (0: 필터 없음)
 	ServiceName   string // 서비스명
@@ -31,6 +32,7 @@ type SpanQuery struct {
 // MetricQuery는 메트릭 조회 필터다.
 type MetricQuery struct {
 	Limit       int
+	Offset      int // 건너뛸 행 수 (페이지네이션용)
 	FromMs      int64
 	ToMs        int64
 	ServiceName string
@@ -40,6 +42,7 @@ type MetricQuery struct {
 // LogQuery는 로그 조회 필터다.
 type LogQuery struct {
 	Limit        int
+	Offset       int // 건너뛸 행 수 (페이지네이션용)
 	FromMs       int64
 	ToMs         int64
 	ServiceName  string
