@@ -13,6 +13,7 @@ package store
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -113,7 +114,15 @@ func (r *DLQReplayer) ReplayAll(ctx context.Context) {
 	}
 }
 
+// dlqLineHeader는 DLQ 라인의 포맷을 판별하기 위한 최소 구조체다.
+// error_reason 필드가 있으면 배치 포맷(새 형식), 없으면 단일 항목 포맷(구 형식)이다.
+type dlqLineHeader struct {
+	ErrorReason string          `json:"error_reason"`
+	Batch       json.RawMessage `json:"batch"`
+}
+
 // replayFile은 단일 JSONL 파일을 읽어 재적재하고 성공 시 삭제한다.
+// 각 라인은 구 형식(단일 항목 JSON) 또는 신 형식({"error_reason":"...","batch":[...]}) 중 하나다.
 func (r *DLQReplayer) replayFile(ctx context.Context, path, name string) error {
 	var signal string
 	switch {
@@ -133,18 +142,39 @@ func (r *DLQReplayer) replayFile(ctx context.Context, path, name string) error {
 	}
 	defer f.Close()
 
-	dec := json.NewDecoder(bufio.NewReaderSize(f, 64*1024))
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024) // 최대 4 MiB 라인 허용
 	var count int
 
 	switch signal {
 	case "spans":
 		var spans []*model.SpanData
-		for dec.More() {
-			var sp model.SpanData
-			if err := dec.Decode(&sp); err != nil {
-				return fmt.Errorf("decode span: %w", err)
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			if len(bytes.TrimSpace(line)) == 0 {
+				continue
 			}
-			spans = append(spans, &sp)
+			var hdr dlqLineHeader
+			if err := json.Unmarshal(line, &hdr); err == nil && hdr.ErrorReason != "" {
+				// 신 형식: {"error_reason":"...","batch":[...]}
+				var batch []*model.SpanData
+				if err := json.Unmarshal(hdr.Batch, &batch); err != nil {
+					slog.Warn("dlq replay: batch decode failed", "err", err)
+					continue
+				}
+				spans = append(spans, batch...)
+			} else {
+				// 구 형식: 단일 SpanData JSON
+				var sp model.SpanData
+				if err := json.Unmarshal(line, &sp); err != nil {
+					slog.Warn("dlq replay: span decode failed", "err", err)
+					continue
+				}
+				spans = append(spans, &sp)
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			return fmt.Errorf("scan spans: %w", err)
 		}
 		if len(spans) == 0 {
 			break
@@ -156,12 +186,30 @@ func (r *DLQReplayer) replayFile(ctx context.Context, path, name string) error {
 
 	case "metrics":
 		var metrics []*model.MetricData
-		for dec.More() {
-			var m model.MetricData
-			if err := dec.Decode(&m); err != nil {
-				return fmt.Errorf("decode metric: %w", err)
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			if len(bytes.TrimSpace(line)) == 0 {
+				continue
 			}
-			metrics = append(metrics, &m)
+			var hdr dlqLineHeader
+			if err := json.Unmarshal(line, &hdr); err == nil && hdr.ErrorReason != "" {
+				var batch []*model.MetricData
+				if err := json.Unmarshal(hdr.Batch, &batch); err != nil {
+					slog.Warn("dlq replay: batch decode failed", "err", err)
+					continue
+				}
+				metrics = append(metrics, batch...)
+			} else {
+				var m model.MetricData
+				if err := json.Unmarshal(line, &m); err != nil {
+					slog.Warn("dlq replay: metric decode failed", "err", err)
+					continue
+				}
+				metrics = append(metrics, &m)
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			return fmt.Errorf("scan metrics: %w", err)
 		}
 		if len(metrics) == 0 {
 			break
@@ -173,12 +221,30 @@ func (r *DLQReplayer) replayFile(ctx context.Context, path, name string) error {
 
 	case "logs":
 		var logs []*model.LogData
-		for dec.More() {
-			var l model.LogData
-			if err := dec.Decode(&l); err != nil {
-				return fmt.Errorf("decode log: %w", err)
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			if len(bytes.TrimSpace(line)) == 0 {
+				continue
 			}
-			logs = append(logs, &l)
+			var hdr dlqLineHeader
+			if err := json.Unmarshal(line, &hdr); err == nil && hdr.ErrorReason != "" {
+				var batch []*model.LogData
+				if err := json.Unmarshal(hdr.Batch, &batch); err != nil {
+					slog.Warn("dlq replay: batch decode failed", "err", err)
+					continue
+				}
+				logs = append(logs, batch...)
+			} else {
+				var l model.LogData
+				if err := json.Unmarshal(line, &l); err != nil {
+					slog.Warn("dlq replay: log decode failed", "err", err)
+					continue
+				}
+				logs = append(logs, &l)
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			return fmt.Errorf("scan logs: %w", err)
 		}
 		if len(logs) == 0 {
 			break

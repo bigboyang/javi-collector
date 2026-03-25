@@ -51,6 +51,8 @@ func DecodeTracesFromRequest(req *collectortracev1.ExportTraceServiceRequest) []
 					ServiceName:   serviceName,
 					ScopeName:     scopeName,
 					ReceivedAtMs:  now,
+					TraceState:    s.TraceState,
+					Links:         convertLinks(s.Links),
 				})
 			}
 		}

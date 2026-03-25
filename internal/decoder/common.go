@@ -5,6 +5,9 @@ import (
 	"fmt"
 
 	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
+	tracev1 "go.opentelemetry.io/proto/otlp/trace/v1"
+
+	"github.com/kkc/javi-collector/internal/model"
 )
 
 // encodeID converts a byte slice to a hex string.
@@ -67,4 +70,21 @@ func anyValueToString(v *commonv1.AnyValue) string {
 		return sv.StringValue
 	}
 	return fmt.Sprintf("%v", convertAnyValue(v))
+}
+
+// convertLinks는 OTLP Span.Links를 model.SpanLink 슬라이스로 변환한다.
+func convertLinks(links []*tracev1.Span_Link) []model.SpanLink {
+	if len(links) == 0 {
+		return nil
+	}
+	result := make([]model.SpanLink, 0, len(links))
+	for _, l := range links {
+		result = append(result, model.SpanLink{
+			TraceID:    hex.EncodeToString(l.TraceId),
+			SpanID:     hex.EncodeToString(l.SpanId),
+			TraceState: l.TraceState,
+			Attributes: convertAttrs(l.Attributes),
+		})
+	}
+	return result
 }

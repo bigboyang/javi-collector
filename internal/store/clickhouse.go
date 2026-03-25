@@ -19,10 +19,12 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
@@ -204,6 +206,21 @@ func retryFlush(table string, fn func() error) error {
 	return err
 }
 
+// ---- 동적 설정 ----
+
+// storeDynCfg는 핫 리로드로 변경 가능한 배치 설정이다.
+// SetDynamicConfig가 atomic.Pointer로 교체한다.
+type storeDynCfg struct {
+	BatchSize     int
+	FlushInterval time.Duration
+}
+
+// DynamicConfigSetter는 런타임 배치 설정을 변경할 수 있는 인터페이스다.
+// 핫 리로드 콜백에서 사용한다.
+type DynamicConfigSetter interface {
+	SetDynamicConfig(batchSize int, flushInterval time.Duration)
+}
+
 // ---- ClickHouseTraceStore ----
 
 // ClickHouseTraceStore는 SpanData를 apm.spans 테이블에 배치 insert한다.
@@ -212,9 +229,10 @@ type ClickHouseTraceStore struct {
 	ch      chan *model.SpanData   // 수신 데이터 채널
 	flushCh chan []*model.SpanData // 조립된 배치를 flush worker에 전달하는 큐
 	cfg     ClickHouseConfig
-	done    chan struct{}     // 모든 flushWorker 종료 시 닫힘
-	dlq     *FileBackupWriter // flush 실패 시 배치 보존 (nil이면 비활성화)
-	cb      *circuitBreaker   // 연속 실패 시 flush 차단 (nil이면 비활성화)
+	dynCfg  atomic.Pointer[storeDynCfg] // 핫 리로드 가능한 배치 설정 (nil이면 cfg 사용)
+	done    chan struct{}                // 모든 flushWorker 종료 시 닫힘
+	dlq     *FileBackupWriter           // flush 실패 시 배치 보존 (nil이면 비활성화)
+	cb      *circuitBreaker             // 연속 실패 시 flush 차단 (nil이면 비활성화)
 }
 
 // NewClickHouseTraceStore는 공유 커넥션을 받아 테이블 DDL을 적용하고
@@ -223,6 +241,13 @@ type ClickHouseTraceStore struct {
 func NewClickHouseTraceStore(conn driver.Conn, cfg ClickHouseConfig) (*ClickHouseTraceStore, error) {
 	if err := ensureSpansTable(conn, cfg.Database, cfg.RetentionDays); err != nil {
 		return nil, fmt.Errorf("clickhouse trace DDL: %w", err)
+	}
+
+	// 버전 관리 마이그레이션: ensureSpansTable 이후의 스키마 변경을 추적 적용한다.
+	migrator := NewMigrator(conn, cfg.Database)
+	if err := migrator.Run(context.Background(), BuildSpansMigrations(cfg.Database)); err != nil {
+		// 마이그레이션 실패는 경고로만 처리 — 대부분의 SQL이 IF NOT EXISTS로 idempotent함
+		slog.Warn("spans schema migration failed", "err", err)
 	}
 
 	var dlq *FileBackupWriter
@@ -270,6 +295,35 @@ func NewClickHouseTraceStore(conn driver.Conn, cfg ClickHouseConfig) (*ClickHous
 	}()
 	go s.batchWriter()
 	return s, nil
+}
+
+// SetDynamicConfig는 배치 설정을 런타임에 변경한다.
+// batchSize 또는 flushInterval이 0이면 기존 cfg 값을 유지한다.
+func (s *ClickHouseTraceStore) SetDynamicConfig(batchSize int, flushInterval time.Duration) {
+	cur := s.dynCfg.Load()
+	next := storeDynCfg{BatchSize: s.cfg.BatchSize, FlushInterval: s.cfg.FlushInterval}
+	if cur != nil {
+		next = *cur
+	}
+	if batchSize > 0 {
+		next.BatchSize = batchSize
+	}
+	if flushInterval > 0 {
+		next.FlushInterval = flushInterval
+	}
+	s.dynCfg.Store(&next)
+	slog.Info("trace store dynamic config updated",
+		"batch_size", next.BatchSize,
+		"flush_interval", next.FlushInterval,
+	)
+}
+
+// loadDynCfg는 현재 유효한 배치 설정을 반환한다.
+func (s *ClickHouseTraceStore) loadDynCfg() storeDynCfg {
+	if p := s.dynCfg.Load(); p != nil {
+		return *p
+	}
+	return storeDynCfg{BatchSize: s.cfg.BatchSize, FlushInterval: s.cfg.FlushInterval}
 }
 
 // AppendSpans는 spans를 채널에 enqueue한다.
@@ -663,10 +717,11 @@ func (s *ClickHouseTraceStore) batchWriter() {
 		}
 	}()
 
-	ticker := time.NewTicker(s.cfg.FlushInterval)
+	dynCfg := s.loadDynCfg()
+	ticker := time.NewTicker(dynCfg.FlushInterval)
 	defer ticker.Stop()
 
-	batch := make([]*model.SpanData, 0, s.cfg.BatchSize)
+	batch := make([]*model.SpanData, 0, dynCfg.BatchSize)
 
 	doFlush := func(b []*model.SpanData) {
 		if len(b) == 0 {
@@ -684,15 +739,22 @@ func (s *ClickHouseTraceStore) batchWriter() {
 				return
 			}
 			batch = append(batch, sp)
-			if len(batch) >= s.cfg.BatchSize {
+			dc := s.loadDynCfg()
+			if len(batch) >= dc.BatchSize {
 				doFlush(batch)
-				batch = make([]*model.SpanData, 0, s.cfg.BatchSize)
+				batch = make([]*model.SpanData, 0, dc.BatchSize)
 			}
 
 		case <-ticker.C:
+			dc := s.loadDynCfg()
+			// FlushInterval이 변경됐으면 ticker 리셋
+			if dc.FlushInterval != dynCfg.FlushInterval {
+				ticker.Reset(dc.FlushInterval)
+				dynCfg = dc
+			}
 			if len(batch) > 0 {
 				doFlush(batch)
-				batch = make([]*model.SpanData, 0, s.cfg.BatchSize)
+				batch = make([]*model.SpanData, 0, dc.BatchSize)
 			}
 		}
 	}
@@ -709,7 +771,7 @@ func (s *ClickHouseTraceStore) flushWorker() {
 			slog.Warn("clickhouse span flush blocked by circuit breaker — routing to DLQ", "count", len(data))
 			chFlushErrorsTotal.WithLabelValues("spans").Inc()
 			if s.dlq != nil {
-				if dlqErr := s.dlq.WriteSpans(data); dlqErr != nil {
+				if dlqErr := s.dlq.WriteDLQSpans(data, "circuit breaker open"); dlqErr != nil {
 					slog.Error("clickhouse span DLQ write failed — data lost", "err", dlqErr, "count", len(data))
 				} else {
 					chDLQWrittenTotal.WithLabelValues("spans").Add(float64(len(data)))
@@ -725,7 +787,7 @@ func (s *ClickHouseTraceStore) flushWorker() {
 			}
 			slog.Error("clickhouse span flush failed (all retries exhausted)", "err", err, "count", len(data))
 			if s.dlq != nil {
-				if dlqErr := s.dlq.WriteSpans(data); dlqErr != nil {
+				if dlqErr := s.dlq.WriteDLQSpans(data, err.Error()); dlqErr != nil {
 					slog.Error("clickhouse span DLQ write failed — data lost", "err", dlqErr, "count", len(data))
 				} else {
 					chDLQWrittenTotal.WithLabelValues("spans").Add(float64(len(data)))
@@ -752,7 +814,8 @@ func (s *ClickHouseTraceStore) flushSpans(spans []*model.SpanData) error {
 		 http_method, http_route, http_status_code,
 		 db_system, db_name, db_operation,
 		 rpc_system, rpc_service, rpc_method,
-		 peer_service, exception_type, exception_message, exception_stacktrace)`, s.cfg.Database),
+		 peer_service, exception_type, exception_message, exception_stacktrace,
+		 trace_state, span_links)`, s.cfg.Database),
 	)
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
@@ -781,6 +844,8 @@ func (s *ClickHouseTraceStore) flushSpans(spans []*model.SpanData) error {
 			strAttr(attrs, "exception.type"),
 			strAttr(attrs, "exception.message"),
 			strAttr(attrs, "exception.stacktrace"),
+			sp.TraceState,
+			encodeSpanLinks(sp.Links),
 		); err != nil {
 			return fmt.Errorf("batch append span: %w", err)
 		}
@@ -805,9 +870,37 @@ type ClickHouseMetricStore struct {
 	ch      chan *model.MetricData   // 수신 데이터 채널
 	flushCh chan []*model.MetricData // 조립된 배치를 flush worker에 전달하는 큐
 	cfg     ClickHouseConfig
-	done    chan struct{}     // 모든 flushWorker 종료 시 닫힘
-	dlq     *FileBackupWriter // flush 실패 시 배치 보존 (nil이면 비활성화)
-	cb      *circuitBreaker   // 연속 실패 시 flush 차단 (nil이면 비활성화)
+	dynCfg  atomic.Pointer[storeDynCfg] // 핫 리로드 가능한 배치 설정
+	done    chan struct{}                // 모든 flushWorker 종료 시 닫힘
+	dlq     *FileBackupWriter           // flush 실패 시 배치 보존 (nil이면 비활성화)
+	cb      *circuitBreaker             // 연속 실패 시 flush 차단 (nil이면 비활성화)
+}
+
+// SetDynamicConfig는 metric store의 배치 설정을 런타임에 변경한다.
+func (s *ClickHouseMetricStore) SetDynamicConfig(batchSize int, flushInterval time.Duration) {
+	cur := s.dynCfg.Load()
+	next := storeDynCfg{BatchSize: s.cfg.BatchSize, FlushInterval: s.cfg.FlushInterval}
+	if cur != nil {
+		next = *cur
+	}
+	if batchSize > 0 {
+		next.BatchSize = batchSize
+	}
+	if flushInterval > 0 {
+		next.FlushInterval = flushInterval
+	}
+	s.dynCfg.Store(&next)
+	slog.Info("metric store dynamic config updated",
+		"batch_size", next.BatchSize,
+		"flush_interval", next.FlushInterval,
+	)
+}
+
+func (s *ClickHouseMetricStore) loadDynCfg() storeDynCfg {
+	if p := s.dynCfg.Load(); p != nil {
+		return *p
+	}
+	return storeDynCfg{BatchSize: s.cfg.BatchSize, FlushInterval: s.cfg.FlushInterval}
 }
 
 func NewClickHouseMetricStore(conn driver.Conn, cfg ClickHouseConfig) (*ClickHouseMetricStore, error) {
@@ -1046,10 +1139,11 @@ func (s *ClickHouseMetricStore) batchWriter() {
 		}
 	}()
 
-	ticker := time.NewTicker(s.cfg.FlushInterval)
+	dynCfg := s.loadDynCfg()
+	ticker := time.NewTicker(dynCfg.FlushInterval)
 	defer ticker.Stop()
 
-	batch := make([]*model.MetricData, 0, s.cfg.BatchSize)
+	batch := make([]*model.MetricData, 0, dynCfg.BatchSize)
 
 	doFlush := func(b []*model.MetricData) {
 		if len(b) == 0 {
@@ -1067,11 +1161,17 @@ func (s *ClickHouseMetricStore) batchWriter() {
 				return
 			}
 			batch = append(batch, m)
-			if len(batch) >= s.cfg.BatchSize {
+			dc := s.loadDynCfg()
+			if len(batch) >= dc.BatchSize {
 				doFlush(batch)
-				batch = make([]*model.MetricData, 0, s.cfg.BatchSize)
+				batch = make([]*model.MetricData, 0, dc.BatchSize)
 			}
 		case <-ticker.C:
+			dc := s.loadDynCfg()
+			if dc.FlushInterval != dynCfg.FlushInterval {
+				ticker.Reset(dc.FlushInterval)
+				dynCfg = dc
+			}
 			if len(batch) > 0 {
 				doFlush(batch)
 				batch = make([]*model.MetricData, 0, s.cfg.BatchSize)
@@ -1088,7 +1188,7 @@ func (s *ClickHouseMetricStore) flushWorker() {
 			slog.Warn("clickhouse metric flush blocked by circuit breaker — routing to DLQ", "count", len(data))
 			chFlushErrorsTotal.WithLabelValues("metrics").Inc()
 			if s.dlq != nil {
-				if dlqErr := s.dlq.WriteMetrics(data); dlqErr != nil {
+				if dlqErr := s.dlq.WriteDLQMetrics(data, "circuit breaker open"); dlqErr != nil {
 					slog.Error("clickhouse metric DLQ write failed — data lost", "err", dlqErr, "count", len(data))
 				} else {
 					chDLQWrittenTotal.WithLabelValues("metrics").Add(float64(len(data)))
@@ -1104,7 +1204,7 @@ func (s *ClickHouseMetricStore) flushWorker() {
 			}
 			slog.Error("clickhouse metric flush failed (all retries exhausted)", "err", err, "count", len(data))
 			if s.dlq != nil {
-				if dlqErr := s.dlq.WriteMetrics(data); dlqErr != nil {
+				if dlqErr := s.dlq.WriteDLQMetrics(data, err.Error()); dlqErr != nil {
 					slog.Error("clickhouse metric DLQ write failed — data lost", "err", dlqErr, "count", len(data))
 				} else {
 					chDLQWrittenTotal.WithLabelValues("metrics").Add(float64(len(data)))
@@ -1256,9 +1356,37 @@ type ClickHouseLogStore struct {
 	ch      chan *model.LogData    // 수신 데이터 채널
 	flushCh chan []*model.LogData  // 조립된 배치를 flush worker에 전달하는 큐
 	cfg     ClickHouseConfig
-	done    chan struct{}     // 모든 flushWorker 종료 시 닫힘
-	dlq     *FileBackupWriter // flush 실패 시 배치 보존 (nil이면 비활성화)
-	cb      *circuitBreaker   // 연속 실패 시 flush 차단 (nil이면 비활성화)
+	dynCfg  atomic.Pointer[storeDynCfg] // 핫 리로드 가능한 배치 설정
+	done    chan struct{}                // 모든 flushWorker 종료 시 닫힘
+	dlq     *FileBackupWriter           // flush 실패 시 배치 보존 (nil이면 비활성화)
+	cb      *circuitBreaker             // 연속 실패 시 flush 차단 (nil이면 비활성화)
+}
+
+// SetDynamicConfig는 log store의 배치 설정을 런타임에 변경한다.
+func (s *ClickHouseLogStore) SetDynamicConfig(batchSize int, flushInterval time.Duration) {
+	cur := s.dynCfg.Load()
+	next := storeDynCfg{BatchSize: s.cfg.BatchSize, FlushInterval: s.cfg.FlushInterval}
+	if cur != nil {
+		next = *cur
+	}
+	if batchSize > 0 {
+		next.BatchSize = batchSize
+	}
+	if flushInterval > 0 {
+		next.FlushInterval = flushInterval
+	}
+	s.dynCfg.Store(&next)
+	slog.Info("log store dynamic config updated",
+		"batch_size", next.BatchSize,
+		"flush_interval", next.FlushInterval,
+	)
+}
+
+func (s *ClickHouseLogStore) loadDynCfg() storeDynCfg {
+	if p := s.dynCfg.Load(); p != nil {
+		return *p
+	}
+	return storeDynCfg{BatchSize: s.cfg.BatchSize, FlushInterval: s.cfg.FlushInterval}
 }
 
 func NewClickHouseLogStore(conn driver.Conn, cfg ClickHouseConfig) (*ClickHouseLogStore, error) {
@@ -1483,10 +1611,11 @@ func (s *ClickHouseLogStore) batchWriter() {
 		}
 	}()
 
-	ticker := time.NewTicker(s.cfg.FlushInterval)
+	dynCfg := s.loadDynCfg()
+	ticker := time.NewTicker(dynCfg.FlushInterval)
 	defer ticker.Stop()
 
-	batch := make([]*model.LogData, 0, s.cfg.BatchSize)
+	batch := make([]*model.LogData, 0, dynCfg.BatchSize)
 
 	doFlush := func(b []*model.LogData) {
 		if len(b) == 0 {
@@ -1504,14 +1633,20 @@ func (s *ClickHouseLogStore) batchWriter() {
 				return
 			}
 			batch = append(batch, l)
-			if len(batch) >= s.cfg.BatchSize {
+			dc := s.loadDynCfg()
+			if len(batch) >= dc.BatchSize {
 				doFlush(batch)
-				batch = make([]*model.LogData, 0, s.cfg.BatchSize)
+				batch = make([]*model.LogData, 0, dc.BatchSize)
 			}
 		case <-ticker.C:
+			dc := s.loadDynCfg()
+			if dc.FlushInterval != dynCfg.FlushInterval {
+				ticker.Reset(dc.FlushInterval)
+				dynCfg = dc
+			}
 			if len(batch) > 0 {
 				doFlush(batch)
-				batch = make([]*model.LogData, 0, s.cfg.BatchSize)
+				batch = make([]*model.LogData, 0, dc.BatchSize)
 			}
 		}
 	}
@@ -1525,7 +1660,7 @@ func (s *ClickHouseLogStore) flushWorker() {
 			slog.Warn("clickhouse log flush blocked by circuit breaker — routing to DLQ", "count", len(data))
 			chFlushErrorsTotal.WithLabelValues("logs").Inc()
 			if s.dlq != nil {
-				if dlqErr := s.dlq.WriteLogs(data); dlqErr != nil {
+				if dlqErr := s.dlq.WriteDLQLogs(data, "circuit breaker open"); dlqErr != nil {
 					slog.Error("clickhouse log DLQ write failed — data lost", "err", dlqErr, "count", len(data))
 				} else {
 					chDLQWrittenTotal.WithLabelValues("logs").Add(float64(len(data)))
@@ -1541,7 +1676,7 @@ func (s *ClickHouseLogStore) flushWorker() {
 			}
 			slog.Error("clickhouse log flush failed (all retries exhausted)", "err", err, "count", len(data))
 			if s.dlq != nil {
-				if dlqErr := s.dlq.WriteLogs(data); dlqErr != nil {
+				if dlqErr := s.dlq.WriteDLQLogs(data, err.Error()); dlqErr != nil {
 					slog.Error("clickhouse log DLQ write failed — data lost", "err", dlqErr, "count", len(data))
 				} else {
 					chDLQWrittenTotal.WithLabelValues("logs").Add(float64(len(data)))
@@ -1597,6 +1732,16 @@ func (s *ClickHouseLogStore) flushLogs(logs []*model.LogData) error {
 }
 
 // ---- OTel 속성 추출 헬퍼 ----
+
+// encodeSpanLinks는 SpanLink 슬라이스를 JSON 문자열로 직렬화한다.
+// ClickHouse의 String 컬럼에 저장하며, 빈 슬라이스는 빈 문자열을 반환한다.
+func encodeSpanLinks(links []model.SpanLink) string {
+	if len(links) == 0 {
+		return ""
+	}
+	b, _ := json.Marshal(links)
+	return string(b)
+}
 
 // toStringMap은 map[string]any를 ClickHouse Map(String,String) 타입에 맞게 변환한다.
 // 비문자열 값은 fmt.Sprintf("%v")로 직렬화한다.
@@ -1689,6 +1834,8 @@ CREATE TABLE IF NOT EXISTS %s.spans (
     exception_type        String DEFAULT '',
     exception_message     String DEFAULT '',
     exception_stacktrace  String DEFAULT '',
+    trace_state           String DEFAULT '',
+    span_links            String DEFAULT '',
     dt Date DEFAULT toDate(fromUnixTimestamp64Milli(received_at_ms))
 ) ENGINE = MergeTree()
 PARTITION BY dt
@@ -1714,6 +1861,9 @@ TTL dt + INTERVAL %d DAY;
 		fmt.Sprintf("ALTER TABLE %s.spans ADD COLUMN IF NOT EXISTS exception_stacktrace String DEFAULT ''", db),
 		// #6: attributes String → Map(String,String) 마이그레이션 (기존 테이블 대상)
 		fmt.Sprintf("ALTER TABLE %s.spans MODIFY COLUMN IF EXISTS attributes Map(String, String)", db),
+		// #7: W3C Trace State 및 Span Links 컬럼 추가
+		fmt.Sprintf("ALTER TABLE %s.spans ADD COLUMN IF NOT EXISTS trace_state String DEFAULT ''", db),
+		fmt.Sprintf("ALTER TABLE %s.spans ADD COLUMN IF NOT EXISTS span_links String DEFAULT ''", db),
 	}
 	for _, q := range alterCols {
 		if err := conn.Exec(ctx, q); err != nil {

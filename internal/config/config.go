@@ -136,6 +136,12 @@ type Config struct {
 	AlertSlackWebhookURL string        // Slack Incoming Webhook URL (ALERT_SLACK_WEBHOOK_URL)
 	AlertInterval        time.Duration // 폴링 주기 (기본 1m)
 	AlertMinSeverity     string        // 최소 severity: "warning" | "critical" (기본 "warning")
+
+	// 설정 핫 리로드: HOT_RELOAD_FILE이 설정된 경우 활성화된다.
+	// JSON 파일을 HOT_RELOAD_INTERVAL마다 폴링해 BatchSize/FlushInterval을 동적으로 반영한다.
+	// 파일 형식: {"batch_size": 2000, "flush_interval": "5s"}
+	HotReloadFile     string        // 핫 리로드 설정 파일 경로 (HOT_RELOAD_FILE)
+	HotReloadInterval time.Duration // 폴링 주기 (기본 30s)
 }
 
 // Load는 환경변수에서 설정을 읽어 Config를 반환한다.
@@ -190,6 +196,8 @@ func Load() (*Config, error) {
 		AlertSlackWebhookURL:     envStr("ALERT_SLACK_WEBHOOK_URL", ""),
 		AlertInterval:            envDuration("ALERT_INTERVAL", time.Minute),
 		AlertMinSeverity:         envStr("ALERT_MIN_SEVERITY", "warning"),
+		HotReloadFile:            envStr("HOT_RELOAD_FILE", ""),
+		HotReloadInterval:        envDuration("HOT_RELOAD_INTERVAL", 30*time.Second),
 	}
 
 	if err := cfg.validate(); err != nil {

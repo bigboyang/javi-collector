@@ -98,6 +98,56 @@ func (w *FileBackupWriter) WriteLogs(logs []*model.LogData) error {
 	})
 }
 
+// dlqBatchEntry는 에러 사유와 배치 데이터를 포함하는 DLQ 항목이다.
+// {"error_reason": "...", "batch": [...]} 형식으로 JSONL에 기록된다.
+type dlqBatchEntry[T any] struct {
+	ErrorReason string `json:"error_reason"`
+	Batch       []T    `json:"batch"`
+}
+
+// WriteDLQSpans는 spans를 에러 사유와 함께 traces-YYYY-MM-DD.jsonl에 기록한다.
+// 각 배치는 {"error_reason":"...","batch":[...]} 형식의 단일 JSON 라인으로 저장된다.
+func (w *FileBackupWriter) WriteDLQSpans(spans []*model.SpanData, reason string) error {
+	today := w.today()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	f, err := w.openFile("traces", today, &w.traceFile, &w.traceDate)
+	if err != nil {
+		return err
+	}
+	entry := dlqBatchEntry[*model.SpanData]{ErrorReason: reason, Batch: spans}
+	return json.NewEncoder(f).Encode(entry)
+}
+
+// WriteDLQMetrics는 metrics를 에러 사유와 함께 metrics-YYYY-MM-DD.jsonl에 기록한다.
+func (w *FileBackupWriter) WriteDLQMetrics(metrics []*model.MetricData, reason string) error {
+	today := w.today()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	f, err := w.openFile("metrics", today, &w.metricFile, &w.metricDate)
+	if err != nil {
+		return err
+	}
+	entry := dlqBatchEntry[*model.MetricData]{ErrorReason: reason, Batch: metrics}
+	return json.NewEncoder(f).Encode(entry)
+}
+
+// WriteDLQLogs는 logs를 에러 사유와 함께 logs-YYYY-MM-DD.jsonl에 기록한다.
+func (w *FileBackupWriter) WriteDLQLogs(logs []*model.LogData, reason string) error {
+	today := w.today()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	f, err := w.openFile("logs", today, &w.logFile, &w.logDate)
+	if err != nil {
+		return err
+	}
+	entry := dlqBatchEntry[*model.LogData]{ErrorReason: reason, Batch: logs}
+	return json.NewEncoder(f).Encode(entry)
+}
+
 // Close는 열려있는 모든 백업 파일을 닫는다.
 func (w *FileBackupWriter) Close() error {
 	w.mu.Lock()

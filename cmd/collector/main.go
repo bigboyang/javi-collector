@@ -278,6 +278,28 @@ func main() {
 		slog.Info("file backup enabled", "dir", cfg.BackupDir)
 	}
 
+	// 설정 핫 리로드: HOT_RELOAD_FILE이 설정된 경우 BatchSize/FlushInterval을 동적으로 반영한다.
+	// ClickHouse가 활성화된 경우에만 의미가 있다.
+	if !cfg.DisableClickHouse && cfg.HotReloadFile != "" {
+		hr := config.NewHotReloader(cfg.HotReloadFile, cfg.HotReloadInterval)
+		hr.OnChange(func(dc config.DynamicConfig) {
+			if ts, ok := traceStore.(store.DynamicConfigSetter); ok {
+				ts.SetDynamicConfig(dc.BatchSize, dc.FlushInterval)
+			}
+			if ms, ok := metricStore.(store.DynamicConfigSetter); ok {
+				ms.SetDynamicConfig(dc.BatchSize, dc.FlushInterval)
+			}
+			if ls, ok := logStore.(store.DynamicConfigSetter); ok {
+				ls.SetDynamicConfig(dc.BatchSize, dc.FlushInterval)
+			}
+		})
+		hr.Start(ctx)
+		slog.Info("hot reload enabled",
+			"file", cfg.HotReloadFile,
+			"interval", cfg.HotReloadInterval,
+		)
+	}
+
 	ing := ingester.New(ingestTraceStore, ingestMetricStore, ingestLogStore, embedPipeline)
 
 	// TraceRouter: SAMPLING_ENABLED=true이고 SELF_URL이 설정된 경우 활성화.

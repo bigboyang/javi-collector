@@ -9,14 +9,14 @@ spec:
     kind: Deployment
     name: javi-collector
   minReplicas: 2
-  maxReplicas: 8
+  maxReplicas: 4
   metrics:
     - type: Resource
       resource:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: 70
+          averageUtilization: 10
     - type: Resource
       resource:
         name: memory
