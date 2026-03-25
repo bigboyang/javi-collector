@@ -16,9 +16,11 @@ import (
 	"github.com/kkc/javi-collector/internal/anomaly"
 	"github.com/kkc/javi-collector/internal/config"
 	"github.com/kkc/javi-collector/internal/ingester"
+	"github.com/kkc/javi-collector/internal/processor"
 	"github.com/kkc/javi-collector/internal/rag"
 	"github.com/kkc/javi-collector/internal/rca"
 	"github.com/kkc/javi-collector/internal/sampling"
+	"github.com/kkc/javi-collector/internal/selftracing"
 	"github.com/kkc/javi-collector/internal/server"
 	"github.com/kkc/javi-collector/internal/store"
 )
@@ -301,6 +303,40 @@ func main() {
 	}
 
 	ing := ingester.New(ingestTraceStore, ingestMetricStore, ingestLogStore, embedPipeline)
+
+	// ── Processor Pipeline ────────────────────────────────────────────────
+	// CARDINALITY_ENABLED=true이면 CardinalityProcessor를 파이프라인에 추가한다.
+	// 파이프라인은 이후 추가 프로세서를 여기에 append해 확장한다.
+	{
+		var procs []processor.Processor
+		if cfg.CardinalityEnabled {
+			limits := processor.CardinalityLimits{
+				PerServiceAttrLimit: cfg.CardinalityLimit,
+				BloomFilterBits:     uint(cfg.CardinalityBloomBits),
+				BloomHashFunctions:  uint(cfg.CardinalityBloomK),
+			}
+			procs = append(procs, processor.NewCardinalityProcessor(limits))
+			slog.Info("cardinality processor enabled",
+				"limit_per_service_attr", cfg.CardinalityLimit,
+				"bloom_bits", cfg.CardinalityBloomBits,
+				"bloom_k", cfg.CardinalityBloomK,
+			)
+		}
+		if len(procs) > 0 {
+			ing.SetPipeline(processor.NewPipeline(procs...))
+		}
+	}
+
+	// ── Collector Self-Tracing ─────────────────────────────────────────────
+	// SELF_TRACING_ENABLED=true이면 컬렉터 내부 파이프라인 스팬을 traceStore에 기록한다.
+	// 셀프 트레이스는 일반 스팬과 함께 저장되며 "javi.internal"=true 속성으로 구분 가능하다.
+	if cfg.SelfTracingEnabled {
+		st := selftracing.New(traceStore)
+		st.Start()
+		defer st.Stop()
+		ing.SetSelfTracer(st)
+		slog.Info("collector self-tracing enabled")
+	}
 
 	// TraceRouter: SAMPLING_ENABLED=true이고 SELF_URL이 설정된 경우 활성화.
 	// 멀티 인스턴스 배포 시 traceID 기반 일관 해시로 동일 trace의 spans를

@@ -142,6 +142,24 @@ type Config struct {
 	// 파일 형식: {"batch_size": 2000, "flush_interval": "5s"}
 	HotReloadFile     string        // 핫 리로드 설정 파일 경로 (HOT_RELOAD_FILE)
 	HotReloadInterval time.Duration // 폴링 주기 (기본 30s)
+
+	// ── Processor Pipeline ────────────────────────────────────────────────
+	// CARDINALITY_ENABLED=true이면 CardinalityProcessor가 활성화된다.
+	// 활성화 시 각 (service, attr_key) 쌍에 대해 CARDINALITY_LIMIT개 이상의
+	// 고유 string 값을 "__high_cardinality__"로 대체한다.
+	CardinalityEnabled bool
+	// CardinalityLimit: 서비스+속성키 별 최대 고유 값 수 (기본 200)
+	CardinalityLimit int
+	// CardinalityBloomBits: bloom filter 비트 수 (기본 100_000, ≈12.5 KB/tracker)
+	CardinalityBloomBits int
+	// CardinalityBloomK: bloom filter 해시 함수 수 (기본 4)
+	CardinalityBloomK int
+
+	// ── Collector Self-Tracing ────────────────────────────────────────────
+	// SELF_TRACING_ENABLED=true이면 컬렉터 내부 파이프라인(decode/process/store)을
+	// 스팬으로 기록해 ClickHouse의 일반 스팬과 함께 저장한다.
+	// serviceName="javi-collector", attr "javi.internal"=true 로 필터 가능.
+	SelfTracingEnabled bool
 }
 
 // Load는 환경변수에서 설정을 읽어 Config를 반환한다.
@@ -198,6 +216,11 @@ func Load() (*Config, error) {
 		AlertMinSeverity:         envStr("ALERT_MIN_SEVERITY", "warning"),
 		HotReloadFile:            envStr("HOT_RELOAD_FILE", ""),
 		HotReloadInterval:        envDuration("HOT_RELOAD_INTERVAL", 30*time.Second),
+		CardinalityEnabled:       envBool("CARDINALITY_ENABLED", false),
+		CardinalityLimit:         envInt("CARDINALITY_LIMIT", 200),
+		CardinalityBloomBits:     envInt("CARDINALITY_BLOOM_BITS", 100_000),
+		CardinalityBloomK:        envInt("CARDINALITY_BLOOM_K", 4),
+		SelfTracingEnabled:       envBool("SELF_TRACING_ENABLED", false),
 	}
 
 	if err := cfg.validate(); err != nil {

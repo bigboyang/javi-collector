@@ -22,9 +22,13 @@ import (
 	collectormetricsv1 "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	collectortracev1 "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 
+	"time"
+
 	"github.com/kkc/javi-collector/internal/decoder"
 	"github.com/kkc/javi-collector/internal/model"
+	"github.com/kkc/javi-collector/internal/processor"
 	"github.com/kkc/javi-collector/internal/rag"
+	"github.com/kkc/javi-collector/internal/selftracing"
 	"github.com/kkc/javi-collector/internal/store"
 )
 
@@ -60,13 +64,15 @@ var (
 	}, []string{"signal"})
 )
 
-// Ingester는 OTLP 수신 → decode → store 파이프라인을 담당한다.
+// Ingester는 OTLP 수신 → decode → process → store 파이프라인을 담당한다.
 type Ingester struct {
 	traceStore  store.TraceStore
 	metricStore store.MetricStore
 	logStore    store.LogStore
-	embedPipe   *rag.EmbedPipeline    // nil이면 RAG 비활성화
+	embedPipe   *rag.EmbedPipeline  // nil이면 RAG 비활성화
 	docBuilder  rag.DocumentBuilder
+	pipeline    *processor.Pipeline    // nil이면 프로세서 파이프라인 비활성화
+	selfTracer  *selftracing.Tracer    // nil이면 셀프 트레이싱 비활성화
 
 	// atomic 카운터: /api/collector/stats 조회용 (단조 증가, reset 없음)
 	traceReceived  atomic.Int64
@@ -84,6 +90,12 @@ func New(ts store.TraceStore, ms store.MetricStore, ls store.LogStore, embedPipe
 		embedPipe:   embedPipeline,
 	}
 }
+
+// SetPipeline attaches a processor pipeline. Must be called before serving traffic.
+func (ing *Ingester) SetPipeline(p *processor.Pipeline) { ing.pipeline = p }
+
+// SetSelfTracer attaches the self-tracing tracer. Must be called before serving traffic.
+func (ing *Ingester) SetSelfTracer(t *selftracing.Tracer) { ing.selfTracer = t }
 
 // ---- HTTP 경로: protobuf bytes 입력 ----
 
@@ -185,10 +197,32 @@ func (ing *Ingester) storeSpans(ctx context.Context, spans []*model.SpanData) (i
 	if len(spans) == 0 {
 		return 0, nil
 	}
-	if err := ing.traceStore.AppendSpans(ctx, spans); err != nil {
-		ingestErrorsTotal.WithLabelValues("traces").Inc()
-		return 0, err
+
+	// Processor pipeline: cardinality control, attribute filtering, etc.
+	if ing.pipeline != nil && ing.pipeline.Enabled() {
+		procStart := time.Now()
+		inCount := len(spans)
+		var procErr error
+		spans, procErr = ing.pipeline.ProcessSpans(ctx, spans)
+		if ing.selfTracer != nil {
+			ing.selfTracer.RecordProcess("traces", inCount, len(spans), procStart, procErr)
+		}
+		if procErr != nil {
+			ingestErrorsTotal.WithLabelValues("traces").Inc()
+			return 0, procErr
+		}
 	}
+
+	storeStart := time.Now()
+	storeErr := ing.traceStore.AppendSpans(ctx, spans)
+	if ing.selfTracer != nil {
+		ing.selfTracer.RecordIngest("ingest.traces", "traces", len(spans), storeStart, storeErr)
+	}
+	if storeErr != nil {
+		ingestErrorsTotal.WithLabelValues("traces").Inc()
+		return 0, storeErr
+	}
+
 	n := int64(len(spans))
 	ing.traceReceived.Add(n)
 	spansIngestedTotal.Add(float64(n))
@@ -212,10 +246,31 @@ func (ing *Ingester) storeMetrics(ctx context.Context, metrics []*model.MetricDa
 	if len(metrics) == 0 {
 		return 0, nil
 	}
-	if err := ing.metricStore.AppendMetrics(ctx, metrics); err != nil {
-		ingestErrorsTotal.WithLabelValues("metrics").Inc()
-		return 0, err
+
+	if ing.pipeline != nil && ing.pipeline.Enabled() {
+		procStart := time.Now()
+		inCount := len(metrics)
+		var procErr error
+		metrics, procErr = ing.pipeline.ProcessMetrics(ctx, metrics)
+		if ing.selfTracer != nil {
+			ing.selfTracer.RecordProcess("metrics", inCount, len(metrics), procStart, procErr)
+		}
+		if procErr != nil {
+			ingestErrorsTotal.WithLabelValues("metrics").Inc()
+			return 0, procErr
+		}
 	}
+
+	storeStart := time.Now()
+	storeErr := ing.metricStore.AppendMetrics(ctx, metrics)
+	if ing.selfTracer != nil {
+		ing.selfTracer.RecordIngest("ingest.metrics", "metrics", len(metrics), storeStart, storeErr)
+	}
+	if storeErr != nil {
+		ingestErrorsTotal.WithLabelValues("metrics").Inc()
+		return 0, storeErr
+	}
+
 	n := int64(len(metrics))
 	ing.metricReceived.Add(n)
 	metricsIngestedTotal.Add(float64(n))
@@ -227,10 +282,31 @@ func (ing *Ingester) storeLogs(ctx context.Context, logs []*model.LogData) (int,
 	if len(logs) == 0 {
 		return 0, nil
 	}
-	if err := ing.logStore.AppendLogs(ctx, logs); err != nil {
-		ingestErrorsTotal.WithLabelValues("logs").Inc()
-		return 0, err
+
+	if ing.pipeline != nil && ing.pipeline.Enabled() {
+		procStart := time.Now()
+		inCount := len(logs)
+		var procErr error
+		logs, procErr = ing.pipeline.ProcessLogs(ctx, logs)
+		if ing.selfTracer != nil {
+			ing.selfTracer.RecordProcess("logs", inCount, len(logs), procStart, procErr)
+		}
+		if procErr != nil {
+			ingestErrorsTotal.WithLabelValues("logs").Inc()
+			return 0, procErr
+		}
 	}
+
+	storeStart := time.Now()
+	storeErr := ing.logStore.AppendLogs(ctx, logs)
+	if ing.selfTracer != nil {
+		ing.selfTracer.RecordIngest("ingest.logs", "logs", len(logs), storeStart, storeErr)
+	}
+	if storeErr != nil {
+		ingestErrorsTotal.WithLabelValues("logs").Inc()
+		return 0, storeErr
+	}
+
 	n := int64(len(logs))
 	ing.logReceived.Add(n)
 	logsIngestedTotal.Add(float64(n))
