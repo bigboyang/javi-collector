@@ -216,6 +216,17 @@ func main() {
 				"qdrant", cfg.QdrantEndpoint,
 			)
 
+			// RAG Janitor: 오래된 Qdrant 포인트를 주기적으로 삭제해 컬렉션 크기를 제한한다.
+			// RAG_RETENTION_DAYS=0 이면 비활성화.
+			if cfg.RAGRetentionDays > 0 {
+				janitor := rag.NewQdrantJanitor(qdrantClient, cfg.RAGRetentionDays, cfg.RAGJanitorInterval)
+				janitor.Start(ctx)
+				slog.Info("qdrant janitor started",
+					"retention_days", cfg.RAGRetentionDays,
+					"interval", cfg.RAGJanitorInterval,
+				)
+			}
+
 			// RAG Historical Backfill: ClickHouse 과거 ERROR spans → Qdrant 적재
 			// 기동 직후 Qdrant가 비어 있어 유사 사례 검색이 안 되는 문제를 해결한다.
 			if cfg.RAGBackfillEnabled {

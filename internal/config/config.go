@@ -69,6 +69,11 @@ type Config struct {
 	RAGBackfillBatchSize      int    // 한 배치에 처리할 span 수 (기본 50)
 	RAGBackfillCheckpointFile string // 체크포인트 파일 경로 (기본: {BackupDir}/rag_backfill_checkpoint.json)
 
+	// RAG Janitor: 오래된 Qdrant 포인트를 주기적으로 삭제해 컬렉션 크기를 제한한다.
+	// RAG_RETENTION_DAYS=0 이면 Janitor 비활성화 (무제한 증가 허용).
+	RAGRetentionDays   int           // Qdrant 포인트 보관 기간(일). 기본 30. (RAG_RETENTION_DAYS)
+	RAGJanitorInterval time.Duration // Janitor 실행 주기. 기본 6h. (RAG_JANITOR_INTERVAL)
+
 	// 파일 백업 설정 (BACKUP_ENABLED=true 시 활성화)
 	// 수신된 trace/metric/log를 JSONL 파일로 백업한다.
 	BackupEnabled bool
@@ -202,6 +207,8 @@ func Load() (*Config, error) {
 		RAGBackfillDays:           envInt("RAG_BACKFILL_DAYS", 7),
 		RAGBackfillBatchSize:      envInt("RAG_BACKFILL_BATCH_SIZE", 50),
 		RAGBackfillCheckpointFile: envStr("RAG_BACKFILL_CHECKPOINT_FILE", ""),
+		RAGRetentionDays:          envInt("RAG_RETENTION_DAYS", 30),
+		RAGJanitorInterval:        envDuration("RAG_JANITOR_INTERVAL", 6*time.Hour),
 		BackupEnabled:             envBool("BACKUP_ENABLED", true),
 		BackupDir:                 envStr("BACKUP_DIR", "./backup"),
 		DLQDir:                   envStr("DLQ_DIR", "./dlq"),

@@ -418,9 +418,9 @@ func (q *QdrantClient) EnsureCollection(ctx context.Context, dimension uint) err
 }
 
 type qdrantPoint struct {
-	ID      string            `json:"id"`
-	Vector  []float32         `json:"vector"`
-	Payload map[string]string `json:"payload"`
+	ID      string         `json:"id"`
+	Vector  []float32      `json:"vector"`
+	Payload map[string]any `json:"payload"` // any: string + int64 혼용 (range filter 지원)
 }
 
 func (q *QdrantClient) Upsert(ctx context.Context, points []qdrantPoint) error {
@@ -539,12 +539,15 @@ func (p *EmbedPipeline) flushBatch(ctx context.Context, docs []*EmbedDocument) e
 
 	points := make([]qdrantPoint, len(docs))
 	for i, doc := range docs {
-		payload := make(map[string]string, len(doc.Metadata)+1)
+		payload := make(map[string]any, len(doc.Metadata)+2)
 		for k, v := range doc.Metadata {
 			payload[k] = v
 		}
 		payload["text"] = doc.Text
 		payload["trace_id"] = doc.TraceID
+		// timestamp_ms를 int64로 저장 — Qdrant range filter는 integer/float 타입 필요.
+		// 문자열로 저장하면 range 조건이 사전순 비교가 되어 TTL/검색 모두 오작동한다.
+		payload["timestamp_ms"] = doc.TimestampMs
 
 		points[i] = qdrantPoint{
 			ID:      spanIDToPointID(doc.SpanID),
@@ -648,8 +651,8 @@ func (r *RAGSearcher) Search(ctx context.Context, req SearchRequest) ([]SearchRe
 
 	var out struct {
 		Result []struct {
-			Score   float32           `json:"score"`
-			Payload map[string]string `json:"payload"`
+			Score   float32        `json:"score"`
+			Payload map[string]any `json:"payload"` // int64 필드(timestamp_ms) 때문에 any 필요
 		} `json:"result"`
 	}
 	if err := json.NewDecoder(httpResp.Body).Decode(&out); err != nil {
@@ -658,14 +661,12 @@ func (r *RAGSearcher) Search(ctx context.Context, req SearchRequest) ([]SearchRe
 
 	results := make([]SearchResult, 0, len(out.Result))
 	for _, item := range out.Result {
-		var tsMs int64
-		fmt.Sscanf(item.Payload["timestamp_ms"], "%d", &tsMs)
 		results = append(results, SearchResult{
-			TraceID:     item.Payload["trace_id"],
-			ServiceName: item.Payload["service_name"],
+			TraceID:     payloadStr(item.Payload, "trace_id"),
+			ServiceName: payloadStr(item.Payload, "service_name"),
 			Score:       item.Score,
-			Text:        item.Payload["text"],
-			TimestampMs: tsMs,
+			Text:        payloadStr(item.Payload, "text"),
+			TimestampMs: payloadInt64(item.Payload, "timestamp_ms"),
 		})
 	}
 	return results, nil
@@ -683,4 +684,134 @@ func FormatForLLM(query string, results []SearchResult) string {
 	}
 	fmt.Fprintf(&sb, "=== 현재 문의 ===\n%s", query)
 	return sb.String()
+}
+
+// ---- payload 헬퍼 ----
+
+// payloadStr은 map[string]any 페이로드에서 문자열 값을 추출한다.
+func payloadStr(m map[string]any, key string) string {
+	if v, ok := m[key]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// payloadInt64는 map[string]any 페이로드에서 int64 값을 추출한다.
+// JSON 숫자는 float64로 디코딩되므로 float64 → int64 변환을 처리한다.
+func payloadInt64(m map[string]any, key string) int64 {
+	if v, ok := m[key]; ok {
+		switch x := v.(type) {
+		case float64:
+			return int64(x)
+		case int64:
+			return x
+		case string:
+			var n int64
+			fmt.Sscanf(x, "%d", &n)
+			return n
+		}
+	}
+	return 0
+}
+
+// ---- QdrantClient.DeleteByFilter ----
+
+// DeleteByFilter는 필터 조건에 맞는 포인트를 일괄 삭제한다.
+// TTL Janitor가 오래된 포인트를 정리할 때 사용한다.
+//
+// filter 예시 (timestamp_ms < cutoffMs):
+//
+//	map[string]any{
+//	  "must": []map[string]any{
+//	    {"key": "timestamp_ms", "range": map[string]any{"lt": cutoffMs}},
+//	  },
+//	}
+func (q *QdrantClient) DeleteByFilter(ctx context.Context, filter map[string]any) error {
+	body, _ := json.Marshal(map[string]any{"filter": filter})
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+		q.endpoint+"/collections/"+q.collection+"/points/delete",
+		bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := q.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("qdrant delete: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("qdrant delete: status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// ---- QdrantJanitor ----
+
+// QdrantJanitor는 주기적으로 오래된 벡터 포인트를 삭제해 컬렉션 크기를 제한한다.
+//
+// 동작:
+//   - 기동 즉시 1회 실행 후, interval마다 반복한다.
+//   - retentionDays보다 오래된 포인트(timestamp_ms 기준)를 삭제한다.
+//   - ctx 취소 시 즉시 종료 (graceful shutdown 보장).
+type QdrantJanitor struct {
+	qdrant        *QdrantClient
+	retentionDays int
+	interval      time.Duration
+}
+
+// NewQdrantJanitor는 QdrantJanitor를 생성한다.
+//   - retentionDays: 포인트 보관 기간(일). 0 이하이면 30일로 설정.
+//   - interval: 정리 실행 주기. 0 이하이면 6시간으로 설정.
+func NewQdrantJanitor(qdrant *QdrantClient, retentionDays int, interval time.Duration) *QdrantJanitor {
+	if retentionDays <= 0 {
+		retentionDays = 30
+	}
+	if interval <= 0 {
+		interval = 6 * time.Hour
+	}
+	return &QdrantJanitor{qdrant: qdrant, retentionDays: retentionDays, interval: interval}
+}
+
+// Start는 백그라운드 goroutine으로 janitor를 실행한다.
+// ctx가 취소되면 종료한다.
+func (j *QdrantJanitor) Start(ctx context.Context) {
+	go func() {
+		// 기동 즉시 1회 실행해 이전 재기동에서 누적된 포인트를 정리한다.
+		j.runOnce(ctx)
+
+		ticker := time.NewTicker(j.interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				j.runOnce(ctx)
+			}
+		}
+	}()
+}
+
+func (j *QdrantJanitor) runOnce(ctx context.Context) {
+	cutoffMs := time.Now().AddDate(0, 0, -j.retentionDays).UnixMilli()
+	filter := map[string]any{
+		"must": []map[string]any{
+			{
+				"key":   "timestamp_ms",
+				"range": map[string]any{"lt": cutoffMs},
+			},
+		},
+	}
+	if err := j.qdrant.DeleteByFilter(ctx, filter); err != nil {
+		slog.Error("qdrant janitor eviction failed",
+			"err", err,
+			"cutoff", time.UnixMilli(cutoffMs).UTC().Format(time.RFC3339),
+		)
+		return
+	}
+	slog.Info("qdrant janitor eviction done",
+		"retention_days", j.retentionDays,
+		"cutoff", time.UnixMilli(cutoffMs).UTC().Format(time.RFC3339),
+	)
 }
