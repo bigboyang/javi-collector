@@ -74,6 +74,12 @@ type Config struct {
 	RAGRetentionDays   int           // Qdrant 포인트 보관 기간(일). 기본 30. (RAG_RETENTION_DAYS)
 	RAGJanitorInterval time.Duration // Janitor 실행 주기. 기본 6h. (RAG_JANITOR_INTERVAL)
 
+	// RAG Generation: LLM 기반 RCA 분석 텍스트 생성.
+	// LLM_ENABLED=true + EMBED_ENABLED=true 인 경우에만 활성화된다.
+	// EmbedEndpoint(Ollama 서버)를 공유해 별도 서버 불필요.
+	LLMEnabled bool   // LLM Generation 활성화 여부 (LLM_ENABLED, 기본 false)
+	LLMModel   string // Ollama LLM 모델명 (LLM_MODEL, 기본 "qwen2.5:3b")
+
 	// 파일 백업 설정 (BACKUP_ENABLED=true 시 활성화)
 	// 수신된 trace/metric/log를 JSONL 파일로 백업한다.
 	BackupEnabled bool
@@ -209,6 +215,8 @@ func Load() (*Config, error) {
 		RAGBackfillCheckpointFile: envStr("RAG_BACKFILL_CHECKPOINT_FILE", ""),
 		RAGRetentionDays:          envInt("RAG_RETENTION_DAYS", 30),
 		RAGJanitorInterval:        envDuration("RAG_JANITOR_INTERVAL", 6*time.Hour),
+		LLMEnabled:                envBool("LLM_ENABLED", false),
+		LLMModel:                  envStr("LLM_MODEL", "qwen2.5:3b"),
 		BackupEnabled:             envBool("BACKUP_ENABLED", true),
 		BackupDir:                 envStr("BACKUP_DIR", "./backup"),
 		DLQDir:                   envStr("DLQ_DIR", "./dlq"),

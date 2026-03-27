@@ -48,5 +48,6 @@ type RCAReport struct {
 	CorrelatedSpans  []CorrelatedSpan  // 최대 5개
 	SimilarIncidents []SimilarIncident // 최대 3개
 	Hypothesis       string            // 규칙 기반 가설 문자열
+	LLMAnalysis      string            // LLM 기반 RCA 분석 (EMBED_ENABLED+LLM_ENABLED 시)
 	CreatedAt        time.Time
 }

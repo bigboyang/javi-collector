@@ -201,6 +201,7 @@ func main() {
 	// Ollama(nomic-embed-text) → Qdrant 벡터 저장 → 자연어 장애 검색
 	var embedPipeline *rag.EmbedPipeline
 	var ragSearcher *rag.RAGSearcher
+	var ragGenerator *rag.RAGGenerator
 	if cfg.EmbedEnabled {
 		embedClient := rag.NewOllamaEmbedClient(cfg.EmbedEndpoint, cfg.EmbedModel)
 		qdrantClient := rag.NewQdrantClient(cfg.QdrantEndpoint, cfg.QdrantCollection)
@@ -210,6 +211,17 @@ func main() {
 			embedPipeline = rag.NewEmbedPipeline(embedClient, qdrantClient, 1024, 32, 10*time.Second)
 			embedPipeline.Start(ctx)
 			ragSearcher = rag.NewRAGSearcher(embedClient, qdrantClient, cfg.RAGScoreThreshold)
+
+			// RAG Generation: LLM 기반 RCA 분석 (LLM_ENABLED=true 시)
+			if cfg.LLMEnabled {
+				llmClient := rag.NewOllamaLLMClient(cfg.EmbedEndpoint, cfg.LLMModel)
+				ragGenerator = rag.NewRAGGenerator(ragSearcher, llmClient)
+				slog.Info("RAG LLM generation enabled",
+					"model", cfg.LLMModel,
+					"endpoint", cfg.EmbedEndpoint,
+				)
+			}
+
 			slog.Info("RAG embed pipeline started",
 				"endpoint", cfg.EmbedEndpoint,
 				"model", cfg.EmbedModel,
@@ -276,11 +288,15 @@ func main() {
 	if !cfg.DisableClickHouse && cfg.RCAEnabled {
 		rcaCfg := rca.Config{Interval: cfg.RCAInterval}
 		rcaEngine := rca.NewEngine(chConn, cfg.ClickHouseDB, rcaCfg, ragSearcher)
+		if ragGenerator != nil {
+			rcaEngine.SetGenerator(ragGenerator)
+		}
 		rcaEngine.Start()
 		defer rcaEngine.Stop()
 		slog.Info("rca engine started",
 			"interval", cfg.RCAInterval,
 			"rag_enabled", ragSearcher != nil,
+			"llm_enabled", ragGenerator != nil,
 		)
 	}
 

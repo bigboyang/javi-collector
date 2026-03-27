@@ -28,6 +28,12 @@ type Searcher interface {
 	Search(ctx context.Context, req rag.SearchRequest) ([]rag.SearchResult, error)
 }
 
+// Generator는 RAGGenerator의 추상 인터페이스 (테스트 교체 가능).
+// anomalyDesc와 검색 파라미터를 받아 LLM 기반 RCA 분석 텍스트를 반환한다.
+type Generator interface {
+	Generate(ctx context.Context, anomalyDesc string, searchReq *rag.SearchRequest) (string, error)
+}
+
 // Config는 RCA Engine 설정.
 type Config struct {
 	Interval time.Duration // 폴링 주기 (기본 2m)
@@ -42,10 +48,11 @@ func DefaultConfig() Config {
 
 // Engine은 RCA 백그라운드 고루틴을 관리한다.
 type Engine struct {
-	conn     driver.Conn
-	db       string
-	interval time.Duration
-	searcher Searcher // nil이면 RAG 검색 생략
+	conn      driver.Conn
+	db        string
+	interval  time.Duration
+	searcher  Searcher  // nil이면 RAG 검색 생략
+	generator Generator // nil이면 LLM Generation 생략
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -62,6 +69,9 @@ func NewEngine(conn driver.Conn, db string, cfg Config, searcher Searcher) *Engi
 		stopCh:   make(chan struct{}),
 	}
 }
+
+// SetGenerator attaches an LLM generator. Must be called before Start.
+func (e *Engine) SetGenerator(g Generator) { e.generator = g }
 
 // Start launches the background goroutine.
 func (e *Engine) Start() {
@@ -142,8 +152,23 @@ func (e *Engine) analyze(ctx context.Context, a AnomalyRow) (RCAReport, error) {
 		}
 	}
 
-	// 3. 가설 생성
+	// 3. 규칙 기반 가설 생성
 	hypo := buildHypothesis(a, spans, similar)
+
+	// 4. LLM 기반 RCA 분석 (Generator가 설정된 경우)
+	var llmAnalysis string
+	if e.generator != nil {
+		anomalyDesc := hypo // 규칙 기반 요약을 LLM 입력으로 재활용
+		searchReq := &rag.SearchRequest{
+			Query:       fmt.Sprintf("%s anomaly in %s operation %s z_score %.1f", a.AnomalyType, a.ServiceName, a.SpanName, a.ZScore),
+			ServiceName: a.ServiceName,
+			Limit:       3,
+		}
+		llmAnalysis, err = e.generator.Generate(ctx, anomalyDesc, searchReq)
+		if err != nil {
+			slog.Warn("rca: llm generation failed", "anomaly_id", a.ID, "err", err)
+		}
+	}
 
 	return RCAReport{
 		ID:               newID(),
@@ -157,6 +182,7 @@ func (e *Engine) analyze(ctx context.Context, a AnomalyRow) (RCAReport, error) {
 		CorrelatedSpans:  spans,
 		SimilarIncidents: similar,
 		Hypothesis:       hypo,
+		LLMAnalysis:      llmAnalysis,
 		CreatedAt:        time.Now(),
 	}, nil
 }
@@ -309,7 +335,7 @@ func (e *Engine) insertReports(ctx context.Context, reports []RCAReport) error {
 	batch, err := e.conn.PrepareBatch(ctx, fmt.Sprintf(
 		`INSERT INTO %s.rca_reports
 		 (id, anomaly_id, service_name, span_name, anomaly_type, minute,
-		  severity, z_score, correlated_spans, similar_incidents, hypothesis, created_at)`,
+		  severity, z_score, correlated_spans, similar_incidents, hypothesis, llm_analysis, created_at)`,
 		e.db))
 	if err != nil {
 		return err
@@ -322,7 +348,7 @@ func (e *Engine) insertReports(ctx context.Context, reports []RCAReport) error {
 			r.ID, r.AnomalyID, r.ServiceName, r.SpanName, r.AnomalyType, r.Minute,
 			r.Severity, r.ZScore,
 			string(spansJSON), string(similarJSON),
-			r.Hypothesis, r.CreatedAt,
+			r.Hypothesis, r.LLMAnalysis, r.CreatedAt,
 		); err != nil {
 			return err
 		}

@@ -2060,6 +2060,13 @@ TTL dt + INTERVAL 90 DAY;
 	}
 
 	// AIOps Phase 3: RCA 결과 저장 테이블
+	// rca_reports 마이그레이션: llm_analysis 컬럼 추가 (기존 테이블 대상)
+	if err := conn.Exec(ctx, fmt.Sprintf(
+		`ALTER TABLE %s.rca_reports ADD COLUMN IF NOT EXISTS llm_analysis String DEFAULT ''`, db,
+	)); err != nil {
+		slog.Warn("alter rca_reports llm_analysis skipped", "err", err)
+	}
+
 	if err := conn.Exec(ctx, fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s.rca_reports (
     id                String,
@@ -2073,6 +2080,7 @@ CREATE TABLE IF NOT EXISTS %s.rca_reports (
     correlated_spans  String,  -- JSON array of CorrelatedSpan
     similar_incidents String,  -- JSON array of SimilarIncident
     hypothesis        String,
+    llm_analysis      String DEFAULT '',  -- LLM 기반 RCA 분석 텍스트
     created_at        DateTime DEFAULT now(),
     dt                Date DEFAULT toDate(minute)
 ) ENGINE = MergeTree()

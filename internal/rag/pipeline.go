@@ -686,6 +686,137 @@ func FormatForLLM(query string, results []SearchResult) string {
 	return sb.String()
 }
 
+// ---- LLMClient ----
+
+// LLMClient는 텍스트를 생성하는 인터페이스다.
+// Ollama, OpenAI 등 교체 가능.
+type LLMClient interface {
+	Generate(ctx context.Context, prompt string) (string, error)
+}
+
+// OllamaLLMClient는 로컬 Ollama로 텍스트를 생성한다.
+// qwen2.5:3b, llama3.2:3b 등 소형 LLM을 on-premise에서 운영.
+//
+// 사용:
+//
+//	ollama pull qwen2.5:3b
+type OllamaLLMClient struct {
+	endpoint string
+	model    string
+	client   *http.Client
+}
+
+func NewOllamaLLMClient(endpoint, model string) *OllamaLLMClient {
+	return &OllamaLLMClient{
+		endpoint: endpoint,
+		model:    model,
+		client:   &http.Client{Timeout: 60 * time.Second},
+	}
+}
+
+func (c *OllamaLLMClient) Generate(ctx context.Context, prompt string) (string, error) {
+	type message struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	type req struct {
+		Model    string    `json:"model"`
+		Messages []message `json:"messages"`
+		Stream   bool      `json:"stream"`
+	}
+	type resp struct {
+		Message message `json:"message"`
+	}
+
+	body, _ := json.Marshal(req{
+		Model: c.model,
+		Messages: []message{
+			{Role: "system", Content: "당신은 APM 시스템의 근본 원인 분석(RCA) 전문가입니다. 주어진 이상 감지 정보와 과거 유사 사례를 바탕으로 간결하고 실용적인 RCA 분석을 한국어로 제공하세요. 200자 이내로 요약하세요."},
+			{Role: "user", Content: prompt},
+		},
+		Stream: false,
+	})
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.endpoint+"/api/chat", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	httpResp, err := c.client.Do(httpReq)
+	if err != nil {
+		return "", fmt.Errorf("ollama generate: %w", err)
+	}
+	defer httpResp.Body.Close()
+
+	if httpResp.StatusCode >= 300 {
+		return "", fmt.Errorf("ollama generate: status %d", httpResp.StatusCode)
+	}
+
+	var out resp
+	if err := json.NewDecoder(httpResp.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("ollama decode: %w", err)
+	}
+	return strings.TrimSpace(out.Message.Content), nil
+}
+
+// ---- RAGGenerator ----
+
+// RAGGenerator는 Retrieval(유사 사례 검색) + Generation(LLM 분석)을 결합한다.
+// RCA Engine이 이상 감지 시 호출해 LLM 기반 근본 원인 분석 텍스트를 생성한다.
+type RAGGenerator struct {
+	searcher *RAGSearcher
+	llm      LLMClient
+}
+
+// NewRAGGenerator는 RAGGenerator를 생성한다.
+func NewRAGGenerator(searcher *RAGSearcher, llm LLMClient) *RAGGenerator {
+	return &RAGGenerator{searcher: searcher, llm: llm}
+}
+
+// Generate는 anomalyDesc와 유사 사례를 결합해 LLM RCA 분석을 반환한다.
+//   - searchReq: Qdrant 유사 사례 검색 파라미터 (nil이면 검색 생략)
+//   - anomalyDesc: 이상 감지 정보 요약 (LLM 입력에 포함)
+func (g *RAGGenerator) Generate(ctx context.Context, anomalyDesc string, searchReq *SearchRequest) (string, error) {
+	// 1. Retrieval: 유사 과거 사례 검색
+	var results []SearchResult
+	if searchReq != nil {
+		var err error
+		results, err = g.searcher.Search(ctx, *searchReq)
+		if err != nil {
+			slog.Warn("rag generator search failed, generating without context", "err", err)
+		}
+	}
+
+	// 2. Prompt 구성
+	prompt := buildRCAPrompt(anomalyDesc, results)
+
+	// 3. LLM Generation
+	return g.llm.Generate(ctx, prompt)
+}
+
+// buildRCAPrompt는 이상 감지 정보와 유사 사례를 LLM 프롬프트로 조합한다.
+func buildRCAPrompt(anomalyDesc string, similar []SearchResult) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "## 현재 이상 감지\n%s\n\n", anomalyDesc)
+
+	if len(similar) > 0 {
+		sb.WriteString("## 과거 유사 사례\n")
+		for i, r := range similar {
+			summary := r.Text
+			if len(summary) > 400 {
+				summary = summary[:400] + "..."
+			}
+			fmt.Fprintf(&sb, "### 사례 %d (유사도: %.2f, 서비스: %s)\n%s\n\n",
+				i+1, r.Score, r.ServiceName, summary)
+		}
+	}
+
+	sb.WriteString("## 요청\n위 정보를 바탕으로 근본 원인과 권장 조치를 간결하게 분석하세요.")
+	return sb.String()
+}
+
 // ---- payload 헬퍼 ----
 
 // payloadStr은 map[string]any 페이로드에서 문자열 값을 추출한다.
