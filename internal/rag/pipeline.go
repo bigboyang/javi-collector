@@ -392,12 +392,16 @@ type SearchResult struct {
 
 // RAGSearcher는 자연어 질의를 벡터 검색으로 변환한다.
 type RAGSearcher struct {
-	embedder EmbedClient
-	qdrant   *QdrantClient
+	embedder       EmbedClient
+	qdrant         *QdrantClient
+	scoreThreshold float64 // 코사인 유사도 임계값 (기본 0.65)
 }
 
-func NewRAGSearcher(embedder EmbedClient, qdrant *QdrantClient) *RAGSearcher {
-	return &RAGSearcher{embedder: embedder, qdrant: qdrant}
+func NewRAGSearcher(embedder EmbedClient, qdrant *QdrantClient, scoreThreshold float64) *RAGSearcher {
+	if scoreThreshold <= 0 {
+		scoreThreshold = 0.65
+	}
+	return &RAGSearcher{embedder: embedder, qdrant: qdrant, scoreThreshold: scoreThreshold}
 }
 
 // Search는 자연어 질의를 임베딩하고 유사 장애 케이스를 반환한다.
@@ -429,7 +433,7 @@ func (r *RAGSearcher) Search(ctx context.Context, req SearchRequest) ([]SearchRe
 		"vector":           embeddings[0],
 		"limit":            req.Limit,
 		"with_payload":     true,
-		"score_threshold":  0.65, // 코사인 유사도 임계값
+		"score_threshold":  r.scoreThreshold,
 	}
 	if len(must) > 0 {
 		searchBody["filter"] = map[string]any{"must": must}

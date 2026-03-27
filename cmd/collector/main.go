@@ -209,7 +209,7 @@ func main() {
 		} else {
 			embedPipeline = rag.NewEmbedPipeline(embedClient, qdrantClient, 1024, 32, 10*time.Second)
 			embedPipeline.Start(ctx)
-			ragSearcher = rag.NewRAGSearcher(embedClient, qdrantClient)
+			ragSearcher = rag.NewRAGSearcher(embedClient, qdrantClient, cfg.RAGScoreThreshold)
 			slog.Info("RAG embed pipeline started",
 				"endpoint", cfg.EmbedEndpoint,
 				"model", cfg.EmbedModel,
