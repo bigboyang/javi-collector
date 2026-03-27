@@ -82,12 +82,14 @@ type Ingester struct {
 
 // New는 Ingester를 생성한다.
 // embedPipeline은 nil이면 RAG 기능이 비활성화된다.
-func New(ts store.TraceStore, ms store.MetricStore, ls store.LogStore, embedPipeline *rag.EmbedPipeline) *Ingester {
+// slowMs는 SLOW span 인덱싱 임계값(ms). 0이면 SLOW 인덱싱 비활성화.
+func New(ts store.TraceStore, ms store.MetricStore, ls store.LogStore, embedPipeline *rag.EmbedPipeline, slowMs int64) *Ingester {
 	return &Ingester{
 		traceStore:  ts,
 		metricStore: ms,
 		logStore:    ls,
 		embedPipe:   embedPipeline,
+		docBuilder:  rag.DocumentBuilder{SlowMs: slowMs},
 	}
 }
 
@@ -228,13 +230,12 @@ func (ing *Ingester) storeSpans(ctx context.Context, spans []*model.SpanData) (i
 	spansIngestedTotal.Add(float64(n))
 	slog.Debug("traces ingested", "spans", n)
 
-	// RAG 파이프라인: ERROR span을 비동기로 임베딩 큐에 제출 (non-blocking)
+	// RAG 파이프라인: ERROR·WARN·SLOW span을 비동기로 임베딩 큐에 제출 (non-blocking)
+	// 인덱싱 조건 판단은 BuildFromSpan에 위임한다.
 	if ing.embedPipe != nil {
 		for _, sp := range spans {
-			if sp.StatusCode == 2 { // 2=ERROR
-				if doc := ing.docBuilder.BuildFromSpan(sp, nil); doc != nil {
-					ing.embedPipe.Submit(doc)
-				}
+			if doc := ing.docBuilder.BuildFromSpan(sp, nil); doc != nil {
+				ing.embedPipe.Submit(doc)
 			}
 		}
 	}

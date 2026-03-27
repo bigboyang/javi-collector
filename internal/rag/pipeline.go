@@ -43,20 +43,40 @@ type EmbedDocument struct {
 	Metadata    map[string]string // Qdrant 페이로드 (필터용)
 }
 
-// DocumentBuilder는 ERROR span에서 EmbedDocument를 구성한다.
-type DocumentBuilder struct{}
+// DocumentBuilder는 ERROR·WARN·SLOW span에서 EmbedDocument를 구성한다.
+//   - ERROR: StatusCode=2
+//   - WARN:  HTTP 4xx (http.response.status_code 또는 http.status_code 400–499)
+//   - SLOW:  duration >= SlowMs (SlowMs=0이면 비활성화)
+type DocumentBuilder struct {
+	SlowMs int64 // 느린 스팬 임계값(ms). 0이면 비활성화.
+}
 
-// BuildFromSpan은 ERROR span에서 임베딩 문서를 생성한다.
-// correlatedLogs: 동일 trace_id의 ERROR/WARN 로그 (없으면 nil)
+// BuildFromSpan은 ERROR·WARN·SLOW span에서 임베딩 문서를 생성한다.
+// 인덱싱 조건에 해당하지 않거나 텍스트가 너무 짧으면 nil을 반환한다.
 func (b *DocumentBuilder) BuildFromSpan(sp *model.SpanData, correlatedLogs []*model.LogData) *EmbedDocument {
-	if sp.StatusCode != 2 { // 2=ERROR 스팬만
+	durationMs := (sp.EndTimeNano - sp.StartTimeNano) / 1_000_000
+
+	isError := sp.StatusCode == 2
+	httpStatus := spanHTTPStatus(sp.Attributes)
+	isWarn := httpStatus >= 400 && httpStatus < 500
+	isSlow := b.SlowMs > 0 && durationMs >= b.SlowMs
+
+	if !isError && !isWarn && !isSlow {
 		return nil
 	}
 
+	label := spanTypeLabel(isError, isWarn, isSlow)
+
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "[SPAN ERROR] %s | service: %s\n", sp.Name, sp.ServiceName)
+	fmt.Fprintf(&sb, "[%s] %s | service: %s\n", label, sp.Name, sp.ServiceName)
 	if sp.StatusMessage != "" {
 		fmt.Fprintf(&sb, "status: %s\n", sp.StatusMessage)
+	}
+	if isSlow {
+		fmt.Fprintf(&sb, "duration: %dms\n", durationMs)
+	}
+	if isWarn {
+		fmt.Fprintf(&sb, "http.status: %d\n", httpStatus)
 	}
 
 	attrs := sp.Attributes
@@ -91,7 +111,6 @@ func (b *DocumentBuilder) BuildFromSpan(sp *model.SpanData, correlatedLogs []*mo
 		return nil // 너무 짧으면 임베딩 의미 없음
 	}
 
-	durationMs := (sp.EndTimeNano - sp.StartTimeNano) / 1_000_000
 	return &EmbedDocument{
 		SpanID:      sp.SpanID,
 		TraceID:     sp.TraceID,
@@ -105,7 +124,38 @@ func (b *DocumentBuilder) BuildFromSpan(sp *model.SpanData, correlatedLogs []*mo
 			"status_message": sp.StatusMessage,
 			"duration_ms":    fmt.Sprintf("%d", durationMs),
 			"timestamp_ms":   fmt.Sprintf("%d", sp.ReceivedAtMs),
+			"span_type":      strings.ToLower(label),
 		},
+	}
+}
+
+// spanHTTPStatus는 span attributes에서 HTTP 상태 코드를 추출한다.
+// "http.response.status_code"(신규) → "http.status_code"(구형) 순으로 탐색한다.
+func spanHTTPStatus(attrs map[string]any) int {
+	for _, key := range []string{"http.response.status_code", "http.status_code"} {
+		v := strVal(attrs[key])
+		if v == "" {
+			continue
+		}
+		var code int
+		if _, err := fmt.Sscanf(v, "%d", &code); err == nil && code > 0 {
+			return code
+		}
+	}
+	return 0
+}
+
+// spanTypeLabel은 span 분류에 따른 레이블을 반환한다.
+func spanTypeLabel(isError, isWarn, isSlow bool) string {
+	switch {
+	case isError:
+		return "SPAN ERROR"
+	case isSlow && isWarn:
+		return "SPAN SLOW+WARN"
+	case isSlow:
+		return "SPAN SLOW"
+	default:
+		return "SPAN WARN"
 	}
 }
 

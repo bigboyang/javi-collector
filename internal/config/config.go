@@ -63,6 +63,7 @@ type Config struct {
 	// EMBED_ENABLED=true이고 RAG_BACKFILL_ENABLED=true인 경우에만 실행된다.
 	// Qdrant upsert 방식이므로 재기동해도 중복 없이 idempotent하게 동작한다.
 	RAGScoreThreshold         float64 // Qdrant 코사인 유사도 임계값 (기본 0.65, RAG_SCORE_THRESHOLD)
+	RAGSlowThresholdMs        int     // SLOW span 인덱싱 임계값(ms). 0이면 비활성화. (기본 1000, RAG_SLOW_THRESHOLD_MS)
 	RAGBackfillEnabled        bool
 	RAGBackfillDays           int    // 과거 몇 일치를 적재할지 (기본 7)
 	RAGBackfillBatchSize      int    // 한 배치에 처리할 span 수 (기본 50)
@@ -196,6 +197,7 @@ func Load() (*Config, error) {
 		QdrantEndpoint:           envStr("QDRANT_ENDPOINT", "http://localhost:6333"),
 		QdrantCollection:         envStr("QDRANT_COLLECTION", "apm_errors"),
 		RAGScoreThreshold:         envFloat64("RAG_SCORE_THRESHOLD", 0.65),
+		RAGSlowThresholdMs:        envInt("RAG_SLOW_THRESHOLD_MS", 1000),
 		RAGBackfillEnabled:        envBool("RAG_BACKFILL_ENABLED", false),
 		RAGBackfillDays:           envInt("RAG_BACKFILL_DAYS", 7),
 		RAGBackfillBatchSize:      envInt("RAG_BACKFILL_BATCH_SIZE", 50),

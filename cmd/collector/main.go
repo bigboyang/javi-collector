@@ -226,7 +226,7 @@ func main() {
 				backfiller := rag.NewHistoricalBackfiller(
 					traceStore, embedPipeline,
 					cfg.RAGBackfillDays, cfg.RAGBackfillBatchSize,
-					checkpointFile,
+					checkpointFile, int64(cfg.RAGSlowThresholdMs),
 				)
 				backfiller.Run(ctx)
 				slog.Info("RAG historical backfill scheduled",
@@ -322,7 +322,7 @@ func main() {
 		)
 	}
 
-	ing := ingester.New(ingestTraceStore, ingestMetricStore, ingestLogStore, embedPipeline)
+	ing := ingester.New(ingestTraceStore, ingestMetricStore, ingestLogStore, embedPipeline, int64(cfg.RAGSlowThresholdMs))
 
 	// ── Processor Pipeline ────────────────────────────────────────────────
 	// CARDINALITY_ENABLED=true이면 CardinalityProcessor를 파이프라인에 추가한다.

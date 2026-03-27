@@ -46,12 +46,13 @@ type HistoricalBackfiller struct {
 
 // NewHistoricalBackfiller는 HistoricalBackfiller를 생성한다.
 //
-//   - ts: ClickHouse TraceStore (QuerySpans로 과거 ERROR spans를 페이지네이션 조회)
+//   - ts: ClickHouse TraceStore (QuerySpans로 과거 spans를 페이지네이션 조회)
 //   - pipeline: EmbedPipeline (임베딩 후 Qdrant에 적재)
 //   - days: 과거 몇 일치를 적재할지 (예: 7이면 최근 7일)
 //   - batchSize: 한 번에 ClickHouse에서 읽을 span 수 (예: 50)
 //   - checkpointFile: 체크포인트 파일 경로 (빈 문자열이면 비활성화)
-func NewHistoricalBackfiller(ts store.TraceStore, pipeline *EmbedPipeline, days, batchSize int, checkpointFile string) *HistoricalBackfiller {
+//   - slowMs: SLOW span 임계값(ms). 0이면 SLOW 인덱싱 비활성화.
+func NewHistoricalBackfiller(ts store.TraceStore, pipeline *EmbedPipeline, days, batchSize int, checkpointFile string, slowMs int64) *HistoricalBackfiller {
 	if days <= 0 {
 		days = 7
 	}
@@ -61,7 +62,7 @@ func NewHistoricalBackfiller(ts store.TraceStore, pipeline *EmbedPipeline, days,
 	return &HistoricalBackfiller{
 		traceStore:     ts,
 		pipeline:       pipeline,
-		builder:        &DocumentBuilder{},
+		builder:        &DocumentBuilder{SlowMs: slowMs},
 		days:           days,
 		batchSize:      batchSize,
 		checkpointFile: checkpointFile,
@@ -98,7 +99,7 @@ func (b *HistoricalBackfiller) Run(ctx context.Context) {
 				Limit:      b.batchSize,
 				Offset:     offset,
 				FromMs:     fromMs,
-				StatusCode: 2, // ERROR spans only
+				StatusCode: -1, // 전체 조회 — ERROR·WARN·SLOW 필터는 BuildFromSpan에서 처리
 			})
 			if err != nil {
 				slog.Error("RAG backfill query failed",
