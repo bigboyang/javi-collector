@@ -255,7 +255,6 @@ func (r *DLQReplayer) replayFile(ctx context.Context, path, name string) error {
 		count = len(logs)
 	}
 
-	f.Close()
 	if err := os.Remove(path); err != nil {
 		slog.Warn("dlq replay: remove failed after replay", "path", path, "err", err)
 		return nil

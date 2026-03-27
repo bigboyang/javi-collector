@@ -1,24 +1,16 @@
 version: "3.9"
 
-services:
-  clickhouse:
-    image: clickhouse/clickhouse-server:24.3-alpine
-    ports:
-      - "9000:9000"   # native protocol
-      - "8123:8123"   # HTTP interface
-    environment:
-      CLICKHOUSE_DB: apm
-      CLICKHOUSE_USER: default
-      CLICKHOUSE_PASSWORD: ""
-    volumes:
-      - clickhouse-data:/var/lib/clickhouse
-      - ./docker/clickhouse/users_override.xml:/etc/clickhouse-server/users.d/users_override.xml:ro
-    healthcheck:
-      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
+# ClickHouse는 k8s에 배포된 인스턴스를 사용합니다.
+# k8s NodePort: localhost:30900 (native) / localhost:30123 (HTTP)
+#
+# 사전 조건:
+#   kubectl apply -k k8s/   # ClickHouse StatefulSet + NodePort 배포
+#
+# 로컬에서 kubectl port-forward를 선호하는 경우:
+#   kubectl -n apm port-forward svc/clickhouse-svc 9000:9000 &
+#   CH_ADDR=localhost:9000 docker compose up collector
 
+services:
   collector:
     build: .
     ports:
@@ -27,18 +19,16 @@ services:
     environment:
       GRPC_PORT: "4317"
       HTTP_PORT: "4318"
-      CLICKHOUSE_ADDR: "clickhouse:9000"
+      # k8s NodePort 주소 (Docker Desktop / minikube: localhost, 그 외: 노드 IP)
+      CLICKHOUSE_ADDR: "${CH_ADDR:-localhost:30900}"
       CLICKHOUSE_DB: "apm"
       CLICKHOUSE_USER: "default"
-      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_PASSWORD: "${CH_PASSWORD:-}"
       BATCH_SIZE: "1000"
       FLUSH_INTERVAL: "2s"
       CHANNEL_BUFFER_SIZE: "8192"
       DISABLE_CLICKHOUSE: "false"
-    depends_on:
-      clickhouse:
-        condition: service_healthy
     restart: unless-stopped
-
-volumes:
-  clickhouse-data:
+    extra_hosts:
+      # macOS Docker Desktop에서 호스트 네트워크 접근
+      - "host.docker.internal:host-gateway"

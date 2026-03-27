@@ -1,5 +1,5 @@
 .PHONY: build run test lint docker-build docker-up docker-down dev run-dev run-sampling run-prod \
-        k8s-apply k8s-delete k8s-status k8s-logs k8s-rollout
+        k8s-apply k8s-apply-ch k8s-delete k8s-status k8s-logs k8s-rollout ch-port-forward
 
 BINARY := javi-collector
 BUILD_FLAGS := -trimpath -ldflags="-s -w"
@@ -30,9 +30,18 @@ docker-up:
 docker-down:
 	docker compose down
 
-# ClickHouse만 실행 (로컬 개발용)
-ch-up:
-	docker compose up -d clickhouse
+# k8s ClickHouse NodePort를 로컬 9000으로 포트 포워드 (백그라운드)
+# 사용: make ch-port-forward &
+ch-port-forward:
+	kubectl -n $(K8S_NS) port-forward svc/clickhouse-svc 9000:9000 8123:8123
+
+# k8s ClickHouse만 배포 (collector 제외)
+k8s-apply-ch:
+	kubectl apply -f k8s/namespace.yaml
+	kubectl apply -f k8s/clickhouse/configmap.yaml
+	kubectl apply -f k8s/clickhouse/secret.yaml
+	kubectl apply -f k8s/clickhouse/service.yaml
+	kubectl apply -f k8s/clickhouse/statefulset.yaml
 
 run-dev:
 	./scripts/run.sh dev

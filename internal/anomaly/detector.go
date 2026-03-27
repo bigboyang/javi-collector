@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -430,8 +432,19 @@ func (d *Detector) insertAnomalies(ctx context.Context, anomalies []AnomalyRecor
 }
 
 // baselineKey returns a lookup key for the baseline map.
+// strings.Builder + strconv avoids fmt.Sprintf allocations in the hot detection loop.
 func baselineKey(svc, span, route string, dow, hour uint8) string {
-	return fmt.Sprintf("%s\x00%s\x00%s\x00%d\x00%d", svc, span, route, dow, hour)
+	var b strings.Builder
+	b.WriteString(svc)
+	b.WriteByte('\x00')
+	b.WriteString(span)
+	b.WriteByte('\x00')
+	b.WriteString(route)
+	b.WriteByte('\x00')
+	b.WriteString(strconv.Itoa(int(dow)))
+	b.WriteByte('\x00')
+	b.WriteString(strconv.Itoa(int(hour)))
+	return b.String()
 }
 
 // newID generates a random 32-character hex ID (crypto/rand).

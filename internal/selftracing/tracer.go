@@ -238,11 +238,6 @@ func (t *Tracer) RecordProcess(signal string, inCount, outCount int, start time.
 
 func newID(n int) string {
 	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		// Fallback: use time-based value (extremely rare).
-		for i := range b {
-			b[i] = byte(time.Now().UnixNano() >> uint(i))
-		}
-	}
+	_, _ = rand.Read(b) // crypto/rand.Read never returns an error (Go 1.20+)
 	return hex.EncodeToString(b)
 }

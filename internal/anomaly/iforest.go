@@ -18,6 +18,7 @@ package anomaly
 import (
 	"math"
 	"math/rand"
+	"time"
 )
 
 // iNode는 iTree의 내부 노드 또는 리프 노드.
@@ -57,7 +58,7 @@ func (f *IsolationForest) Fit(data [][]float64) {
 	if len(data) == 0 {
 		return
 	}
-	rng := rand.New(rand.NewSource(42))
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	maxDepth := int(math.Ceil(math.Log2(float64(f.maxSamples))))
 	f.trees = make([]*iNode, f.nTrees)
 	for i := range f.trees {

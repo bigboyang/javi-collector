@@ -40,6 +40,10 @@ type FileBackupWriter struct {
 	metricFile *os.File
 	logFile    *os.File
 
+	traceEnc  *json.Encoder
+	metricEnc *json.Encoder
+	logEnc    *json.Encoder
+
 	traceDate  string
 	metricDate string
 	logDate    string
@@ -59,11 +63,11 @@ func (w *FileBackupWriter) WriteSpans(spans []*model.SpanData) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	f, err := w.openFile("traces", today, &w.traceFile, &w.traceDate)
+	enc, err := w.openFile("traces", today, &w.traceFile, &w.traceEnc, &w.traceDate)
 	if err != nil {
 		return err
 	}
-	return writeJSONL(f, spans, func(enc *json.Encoder, v *model.SpanData) error {
+	return writeJSONL(enc, spans, func(enc *json.Encoder, v *model.SpanData) error {
 		return enc.Encode(v)
 	})
 }
@@ -74,11 +78,11 @@ func (w *FileBackupWriter) WriteMetrics(metrics []*model.MetricData) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	f, err := w.openFile("metrics", today, &w.metricFile, &w.metricDate)
+	enc, err := w.openFile("metrics", today, &w.metricFile, &w.metricEnc, &w.metricDate)
 	if err != nil {
 		return err
 	}
-	return writeJSONL(f, metrics, func(enc *json.Encoder, v *model.MetricData) error {
+	return writeJSONL(enc, metrics, func(enc *json.Encoder, v *model.MetricData) error {
 		return enc.Encode(v)
 	})
 }
@@ -89,11 +93,11 @@ func (w *FileBackupWriter) WriteLogs(logs []*model.LogData) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	f, err := w.openFile("logs", today, &w.logFile, &w.logDate)
+	enc, err := w.openFile("logs", today, &w.logFile, &w.logEnc, &w.logDate)
 	if err != nil {
 		return err
 	}
-	return writeJSONL(f, logs, func(enc *json.Encoder, v *model.LogData) error {
+	return writeJSONL(enc, logs, func(enc *json.Encoder, v *model.LogData) error {
 		return enc.Encode(v)
 	})
 }
@@ -112,12 +116,12 @@ func (w *FileBackupWriter) WriteDLQSpans(spans []*model.SpanData, reason string)
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	f, err := w.openFile("traces", today, &w.traceFile, &w.traceDate)
+	enc, err := w.openFile("traces", today, &w.traceFile, &w.traceEnc, &w.traceDate)
 	if err != nil {
 		return err
 	}
 	entry := dlqBatchEntry[*model.SpanData]{ErrorReason: reason, Batch: spans}
-	return json.NewEncoder(f).Encode(entry)
+	return enc.Encode(entry)
 }
 
 // WriteDLQMetrics는 metrics를 에러 사유와 함께 metrics-YYYY-MM-DD.jsonl에 기록한다.
@@ -126,12 +130,12 @@ func (w *FileBackupWriter) WriteDLQMetrics(metrics []*model.MetricData, reason s
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	f, err := w.openFile("metrics", today, &w.metricFile, &w.metricDate)
+	enc, err := w.openFile("metrics", today, &w.metricFile, &w.metricEnc, &w.metricDate)
 	if err != nil {
 		return err
 	}
 	entry := dlqBatchEntry[*model.MetricData]{ErrorReason: reason, Batch: metrics}
-	return json.NewEncoder(f).Encode(entry)
+	return enc.Encode(entry)
 }
 
 // WriteDLQLogs는 logs를 에러 사유와 함께 logs-YYYY-MM-DD.jsonl에 기록한다.
@@ -140,12 +144,12 @@ func (w *FileBackupWriter) WriteDLQLogs(logs []*model.LogData, reason string) er
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	f, err := w.openFile("logs", today, &w.logFile, &w.logDate)
+	enc, err := w.openFile("logs", today, &w.logFile, &w.logEnc, &w.logDate)
 	if err != nil {
 		return err
 	}
 	entry := dlqBatchEntry[*model.LogData]{ErrorReason: reason, Batch: logs}
-	return json.NewEncoder(f).Encode(entry)
+	return enc.Encode(entry)
 }
 
 // Close는 열려있는 모든 백업 파일을 닫는다.
@@ -169,15 +173,17 @@ func (w *FileBackupWriter) today() string {
 }
 
 // openFile은 signal-YYYY-MM-DD.jsonl 파일을 열거나 날짜 변경 시 새 파일로 교체한다.
+// 파일과 함께 json.Encoder를 캐시하여 매 쓰기마다 Encoder를 재생성하는 비용을 제거한다.
 // 호출자가 w.mu를 보유해야 한다.
-func (w *FileBackupWriter) openFile(signal, today string, fp **os.File, date *string) (*os.File, error) {
+func (w *FileBackupWriter) openFile(signal, today string, fp **os.File, ep **json.Encoder, date *string) (*json.Encoder, error) {
 	if *fp != nil && *date == today {
-		return *fp, nil
+		return *ep, nil
 	}
 	// 날짜가 변경됐으면 이전 파일 닫기
 	if *fp != nil {
 		_ = (*fp).Close()
 		*fp = nil
+		*ep = nil
 	}
 	path := filepath.Join(w.dir, fmt.Sprintf("%s-%s.jsonl", signal, today))
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
@@ -185,14 +191,15 @@ func (w *FileBackupWriter) openFile(signal, today string, fp **os.File, date *st
 		return nil, fmt.Errorf("open backup file %s: %w", path, err)
 	}
 	*fp = f
+	*ep = json.NewEncoder(f)
 	*date = today
 	slog.Debug("backup file opened", "path", path)
-	return f, nil
+	return *ep, nil
 }
 
-// writeJSONL은 슬라이스의 각 원소를 JSON 한 줄로 f에 기록한다.
-func writeJSONL[T any](f *os.File, items []T, encode func(*json.Encoder, T) error) error {
-	enc := json.NewEncoder(f)
+// writeJSONL은 슬라이스의 각 원소를 JSON 한 줄로 enc에 기록한다.
+// Encoder는 호출자가 캐시해서 전달하므로 매 호출마다 생성하지 않는다.
+func writeJSONL[T any](enc *json.Encoder, items []T, encode func(*json.Encoder, T) error) error {
 	for _, item := range items {
 		if err := encode(enc, item); err != nil {
 			return err
