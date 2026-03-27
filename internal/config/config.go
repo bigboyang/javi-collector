@@ -59,6 +59,14 @@ type Config struct {
 	QdrantEndpoint   string // e.g. http://localhost:6333
 	QdrantCollection string
 
+	// RAG Historical Backfill: 기동 시 ClickHouse 과거 ERROR spans를 Qdrant에 적재한다.
+	// EMBED_ENABLED=true이고 RAG_BACKFILL_ENABLED=true인 경우에만 실행된다.
+	// Qdrant upsert 방식이므로 재기동해도 중복 없이 idempotent하게 동작한다.
+	RAGBackfillEnabled        bool
+	RAGBackfillDays           int    // 과거 몇 일치를 적재할지 (기본 7)
+	RAGBackfillBatchSize      int    // 한 배치에 처리할 span 수 (기본 50)
+	RAGBackfillCheckpointFile string // 체크포인트 파일 경로 (기본: {BackupDir}/rag_backfill_checkpoint.json)
+
 	// 파일 백업 설정 (BACKUP_ENABLED=true 시 활성화)
 	// 수신된 trace/metric/log를 JSONL 파일로 백업한다.
 	BackupEnabled bool
@@ -186,8 +194,12 @@ func Load() (*Config, error) {
 		EmbedModel:               envStr("EMBED_MODEL", "nomic-embed-text"),
 		QdrantEndpoint:           envStr("QDRANT_ENDPOINT", "http://localhost:6333"),
 		QdrantCollection:         envStr("QDRANT_COLLECTION", "apm_errors"),
-		BackupEnabled:            envBool("BACKUP_ENABLED", true),
-		BackupDir:                envStr("BACKUP_DIR", "./backup"),
+		RAGBackfillEnabled:        envBool("RAG_BACKFILL_ENABLED", false),
+		RAGBackfillDays:           envInt("RAG_BACKFILL_DAYS", 7),
+		RAGBackfillBatchSize:      envInt("RAG_BACKFILL_BATCH_SIZE", 50),
+		RAGBackfillCheckpointFile: envStr("RAG_BACKFILL_CHECKPOINT_FILE", ""),
+		BackupEnabled:             envBool("BACKUP_ENABLED", true),
+		BackupDir:                 envStr("BACKUP_DIR", "./backup"),
 		DLQDir:                   envStr("DLQ_DIR", "./dlq"),
 		DLQRetentionDays:         envInt("DLQ_RETENTION_DAYS", 7),
 		DLQReplayInterval:        envDuration("DLQ_REPLAY_INTERVAL", 5*time.Minute),

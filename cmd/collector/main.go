@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -214,6 +215,25 @@ func main() {
 				"model", cfg.EmbedModel,
 				"qdrant", cfg.QdrantEndpoint,
 			)
+
+			// RAG Historical Backfill: ClickHouse 과거 ERROR spans → Qdrant 적재
+			// 기동 직후 Qdrant가 비어 있어 유사 사례 검색이 안 되는 문제를 해결한다.
+			if cfg.RAGBackfillEnabled {
+				checkpointFile := cfg.RAGBackfillCheckpointFile
+				if checkpointFile == "" {
+					checkpointFile = filepath.Join(cfg.BackupDir, "rag_backfill_checkpoint.json")
+				}
+				backfiller := rag.NewHistoricalBackfiller(
+					traceStore, embedPipeline,
+					cfg.RAGBackfillDays, cfg.RAGBackfillBatchSize,
+					checkpointFile,
+				)
+				backfiller.Run(ctx)
+				slog.Info("RAG historical backfill scheduled",
+					"days", cfg.RAGBackfillDays,
+					"batch_size", cfg.RAGBackfillBatchSize,
+				)
+			}
 		}
 	}
 
