@@ -67,23 +67,130 @@ func (b *DocumentBuilder) BuildFromSpan(sp *model.SpanData, correlatedLogs []*mo
 
 	label := spanTypeLabel(isError, isWarn, isSlow)
 
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "[%s] %s | service: %s\n", label, sp.Name, sp.ServiceName)
-	if sp.StatusMessage != "" {
-		fmt.Fprintf(&sb, "status: %s\n", sp.StatusMessage)
-	}
-	if isSlow {
-		fmt.Fprintf(&sb, "duration: %dms\n", durationMs)
-	}
-	if isWarn {
-		fmt.Fprintf(&sb, "http.status: %d\n", httpStatus)
-	}
-
 	attrs := sp.Attributes
 	if attrs == nil {
 		attrs = map[string]any{}
 	}
 
+	var sb strings.Builder
+
+	// === 헤더: 분류·서비스·span 종류·소요시간 ===
+	fmt.Fprintf(&sb, "[%s] %s | service: %s\n", label, sp.Name, sp.ServiceName)
+	fmt.Fprintf(&sb, "span_kind: %s | duration: %dms\n", spanKindLabel(sp.Kind), durationMs)
+	if sp.StatusMessage != "" {
+		fmt.Fprintf(&sb, "status: %s\n", sp.StatusMessage)
+	}
+
+	// === HTTP 컨텍스트 ===
+	httpMethod := strVal(attrs["http.request.method"])
+	if httpMethod == "" {
+		httpMethod = strVal(attrs["http.method"])
+	}
+	httpURL := strVal(attrs["url.full"])
+	if httpURL == "" {
+		httpURL = strVal(attrs["http.url"])
+	}
+	httpRoute := strVal(attrs["http.route"])
+	httpTarget := strVal(attrs["http.target"])
+
+	if httpMethod != "" || httpURL != "" || httpRoute != "" || httpTarget != "" || httpStatus > 0 {
+		sb.WriteString("--- HTTP ---\n")
+		if httpMethod != "" {
+			fmt.Fprintf(&sb, "http.method: %s\n", httpMethod)
+		}
+		if httpStatus > 0 {
+			fmt.Fprintf(&sb, "http.status: %d\n", httpStatus)
+		}
+		if httpRoute != "" {
+			fmt.Fprintf(&sb, "http.route: %s\n", httpRoute)
+		} else if httpTarget != "" {
+			fmt.Fprintf(&sb, "http.target: %s\n", httpTarget)
+		}
+		if httpURL != "" {
+			if len(httpURL) > 200 {
+				httpURL = httpURL[:200] + "...[truncated]"
+			}
+			fmt.Fprintf(&sb, "http.url: %s\n", httpURL)
+		}
+	}
+
+	// === DB 컨텍스트 ===
+	dbSystem := strVal(attrs["db.system"])
+	dbName := strVal(attrs["db.name"])
+	dbOperation := strVal(attrs["db.operation"])
+	dbStatement := strVal(attrs["db.statement"])
+
+	if dbSystem != "" || dbStatement != "" || dbName != "" {
+		sb.WriteString("--- DB ---\n")
+		if dbSystem != "" {
+			fmt.Fprintf(&sb, "db.system: %s\n", dbSystem)
+		}
+		if dbName != "" {
+			fmt.Fprintf(&sb, "db.name: %s\n", dbName)
+		}
+		if dbOperation != "" {
+			fmt.Fprintf(&sb, "db.operation: %s\n", dbOperation)
+		}
+		if dbStatement != "" {
+			if len(dbStatement) > 500 {
+				dbStatement = dbStatement[:500] + "...[truncated]"
+			}
+			fmt.Fprintf(&sb, "db.statement: %s\n", dbStatement)
+		}
+	}
+
+	// === RPC 컨텍스트 ===
+	rpcSystem := strVal(attrs["rpc.system"])
+	rpcService := strVal(attrs["rpc.service"])
+	rpcMethod := strVal(attrs["rpc.method"])
+
+	if rpcSystem != "" || rpcService != "" {
+		sb.WriteString("--- RPC ---\n")
+		if rpcSystem != "" {
+			fmt.Fprintf(&sb, "rpc.system: %s\n", rpcSystem)
+		}
+		if rpcService != "" {
+			fmt.Fprintf(&sb, "rpc.service: %s\n", rpcService)
+		}
+		if rpcMethod != "" {
+			fmt.Fprintf(&sb, "rpc.method: %s\n", rpcMethod)
+		}
+	}
+
+	// === Messaging 컨텍스트 ===
+	msgSystem := strVal(attrs["messaging.system"])
+	msgDest := strVal(attrs["messaging.destination.name"])
+	if msgDest == "" {
+		msgDest = strVal(attrs["messaging.destination"])
+	}
+
+	if msgSystem != "" || msgDest != "" {
+		sb.WriteString("--- Messaging ---\n")
+		if msgSystem != "" {
+			fmt.Fprintf(&sb, "messaging.system: %s\n", msgSystem)
+		}
+		if msgDest != "" {
+			fmt.Fprintf(&sb, "messaging.destination: %s\n", msgDest)
+		}
+	}
+
+	// === Peer / 네트워크 ===
+	peerService := strVal(attrs["peer.service"])
+	netPeerName := strVal(attrs["net.peer.name"])
+	netPeerPort := strVal(attrs["net.peer.port"])
+
+	if peerService != "" {
+		fmt.Fprintf(&sb, "peer.service: %s\n", peerService)
+	}
+	if netPeerName != "" {
+		if netPeerPort != "" {
+			fmt.Fprintf(&sb, "net.peer: %s:%s\n", netPeerName, netPeerPort)
+		} else {
+			fmt.Fprintf(&sb, "net.peer: %s\n", netPeerName)
+		}
+	}
+
+	// === Exception ===
 	if v := strVal(attrs["exception.type"]); v != "" {
 		fmt.Fprintf(&sb, "exception: %s\n", v)
 	}
@@ -111,21 +218,40 @@ func (b *DocumentBuilder) BuildFromSpan(sp *model.SpanData, correlatedLogs []*mo
 		return nil // 너무 짧으면 임베딩 의미 없음
 	}
 
+	// enriched metadata (Qdrant 필터용)
+	metadata := map[string]string{
+		"service_name":   sp.ServiceName,
+		"span_name":      sp.Name,
+		"trace_id":       sp.TraceID,
+		"status_message": sp.StatusMessage,
+		"duration_ms":    fmt.Sprintf("%d", durationMs),
+		"timestamp_ms":   fmt.Sprintf("%d", sp.ReceivedAtMs),
+		"span_type":      strings.ToLower(label),
+		"span_kind":      spanKindLabel(sp.Kind),
+	}
+	if httpMethod != "" {
+		metadata["http_method"] = httpMethod
+	}
+	if httpStatus > 0 {
+		metadata["http_status"] = fmt.Sprintf("%d", httpStatus)
+	}
+	if httpRoute != "" {
+		metadata["http_route"] = httpRoute
+	}
+	if dbSystem != "" {
+		metadata["db_system"] = dbSystem
+	}
+	if rpcSystem != "" {
+		metadata["rpc_system"] = rpcSystem
+	}
+
 	return &EmbedDocument{
 		SpanID:      sp.SpanID,
 		TraceID:     sp.TraceID,
 		ServiceName: sp.ServiceName,
 		TimestampMs: sp.ReceivedAtMs,
 		Text:        text,
-		Metadata: map[string]string{
-			"service_name":   sp.ServiceName,
-			"span_name":      sp.Name,
-			"trace_id":       sp.TraceID,
-			"status_message": sp.StatusMessage,
-			"duration_ms":    fmt.Sprintf("%d", durationMs),
-			"timestamp_ms":   fmt.Sprintf("%d", sp.ReceivedAtMs),
-			"span_type":      strings.ToLower(label),
-		},
+		Metadata:    metadata,
 	}
 }
 
@@ -143,6 +269,25 @@ func spanHTTPStatus(attrs map[string]any) int {
 		}
 	}
 	return 0
+}
+
+// spanKindLabel은 OTLP SpanKind 숫자를 사람이 읽기 쉬운 문자열로 변환한다.
+// https://opentelemetry.io/docs/specs/otel/trace/api/#spankind
+func spanKindLabel(kind int32) string {
+	switch kind {
+	case 1:
+		return "INTERNAL"
+	case 2:
+		return "SERVER"
+	case 3:
+		return "CLIENT"
+	case 4:
+		return "PRODUCER"
+	case 5:
+		return "CONSUMER"
+	default:
+		return "UNSPECIFIED"
+	}
 }
 
 // spanTypeLabel은 span 분류에 따른 레이블을 반환한다.

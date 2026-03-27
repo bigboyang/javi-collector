@@ -4,10 +4,10 @@ import (
 	"context"
 	"testing"
 
-	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
 	collectorlogsv1 "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	collectormetricsv1 "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	collectortracev1 "go.opentelemetry.io/proto/otlp/collector/trace/v1"
+	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
 	logsv1 "go.opentelemetry.io/proto/otlp/logs/v1"
 	metricsv1 "go.opentelemetry.io/proto/otlp/metrics/v1"
 	resourcev1 "go.opentelemetry.io/proto/otlp/resource/v1"
@@ -34,7 +34,7 @@ func newTestIngester() (*Ingester, *store.MemoryTraceStore, *store.MemoryMetricS
 	ts := store.NewMemoryTraceStore(1000)
 	ms := store.NewMemoryMetricStore(1000)
 	ls := store.NewMemoryLogStore(1000)
-	ing := New(ts, ms, ls, nil)
+	ing := New(ts, ms, ls, nil, 0)
 	return ing, ts, ms, ls
 }
 
