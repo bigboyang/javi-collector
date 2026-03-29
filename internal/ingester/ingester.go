@@ -64,13 +64,33 @@ var (
 	}, []string{"signal"})
 )
 
+// SpanPublisher는 span 이벤트를 하류(RAG, Forecast 등)로 발행하는 인터페이스다.
+//   - DirectSpanPublisher: 채널 기반 EmbedPipeline에 직접 제출 (Kafka 미사용 시)
+//   - kafka.SpanProducer: Kafka 토픽에 발행 (팬아웃 필요 시)
+type SpanPublisher interface {
+	Publish(sp *model.SpanData)
+}
+
+// DirectSpanPublisher는 span을 DocumentBuilder로 변환해 EmbedPipeline에 직접 제출한다.
+// KAFKA_ENABLED=false(기본)일 때 사용한다.
+type DirectSpanPublisher struct {
+	Pipeline *rag.EmbedPipeline
+	Builder  rag.DocumentBuilder
+}
+
+// Publish는 span을 EmbedDocument로 변환해 EmbedPipeline에 제출한다.
+func (d *DirectSpanPublisher) Publish(sp *model.SpanData) {
+	if doc := d.Builder.BuildFromSpan(sp, nil); doc != nil {
+		d.Pipeline.Submit(doc)
+	}
+}
+
 // Ingester는 OTLP 수신 → decode → process → store 파이프라인을 담당한다.
 type Ingester struct {
 	traceStore  store.TraceStore
 	metricStore store.MetricStore
 	logStore    store.LogStore
-	embedPipe   *rag.EmbedPipeline  // nil이면 RAG 비활성화
-	docBuilder  rag.DocumentBuilder
+	spanPub     SpanPublisher          // nil이면 RAG/Forecast 비활성화
 	pipeline    *processor.Pipeline    // nil이면 프로세서 파이프라인 비활성화
 	selfTracer  *selftracing.Tracer    // nil이면 셀프 트레이싱 비활성화
 
@@ -81,15 +101,14 @@ type Ingester struct {
 }
 
 // New는 Ingester를 생성한다.
-// embedPipeline은 nil이면 RAG 기능이 비활성화된다.
-// slowMs는 SLOW span 인덱싱 임계값(ms). 0이면 SLOW 인덱싱 비활성화.
-func New(ts store.TraceStore, ms store.MetricStore, ls store.LogStore, embedPipeline *rag.EmbedPipeline, slowMs int64) *Ingester {
+// pub은 nil이면 RAG/Forecast 기능이 비활성화된다.
+// pub이 *DirectSpanPublisher이면 채널 기반 직접 적재, *kafka.SpanProducer이면 Kafka 팬아웃.
+func New(ts store.TraceStore, ms store.MetricStore, ls store.LogStore, pub SpanPublisher) *Ingester {
 	return &Ingester{
 		traceStore:  ts,
 		metricStore: ms,
 		logStore:    ls,
-		embedPipe:   embedPipeline,
-		docBuilder:  rag.DocumentBuilder{SlowMs: slowMs},
+		spanPub:     pub,
 	}
 }
 
@@ -230,13 +249,11 @@ func (ing *Ingester) storeSpans(ctx context.Context, spans []*model.SpanData) (i
 	spansIngestedTotal.Add(float64(n))
 	slog.Debug("traces ingested", "spans", n)
 
-	// RAG 파이프라인: ERROR·WARN·SLOW span을 비동기로 임베딩 큐에 제출 (non-blocking)
-	// 인덱싱 조건 판단은 BuildFromSpan에 위임한다.
-	if ing.embedPipe != nil {
+	// RAG / Forecast 파이프라인: span 이벤트를 비동기로 발행 (non-blocking)
+	// SpanPublisher 구현에 따라 직접 EmbedPipeline 제출 또는 Kafka 발행.
+	if ing.spanPub != nil {
 		for _, sp := range spans {
-			if doc := ing.docBuilder.BuildFromSpan(sp, nil); doc != nil {
-				ing.embedPipe.Submit(doc)
-			}
+			ing.spanPub.Publish(sp)
 		}
 	}
 

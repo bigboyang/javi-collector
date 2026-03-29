@@ -176,6 +176,22 @@ type Config struct {
 	// CardinalityBloomK: bloom filter 해시 함수 수 (기본 4)
 	CardinalityBloomK int
 
+	// ── Kafka Event Bus ───────────────────────────────────────────────────
+	// KAFKA_ENABLED=true이면 Ingester가 span 이벤트를 Kafka 토픽에 발행한다.
+	// RAGConsumer와 ForecastConsumer가 각각 독립적인 consumer group으로 구독한다.
+	//
+	// 팬아웃 시나리오:
+	//   spans.error → [rag-embedder]    → EmbedPipeline → Qdrant
+	//              → [forecast-feeder]  → Forecast Server (예정)
+	//
+	// false이면 기존 채널 기반 직접 적재(DirectSpanPublisher)로 동작한다.
+	KafkaEnabled        bool
+	KafkaBrokers        []string // 콤마 구분 브로커 목록 (KAFKA_BROKERS, 기본 "localhost:9092")
+	KafkaTopic          string   // span 이벤트 토픽 (KAFKA_TOPIC, 기본 "spans.error")
+	KafkaRAGGroup       string   // RAG consumer group ID (KAFKA_RAG_GROUP, 기본 "rag-embedder")
+	KafkaForecastGroup  string   // Forecast consumer group ID (KAFKA_FORECAST_GROUP, 기본 "forecast-feeder")
+	KafkaForecastEndpoint string // Forecast 서버 URL (KAFKA_FORECAST_ENDPOINT, 빈 문자열이면 stub)
+
 	// ── Collector Self-Tracing ────────────────────────────────────────────
 	// SELF_TRACING_ENABLED=true이면 컬렉터 내부 파이프라인(decode/process/store)을
 	// 스팬으로 기록해 ClickHouse의 일반 스팬과 함께 저장한다.
@@ -252,6 +268,12 @@ func Load() (*Config, error) {
 		CardinalityBloomBits:     envInt("CARDINALITY_BLOOM_BITS", 100_000),
 		CardinalityBloomK:        envInt("CARDINALITY_BLOOM_K", 4),
 		SelfTracingEnabled:       envBool("SELF_TRACING_ENABLED", false),
+		KafkaEnabled:             envBool("KAFKA_ENABLED", false),
+		KafkaBrokers:             envStringSlice("KAFKA_BROKERS", []string{"localhost:9092"}),
+		KafkaTopic:               envStr("KAFKA_TOPIC", "spans.error"),
+		KafkaRAGGroup:            envStr("KAFKA_RAG_GROUP", "rag-embedder"),
+		KafkaForecastGroup:       envStr("KAFKA_FORECAST_GROUP", "forecast-feeder"),
+		KafkaForecastEndpoint:    envStr("KAFKA_FORECAST_ENDPOINT", ""),
 	}
 
 	if err := cfg.validate(); err != nil {

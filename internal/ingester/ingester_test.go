@@ -34,7 +34,7 @@ func newTestIngester() (*Ingester, *store.MemoryTraceStore, *store.MemoryMetricS
 	ts := store.NewMemoryTraceStore(1000)
 	ms := store.NewMemoryMetricStore(1000)
 	ls := store.NewMemoryLogStore(1000)
-	ing := New(ts, ms, ls, nil, 0)
+	ing := New(ts, ms, ls, nil)
 	return ing, ts, ms, ls
 }
 

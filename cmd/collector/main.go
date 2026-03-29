@@ -17,6 +17,7 @@ import (
 	"github.com/kkc/javi-collector/internal/anomaly"
 	"github.com/kkc/javi-collector/internal/config"
 	"github.com/kkc/javi-collector/internal/ingester"
+	jkafka "github.com/kkc/javi-collector/internal/kafka"
 	"github.com/kkc/javi-collector/internal/processor"
 	"github.com/kkc/javi-collector/internal/rag"
 	"github.com/kkc/javi-collector/internal/rca"
@@ -349,7 +350,47 @@ func main() {
 		)
 	}
 
-	ing := ingester.New(ingestTraceStore, ingestMetricStore, ingestLogStore, embedPipeline, int64(cfg.RAGSlowThresholdMs))
+	// SpanPublisher 결정: Kafka 활성화 여부에 따라 팬아웃 방식이 달라진다.
+	//   KAFKA_ENABLED=false (기본): DirectSpanPublisher → EmbedPipeline (채널)
+	//   KAFKA_ENABLED=true:         SpanProducer → Kafka "spans.error" → [RAG + Forecast consumers]
+	var spanPub ingester.SpanPublisher
+	if cfg.KafkaEnabled {
+		// Kafka 모드: span 이벤트를 Kafka에 발행
+		producer := jkafka.NewSpanProducer(cfg.KafkaBrokers, cfg.KafkaTopic)
+		spanPub = producer
+		slog.Info("kafka span producer started",
+			"brokers", cfg.KafkaBrokers,
+			"topic", cfg.KafkaTopic,
+		)
+
+		// RAG Consumer: Kafka → EmbedPipeline → Qdrant
+		if embedPipeline != nil {
+			ragConsumer := jkafka.NewRAGConsumer(
+				cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaRAGGroup,
+				embedPipeline, int64(cfg.RAGSlowThresholdMs),
+			)
+			ragConsumer.Start(ctx)
+			defer ragConsumer.Close() //nolint:errcheck
+		}
+
+		// Forecast Consumer: Kafka → Forecast Server (endpoint 미설정 시 stub)
+		forecastConsumer := jkafka.NewForecastConsumer(
+			cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaForecastGroup,
+			cfg.KafkaForecastEndpoint,
+		)
+		forecastConsumer.Start(ctx)
+		defer forecastConsumer.Close() //nolint:errcheck
+
+		defer producer.Close() //nolint:errcheck
+	} else if embedPipeline != nil {
+		// 직접 모드: EmbedPipeline에 직접 제출 (Kafka 미사용)
+		spanPub = &ingester.DirectSpanPublisher{
+			Pipeline: embedPipeline,
+			Builder:  rag.DocumentBuilder{SlowMs: int64(cfg.RAGSlowThresholdMs)},
+		}
+	}
+
+	ing := ingester.New(ingestTraceStore, ingestMetricStore, ingestLogStore, spanPub)
 
 	// ── Processor Pipeline ────────────────────────────────────────────────
 	// CARDINALITY_ENABLED=true이면 CardinalityProcessor를 파이프라인에 추가한다.
