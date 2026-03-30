@@ -4,12 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"time"
 
 	kafka "github.com/segmentio/kafka-go"
 
 	"github.com/kkc/javi-collector/internal/model"
 	"github.com/kkc/javi-collector/internal/rag"
+	"github.com/kkc/javi-collector/internal/store"
 )
+
+// logLookbackWindow는 span traceId로 연관 로그를 조회할 때 사용하는 시간 범위다.
+// span 발생 전후 이 범위의 로그를 조회한다.
+const logLookbackWindow = 5 * time.Minute
 
 // RAGConsumer는 Kafka "spans.error" 토픽에서 span 이벤트를 읽어
 // EmbedPipeline을 통해 Qdrant에 벡터로 적재한다.
@@ -19,6 +25,7 @@ type RAGConsumer struct {
 	reader   *kafka.Reader
 	pipeline *rag.EmbedPipeline
 	builder  rag.DocumentBuilder
+	logStore store.LogStore // traceId 기반 연관 로그 조회용 (nil이면 로그 없이 적재)
 }
 
 // NewRAGConsumer는 RAGConsumer를 생성한다.
@@ -26,8 +33,9 @@ type RAGConsumer struct {
 //   - topic: 구독할 토픽 (e.g. "spans.error")
 //   - group: consumer group ID (e.g. "rag-embedder")
 //   - pipeline: EmbedPipeline — Qdrant 적재 담당
+//   - logStore: LogStore — traceId 기반 연관 로그 조회용 (nil 허용)
 //   - slowMs: SLOW span 인덱싱 임계값(ms). 0이면 비활성화.
-func NewRAGConsumer(brokers []string, topic, group string, pipeline *rag.EmbedPipeline, slowMs int64) *RAGConsumer {
+func NewRAGConsumer(brokers []string, topic, group string, pipeline *rag.EmbedPipeline, logStore store.LogStore, slowMs int64) *RAGConsumer {
 	r := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:  brokers,
 		Topic:    topic,
@@ -43,6 +51,7 @@ func NewRAGConsumer(brokers []string, topic, group string, pipeline *rag.EmbedPi
 		reader:   r,
 		pipeline: pipeline,
 		builder:  rag.DocumentBuilder{SlowMs: slowMs},
+		logStore: logStore,
 	}
 }
 
@@ -72,7 +81,24 @@ func (c *RAGConsumer) Start(ctx context.Context) {
 				continue
 			}
 
-			if doc := c.builder.BuildFromSpan(&sp, nil); doc != nil {
+			var correlatedLogs []*model.LogData
+			if c.logStore != nil && sp.TraceID != "" {
+				spanMs := sp.StartTimeNano / 1_000_000
+				logs, err := c.logStore.QueryLogs(ctx, store.LogQuery{
+					TraceID: sp.TraceID,
+					FromMs:  spanMs - logLookbackWindow.Milliseconds(),
+					ToMs:    spanMs + logLookbackWindow.Milliseconds(),
+					Limit:   50,
+				})
+				if err != nil {
+					slog.Warn("kafka rag consumer log query failed",
+						"err", err, "traceId", sp.TraceID)
+				} else {
+					correlatedLogs = logs
+				}
+			}
+
+			if doc := c.builder.BuildFromSpan(&sp, correlatedLogs); doc != nil {
 				c.pipeline.Submit(doc)
 			}
 		}

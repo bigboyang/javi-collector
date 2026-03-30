@@ -367,7 +367,7 @@ func main() {
 		if embedPipeline != nil {
 			ragConsumer := jkafka.NewRAGConsumer(
 				cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaRAGGroup,
-				embedPipeline, int64(cfg.RAGSlowThresholdMs),
+				embedPipeline, logStore, int64(cfg.RAGSlowThresholdMs),
 			)
 			ragConsumer.Start(ctx)
 			defer ragConsumer.Close() //nolint:errcheck
