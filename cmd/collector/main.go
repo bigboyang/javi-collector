@@ -350,20 +350,36 @@ func main() {
 		)
 	}
 
-	// SpanPublisher 결정: Kafka 활성화 여부에 따라 팬아웃 방식이 달라진다.
+	// Publisher 결정: Kafka 활성화 여부에 따라 팬아웃 방식이 달라진다.
 	//   KAFKA_ENABLED=false (기본): DirectSpanPublisher → EmbedPipeline (채널)
-	//   KAFKA_ENABLED=true:         SpanProducer → Kafka "spans.error" → [RAG + Forecast consumers]
+	//   KAFKA_ENABLED=true:
+	//     SpanProducer   → Kafka "spans.error" → [RAG + Forecast consumers]
+	//     MetricProducer → Kafka "metrics"      → [MetricForecast consumer]
+	//     LogProducer    → Kafka "logs"         → [LogRAG consumer]
 	var spanPub ingester.SpanPublisher
+	var metricPub ingester.MetricPublisher
+	var logPub ingester.LogPublisher
+
 	if cfg.KafkaEnabled {
-		// Kafka 모드: span 이벤트를 Kafka에 발행
-		producer := jkafka.NewSpanProducer(cfg.KafkaBrokers, cfg.KafkaTopic)
-		spanPub = producer
+		// Span producer
+		spanProducer := jkafka.NewSpanProducer(cfg.KafkaBrokers, cfg.KafkaTopic)
+		spanPub = spanProducer
 		slog.Info("kafka span producer started",
 			"brokers", cfg.KafkaBrokers,
 			"topic", cfg.KafkaTopic,
 		)
 
-		// RAG Consumer: Kafka → EmbedPipeline → Qdrant
+		// Metric producer
+		metricProducer := jkafka.NewMetricProducer(cfg.KafkaBrokers, cfg.KafkaMetricsTopic)
+		metricPub = metricProducer
+		slog.Info("kafka metric producer started", "topic", cfg.KafkaMetricsTopic)
+
+		// Log producer
+		logProducer := jkafka.NewLogProducer(cfg.KafkaBrokers, cfg.KafkaLogsTopic)
+		logPub = logProducer
+		slog.Info("kafka log producer started", "topic", cfg.KafkaLogsTopic)
+
+		// Span RAG Consumer: Kafka → EmbedPipeline → Qdrant
 		if embedPipeline != nil {
 			ragConsumer := jkafka.NewRAGConsumer(
 				cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaRAGGroup,
@@ -371,9 +387,17 @@ func main() {
 			)
 			ragConsumer.Start(ctx)
 			defer ragConsumer.Close() //nolint:errcheck
+
+			// Log RAG Consumer: Kafka → EmbedPipeline → Qdrant (ERROR+ 로그만)
+			logRAGConsumer := jkafka.NewLogRAGConsumer(
+				cfg.KafkaBrokers, cfg.KafkaLogsTopic, cfg.KafkaLogRAGGroup,
+				embedPipeline,
+			)
+			logRAGConsumer.Start(ctx)
+			defer logRAGConsumer.Close() //nolint:errcheck
 		}
 
-		// Forecast Consumer: Kafka → Forecast Server (endpoint 미설정 시 stub)
+		// Span Forecast Consumer: Kafka → Forecast Server
 		forecastConsumer := jkafka.NewForecastConsumer(
 			cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaForecastGroup,
 			cfg.KafkaForecastEndpoint,
@@ -381,7 +405,17 @@ func main() {
 		forecastConsumer.Start(ctx)
 		defer forecastConsumer.Close() //nolint:errcheck
 
-		defer producer.Close() //nolint:errcheck
+		// Metric Forecast Consumer: Kafka → Forecast Server
+		metricForecastConsumer := jkafka.NewMetricForecastConsumer(
+			cfg.KafkaBrokers, cfg.KafkaMetricsTopic, cfg.KafkaMetricForecastGroup,
+			cfg.KafkaForecastEndpoint,
+		)
+		metricForecastConsumer.Start(ctx)
+		defer metricForecastConsumer.Close() //nolint:errcheck
+
+		defer spanProducer.Close()   //nolint:errcheck
+		defer metricProducer.Close() //nolint:errcheck
+		defer logProducer.Close()    //nolint:errcheck
 	} else if embedPipeline != nil {
 		// 직접 모드: EmbedPipeline에 직접 제출 (Kafka 미사용)
 		spanPub = &ingester.DirectSpanPublisher{
@@ -391,6 +425,12 @@ func main() {
 	}
 
 	ing := ingester.New(ingestTraceStore, ingestMetricStore, ingestLogStore, spanPub)
+	if metricPub != nil {
+		ing.SetMetricPublisher(metricPub)
+	}
+	if logPub != nil {
+		ing.SetLogPublisher(logPub)
+	}
 
 	// ── Processor Pipeline ────────────────────────────────────────────────
 	// CARDINALITY_ENABLED=true이면 CardinalityProcessor를 파이프라인에 추가한다.

@@ -255,6 +255,73 @@ func (b *DocumentBuilder) BuildFromSpan(sp *model.SpanData, correlatedLogs []*mo
 	}
 }
 
+// BuildFromLog는 ERROR 이상 심각도 로그에서 임베딩 문서를 생성한다.
+// severityNumber < 17 (ERROR 미만)이면 nil을 반환한다.
+func (b *DocumentBuilder) BuildFromLog(l *model.LogData) *EmbedDocument {
+	if l.SeverityNumber < 17 { // ERROR(17) 미만은 인덱싱하지 않음
+		return nil
+	}
+
+	var sb strings.Builder
+	label := l.SeverityLabel()
+	fmt.Fprintf(&sb, "[LOG %s] service: %s\n", label, l.ServiceName)
+
+	ts := time.UnixMilli(l.TimestampNanos / 1_000_000).UTC().Format(time.RFC3339)
+	fmt.Fprintf(&sb, "timestamp: %s\n", ts)
+
+	if l.Body != "" {
+		body := l.Body
+		if len(body) > 2000 {
+			body = body[:2000] + "...[truncated]"
+		}
+		fmt.Fprintf(&sb, "body: %s\n", body)
+	}
+	if l.TraceID != "" {
+		fmt.Fprintf(&sb, "traceId: %s\n", l.TraceID)
+	}
+
+	// exception 관련 속성만 포함
+	for _, k := range []string{"exception.type", "exception.message", "exception.stacktrace"} {
+		if v, ok := l.Attributes[k]; ok {
+			val := strVal(v)
+			if k == "exception.stacktrace" && len(val) > 1000 {
+				val = val[:1000] + "...[truncated]"
+			}
+			fmt.Fprintf(&sb, "%s: %s\n", k, val)
+		}
+	}
+
+	text := sb.String()
+	if len(strings.TrimSpace(text)) < 20 {
+		return nil
+	}
+
+	// log에 spanId가 없을 경우 서비스+타임스탬프 기반 고유 ID를 사용
+	docID := l.SpanID
+	if docID == "" {
+		docID = fmt.Sprintf("log-%s-%d", l.ServiceName, l.TimestampNanos)
+	}
+
+	metadata := map[string]string{
+		"service_name": l.ServiceName,
+		"severity":     label,
+		"timestamp_ms": fmt.Sprintf("%d", l.TimestampNanos/1_000_000),
+		"signal":       "log",
+	}
+	if l.TraceID != "" {
+		metadata["trace_id"] = l.TraceID
+	}
+
+	return &EmbedDocument{
+		SpanID:      docID,
+		TraceID:     l.TraceID,
+		ServiceName: l.ServiceName,
+		TimestampMs: l.TimestampNanos / 1_000_000,
+		Text:        text,
+		Metadata:    metadata,
+	}
+}
+
 // spanHTTPStatus는 span attributes에서 HTTP 상태 코드를 추출한다.
 // "http.response.status_code"(신규) → "http.status_code"(구형) 순으로 탐색한다.
 func spanHTTPStatus(attrs map[string]any) int {

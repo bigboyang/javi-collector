@@ -177,20 +177,26 @@ type Config struct {
 	CardinalityBloomK int
 
 	// ── Kafka Event Bus ───────────────────────────────────────────────────
-	// KAFKA_ENABLED=true이면 Ingester가 span 이벤트를 Kafka 토픽에 발행한다.
-	// RAGConsumer와 ForecastConsumer가 각각 독립적인 consumer group으로 구독한다.
+	// KAFKA_ENABLED=true이면 Ingester가 span/metric/log 이벤트를 Kafka 토픽에 발행한다.
+	// 각 signal 타입별로 독립적인 토픽과 consumer group을 사용한다.
 	//
 	// 팬아웃 시나리오:
-	//   spans.error → [rag-embedder]    → EmbedPipeline → Qdrant
-	//              → [forecast-feeder]  → Forecast Server (예정)
+	//   spans.error → [rag-embedder]           → EmbedPipeline → Qdrant
+	//              → [forecast-feeder]          → Forecast Server
+	//   metrics     → [metric-forecast-feeder]  → Forecast Server
+	//   logs        → [log-rag-embedder]        → EmbedPipeline → Qdrant (ERROR+만)
 	//
 	// false이면 기존 채널 기반 직접 적재(DirectSpanPublisher)로 동작한다.
-	KafkaEnabled        bool
-	KafkaBrokers        []string // 콤마 구분 브로커 목록 (KAFKA_BROKERS, 기본 "localhost:9092")
-	KafkaTopic          string   // span 이벤트 토픽 (KAFKA_TOPIC, 기본 "spans.error")
-	KafkaRAGGroup       string   // RAG consumer group ID (KAFKA_RAG_GROUP, 기본 "rag-embedder")
-	KafkaForecastGroup  string   // Forecast consumer group ID (KAFKA_FORECAST_GROUP, 기본 "forecast-feeder")
-	KafkaForecastEndpoint string // Forecast 서버 URL (KAFKA_FORECAST_ENDPOINT, 빈 문자열이면 stub)
+	KafkaEnabled              bool
+	KafkaBrokers              []string // 콤마 구분 브로커 목록 (KAFKA_BROKERS, 기본 "localhost:9092")
+	KafkaTopic                string   // span 이벤트 토픽 (KAFKA_TOPIC, 기본 "spans.error")
+	KafkaMetricsTopic         string   // metric 이벤트 토픽 (KAFKA_METRICS_TOPIC, 기본 "metrics")
+	KafkaLogsTopic            string   // log 이벤트 토픽 (KAFKA_LOGS_TOPIC, 기본 "logs")
+	KafkaRAGGroup             string   // span RAG consumer group (KAFKA_RAG_GROUP, 기본 "rag-embedder")
+	KafkaForecastGroup        string   // span Forecast consumer group (KAFKA_FORECAST_GROUP, 기본 "forecast-feeder")
+	KafkaMetricForecastGroup  string   // metric Forecast consumer group (KAFKA_METRIC_FORECAST_GROUP, 기본 "metric-forecast-feeder")
+	KafkaLogRAGGroup          string   // log RAG consumer group (KAFKA_LOG_RAG_GROUP, 기본 "log-rag-embedder")
+	KafkaForecastEndpoint     string   // Forecast 서버 URL (KAFKA_FORECAST_ENDPOINT, 빈 문자열이면 stub)
 
 	// ── Collector Self-Tracing ────────────────────────────────────────────
 	// SELF_TRACING_ENABLED=true이면 컬렉터 내부 파이프라인(decode/process/store)을
@@ -271,8 +277,12 @@ func Load() (*Config, error) {
 		KafkaEnabled:             envBool("KAFKA_ENABLED", false),
 		KafkaBrokers:             envStringSlice("KAFKA_BROKERS", []string{"localhost:9092"}),
 		KafkaTopic:               envStr("KAFKA_TOPIC", "spans.error"),
+		KafkaMetricsTopic:        envStr("KAFKA_METRICS_TOPIC", "metrics"),
+		KafkaLogsTopic:           envStr("KAFKA_LOGS_TOPIC", "logs"),
 		KafkaRAGGroup:            envStr("KAFKA_RAG_GROUP", "rag-embedder"),
 		KafkaForecastGroup:       envStr("KAFKA_FORECAST_GROUP", "forecast-feeder"),
+		KafkaMetricForecastGroup: envStr("KAFKA_METRIC_FORECAST_GROUP", "metric-forecast-feeder"),
+		KafkaLogRAGGroup:         envStr("KAFKA_LOG_RAG_GROUP", "log-rag-embedder"),
 		KafkaForecastEndpoint:    envStr("KAFKA_FORECAST_ENDPOINT", ""),
 	}
 

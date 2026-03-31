@@ -71,6 +71,18 @@ type SpanPublisher interface {
 	Publish(sp *model.SpanData)
 }
 
+// MetricPublisher는 metric 이벤트를 하류(Forecast 등)로 발행하는 인터페이스다.
+//   - kafka.MetricProducer: Kafka metrics 토픽에 발행
+type MetricPublisher interface {
+	PublishMetric(m *model.MetricData)
+}
+
+// LogPublisher는 log 이벤트를 하류(RAG 등)로 발행하는 인터페이스다.
+//   - kafka.LogProducer: Kafka logs 토픽에 발행
+type LogPublisher interface {
+	PublishLog(l *model.LogData)
+}
+
 // DirectSpanPublisher는 span을 DocumentBuilder로 변환해 EmbedPipeline에 직접 제출한다.
 // KAFKA_ENABLED=false(기본)일 때 사용한다.
 type DirectSpanPublisher struct {
@@ -90,7 +102,9 @@ type Ingester struct {
 	traceStore  store.TraceStore
 	metricStore store.MetricStore
 	logStore    store.LogStore
-	spanPub     SpanPublisher          // nil이면 RAG/Forecast 비활성화
+	spanPub     SpanPublisher          // nil이면 span RAG/Forecast 비활성화
+	metricPub   MetricPublisher        // nil이면 metric Forecast 비활성화
+	logPub      LogPublisher           // nil이면 log RAG 비활성화
 	pipeline    *processor.Pipeline    // nil이면 프로세서 파이프라인 비활성화
 	selfTracer  *selftracing.Tracer    // nil이면 셀프 트레이싱 비활성화
 
@@ -117,6 +131,12 @@ func (ing *Ingester) SetPipeline(p *processor.Pipeline) { ing.pipeline = p }
 
 // SetSelfTracer attaches the self-tracing tracer. Must be called before serving traffic.
 func (ing *Ingester) SetSelfTracer(t *selftracing.Tracer) { ing.selfTracer = t }
+
+// SetMetricPublisher는 metric 이벤트 발행자를 설정한다. 트래픽 수신 전에 호출해야 한다.
+func (ing *Ingester) SetMetricPublisher(p MetricPublisher) { ing.metricPub = p }
+
+// SetLogPublisher는 log 이벤트 발행자를 설정한다. 트래픽 수신 전에 호출해야 한다.
+func (ing *Ingester) SetLogPublisher(p LogPublisher) { ing.logPub = p }
 
 // ---- HTTP 경로: protobuf bytes 입력 ----
 
@@ -293,6 +313,14 @@ func (ing *Ingester) storeMetrics(ctx context.Context, metrics []*model.MetricDa
 	ing.metricReceived.Add(n)
 	metricsIngestedTotal.Add(float64(n))
 	slog.Debug("metrics ingested", "count", n)
+
+	// Forecast 파이프라인: metric 이벤트를 비동기로 발행 (non-blocking)
+	if ing.metricPub != nil {
+		for _, m := range metrics {
+			ing.metricPub.PublishMetric(m)
+		}
+	}
+
 	return int(n), nil
 }
 
@@ -329,6 +357,14 @@ func (ing *Ingester) storeLogs(ctx context.Context, logs []*model.LogData) (int,
 	ing.logReceived.Add(n)
 	logsIngestedTotal.Add(float64(n))
 	slog.Debug("logs ingested", "count", n)
+
+	// RAG 파이프라인: log 이벤트를 비동기로 발행 (non-blocking)
+	if ing.logPub != nil {
+		for _, l := range logs {
+			ing.logPub.PublishLog(l)
+		}
+	}
+
 	return int(n), nil
 }
 
