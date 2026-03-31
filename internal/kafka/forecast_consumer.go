@@ -13,6 +13,10 @@ import (
 	"github.com/kkc/javi-collector/internal/model"
 )
 
+// maxConcurrentSends는 Forecast 서버로의 최대 동시 전송 goroutine 수다.
+// 서버 지연 시 goroutine 누적을 방지하기 위한 semaphore 크기다.
+const maxConcurrentSends = 32
+
 // ForecastConsumer는 Kafka "spans.error" 토픽에서 span 이벤트를 읽어
 // Forecast 서버로 전달한다.
 //
@@ -23,8 +27,9 @@ import (
 // RED 메트릭(RPS·ErrorRate·P99)을 주기적으로 Forecast 서버에 전송한다.
 type ForecastConsumer struct {
 	reader   *kafka.Reader
-	endpoint string // 빈 문자열이면 stub 모드 (수신 후 드롭)
+	endpoint string      // 빈 문자열이면 stub 모드 (수신 후 드롭)
 	client   *http.Client
+	sem      chan struct{} // semaphore: 최대 동시 전송 수 제한
 }
 
 // NewForecastConsumer는 ForecastConsumer를 생성한다.
@@ -48,6 +53,7 @@ func NewForecastConsumer(brokers []string, topic, group, endpoint string) *Forec
 		reader:   r,
 		endpoint: endpoint,
 		client:   &http.Client{Timeout: 5 * time.Second},
+		sem:      make(chan struct{}, maxConcurrentSends),
 	}
 }
 
@@ -104,8 +110,18 @@ func (c *ForecastConsumer) Start(ctx context.Context) {
 				StatusCode:  sp.StatusCode,
 				TimestampMs: sp.ReceivedAtMs,
 			}
-			// 비동기 전송: Forecast 서버 지연이 Kafka 소비를 블로킹하지 않도록 한다.
-			go c.send(ctx, evt)
+			// semaphore로 최대 동시 goroutine 수를 제한한다.
+			// 전송 슬롯이 모두 사용 중이면 span을 드롭하고 경고를 남긴다.
+			select {
+			case c.sem <- struct{}{}:
+				go func() {
+					defer func() { <-c.sem }()
+					c.send(ctx, evt)
+				}()
+			default:
+				slog.Warn("forecast consumer: send queue full, dropping span",
+					"service", evt.ServiceName)
+			}
 		}
 	}()
 }
