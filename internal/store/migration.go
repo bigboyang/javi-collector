@@ -175,6 +175,21 @@ var SpansMigrations = []Migration{
 		Description: "add span_links column for cross-trace link metadata",
 		SQL:         `ALTER TABLE %SPANS_TABLE% ADD COLUMN IF NOT EXISTS span_links String DEFAULT ''`,
 	},
+	{
+		Version:     3,
+		Description: "add duration_ms materialized column for millisecond-granularity latency queries",
+		SQL:         `ALTER TABLE %SPANS_TABLE% ADD COLUMN IF NOT EXISTS duration_ms Int64 MATERIALIZED toInt64((end_time_nano - start_time_nano) / 1000000)`,
+	},
+	{
+		Version:     4,
+		Description: "add is_error materialized column for fast error-rate aggregation",
+		SQL:         `ALTER TABLE %SPANS_TABLE% ADD COLUMN IF NOT EXISTS is_error UInt8 MATERIALIZED if(status_code = 2, 1, 0)`,
+	},
+	{
+		Version:     5,
+		Description: "add span_kind_str materialized column for human-readable span kind filtering",
+		SQL:         `ALTER TABLE %SPANS_TABLE% ADD COLUMN IF NOT EXISTS span_kind_str LowCardinality(String) MATERIALIZED multiIf(kind=1,'INTERNAL',kind=2,'SERVER',kind=3,'CLIENT',kind=4,'PRODUCER',kind=5,'CONSUMER','UNSPECIFIED')`,
+	},
 }
 
 // MetricsMigrations는 metrics 테이블에 대한 버전 관리 마이그레이션 목록이다.

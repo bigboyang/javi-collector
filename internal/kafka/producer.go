@@ -26,6 +26,30 @@ import (
 	"github.com/kkc/javi-collector/internal/model"
 )
 
+// SpanEvent는 Kafka 메시지로 발행되는 경량 span 이벤트다.
+// RAGConsumer와 ForecastConsumer에 필요한 필드만 포함한다.
+//
+// 제외 필드:
+//   - ReceivedAtMs: 수신 타임스탬프는 ingestion 내부 계측용이며 하류 컨슈머에 불필요.
+//   - TraceState: W3C Trace Context 전파 메타데이터; 벡터 임베딩·예측 불필요.
+//   - Links: 크로스-트레이스 연결; RAG/Forecast 로직에서 미사용.
+//
+// JSON 태그는 model.SpanData와 동일하므로 기존 컨슈머(SpanData 역직렬화)와 호환된다.
+type SpanEvent struct {
+	TraceID       string         `json:"traceId"`
+	SpanID        string         `json:"spanId"`
+	ParentSpanID  string         `json:"parentSpanId,omitempty"`
+	Name          string         `json:"name"`
+	Kind          int32          `json:"kind"`
+	StartTimeNano int64          `json:"startTimeNanos"`
+	EndTimeNano   int64          `json:"endTimeNanos"`
+	Attributes    map[string]any `json:"attributes,omitempty"`
+	StatusCode    int32          `json:"statusCode"`
+	StatusMessage string         `json:"statusMessage,omitempty"`
+	ServiceName   string         `json:"serviceName"`
+	ScopeName     string         `json:"scopeName,omitempty"`
+}
+
 // SpanProducer는 span 이벤트를 Kafka 토픽에 비동기로 발행한다.
 // APM의 ingestion 핫패스를 블로킹하지 않도록 Async=true로 동작한다.
 // 채널이 꽉 차면 즉시 드롭한다 (완전성보다 속도 우선).
@@ -52,9 +76,24 @@ func NewSpanProducer(brokers []string, topic string) *SpanProducer {
 }
 
 // Publish는 span 이벤트를 Kafka에 비동기로 발행한다.
+// SpanData에서 SpanEvent로 projection해 ClickHouse 전용 필드(ReceivedAtMs, TraceState, Links)를 제외한다.
 // JSON 직렬화 실패 시 즉시 드롭 (발생하지 않는 케이스).
 func (p *SpanProducer) Publish(sp *model.SpanData) {
-	data, err := json.Marshal(sp)
+	ev := SpanEvent{
+		TraceID:       sp.TraceID,
+		SpanID:        sp.SpanID,
+		ParentSpanID:  sp.ParentSpanID,
+		Name:          sp.Name,
+		Kind:          sp.Kind,
+		StartTimeNano: sp.StartTimeNano,
+		EndTimeNano:   sp.EndTimeNano,
+		Attributes:    sp.Attributes,
+		StatusCode:    sp.StatusCode,
+		StatusMessage: sp.StatusMessage,
+		ServiceName:   sp.ServiceName,
+		ScopeName:     sp.ScopeName,
+	}
+	data, err := json.Marshal(ev)
 	if err != nil {
 		slog.Warn("kafka producer marshal failed", "span_id", sp.SpanID, "err", err)
 		return
