@@ -13,6 +13,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -361,9 +362,11 @@ func escapeStr(s string) string {
 	return strings.ReplaceAll(s, "'", "\\'")
 }
 
-// newID generates a random 32-character hex ID.
+// newID generates a cryptographically random 32-character hex ID.
 func newID() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
+	var b [16]byte
+	if _, err := io.ReadFull(rand.Reader, b[:]); err != nil {
+		panic("crypto/rand unavailable: " + err.Error())
+	}
+	return hex.EncodeToString(b[:])
 }
