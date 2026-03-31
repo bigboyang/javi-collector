@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -431,20 +430,38 @@ func (d *Detector) insertAnomalies(ctx context.Context, anomalies []AnomalyRecor
 	return batch.Send()
 }
 
+// builderPool reuses strings.Builder instances to eliminate per-call heap
+// allocations in the hot detection loop.
+var builderPool = sync.Pool{
+	New: func() any {
+		b := new(strings.Builder)
+		b.Grow(128)
+		return b
+	},
+}
+
 // baselineKey returns a lookup key for the baseline map.
-// strings.Builder + strconv avoids fmt.Sprintf allocations in the hot detection loop.
+//
+// Hot-path notes:
+//   - sync.Pool reuses the Builder's internal []byte buffer across calls.
+//   - dow (1–7) and hour (0–23) are stored as raw bytes offset by +1
+//     (→ 2–8 and 1–24) so they are never confused with the '\x00' separator.
+//   - strconv.Itoa is no longer needed.
 func baselineKey(svc, span, route string, dow, hour uint8) string {
-	var b strings.Builder
+	b := builderPool.Get().(*strings.Builder)
+	b.Reset()
 	b.WriteString(svc)
 	b.WriteByte('\x00')
 	b.WriteString(span)
 	b.WriteByte('\x00')
 	b.WriteString(route)
 	b.WriteByte('\x00')
-	b.WriteString(strconv.Itoa(int(dow)))
+	b.WriteByte(dow + 1)  // 1–7  → 2–8,  never '\x00'
 	b.WriteByte('\x00')
-	b.WriteString(strconv.Itoa(int(hour)))
-	return b.String()
+	b.WriteByte(hour + 1) // 0–23 → 1–24, never '\x00'
+	key := b.String()
+	builderPool.Put(b)
+	return key
 }
 
 // newID generates a random 32-character hex ID (crypto/rand).

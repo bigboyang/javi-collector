@@ -38,10 +38,14 @@ type IsolationForest struct {
 	nTrees     int
 	maxSamples int
 	trees      []*iNode
+	// seed != 0 이면 Fit() 호출마다 동일한 RNG를 사용한다 (재현 가능 모드).
+	// seed == 0 이면 time.Now().UnixNano()로 매번 새로운 RNG를 생성한다 (기본).
+	seed int64
 }
 
 // NewIsolationForest는 IsolationForest를 생성한다.
 // nTrees ≤ 0이면 100, maxSamples ≤ 0이면 256을 사용한다.
+// 시드는 0(랜덤)으로 초기화된다.
 func NewIsolationForest(nTrees, maxSamples int) *IsolationForest {
 	if nTrees <= 0 {
 		nTrees = 100
@@ -52,13 +56,29 @@ func NewIsolationForest(nTrees, maxSamples int) *IsolationForest {
 	return &IsolationForest{nTrees: nTrees, maxSamples: maxSamples}
 }
 
+// NewIsolationForestWithSeed는 고정 시드로 IsolationForest를 생성한다.
+// 테스트 또는 재현 가능한 실험에서 사용한다.
+// seed == 0 이면 NewIsolationForest와 동일하게 랜덤 시드를 사용한다.
+func NewIsolationForestWithSeed(nTrees, maxSamples int, seed int64) *IsolationForest {
+	f := NewIsolationForest(nTrees, maxSamples)
+	f.seed = seed
+	return f
+}
+
 // Fit trains the forest on data (n_samples × n_features).
 // data는 이미 동일 스케일로 정규화된 상태여야 한다 (호출자 책임).
+// f.seed != 0 이면 고정 시드로 재현 가능한 트리를 구성한다.
 func (f *IsolationForest) Fit(data [][]float64) {
 	if len(data) == 0 {
 		return
 	}
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	var src int64
+	if f.seed != 0 {
+		src = f.seed
+	} else {
+		src = time.Now().UnixNano()
+	}
+	rng := rand.New(rand.NewSource(src))
 	maxDepth := int(math.Ceil(math.Log2(float64(f.maxSamples))))
 	f.trees = make([]*iNode, f.nTrees)
 	for i := range f.trees {
