@@ -1116,6 +1116,81 @@ func (s *ClickHouseMetricStore) QueryMetrics(ctx context.Context, q MetricQuery)
 	return result, hrows.Err()
 }
 
+// QueryHistogramMV는 mv_histogram_1m_state에서 1분 집계 히스토그램 메트릭을 반환한다.
+// GET /api/collector/histogram?service=svc&name=http.server.duration&from=<ms>&to=<ms>&limit=100
+func (s *ClickHouseMetricStore) QueryHistogramMV(ctx context.Context, service, name string, fromMs, toMs int64, limit int) ([]map[string]any, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	var conds []string
+	var args []any
+
+	if fromMs > 0 {
+		conds = append(conds, "minute >= ?")
+		args = append(args, time.UnixMilli(fromMs).UTC())
+	}
+	if toMs > 0 {
+		conds = append(conds, "minute <= ?")
+		args = append(args, time.UnixMilli(toMs).UTC())
+	}
+	if service != "" {
+		conds = append(conds, "service_name = ?")
+		args = append(args, service)
+	}
+	if name != "" {
+		conds = append(conds, "metric_name = ?")
+		args = append(args, name)
+	}
+
+	where := ""
+	if len(conds) > 0 {
+		where = "WHERE " + strings.Join(conds, " AND ")
+	}
+
+	q := fmt.Sprintf(`
+SELECT service_name, metric_name, minute,
+       sumMerge(count_state) AS count,
+       sumMerge(sum_state)   AS sum
+FROM %s.mv_histogram_1m_state
+%s
+GROUP BY service_name, metric_name, minute
+ORDER BY minute DESC
+LIMIT %d`, s.cfg.Database, where, limit)
+
+	rows, err := s.conn.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []map[string]any
+	for rows.Next() {
+		var (
+			serviceName, metricName string
+			minute                  time.Time
+			count                   uint64
+			sum                     float64
+		)
+		if err := rows.Scan(&serviceName, &metricName, &minute, &count, &sum); err != nil {
+			return nil, err
+		}
+		result = append(result, map[string]any{
+			"service_name": serviceName,
+			"metric_name":  metricName,
+			"minute":       minute.UnixMilli(),
+			"count":        count,
+			"sum":          sum,
+			"avg":          func() float64 {
+				if count == 0 {
+					return 0
+				}
+				return sum / float64(count)
+			}(),
+		})
+	}
+	return result, rows.Err()
+}
+
 func (s *ClickHouseMetricStore) Close() error {
 	close(s.ch)
 	select {

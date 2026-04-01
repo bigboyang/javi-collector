@@ -6,12 +6,26 @@
 //	POST /v1/metrics  — ExportMetricsServiceRequest
 //	POST /v1/logs     — ExportLogsServiceRequest
 //
-// 조회 경로:
+// 조회 경로 (Polling):
 //
 //	GET /api/collector/traces?limit=100
 //	GET /api/collector/metrics?limit=100
 //	GET /api/collector/logs?limit=100
 //	GET /api/collector/stats
+//	GET /api/collector/red?service=svc&from=<ms>&to=<ms>
+//	GET /api/collector/topology?from=<ms>&to=<ms>
+//	GET /api/collector/error-logs?service=svc&from=<ms>&to=<ms>
+//	GET /api/collector/anomalies?service=svc&severity=critical&from=<ms>&to=<ms>&limit=100
+//	GET /api/collector/histogram?service=svc&name=<metric>&from=<ms>&to=<ms>&limit=100
+//
+// SSE 실시간 스트리밍:
+//
+//	GET /api/stream/logs?service=svc&severity=ERROR   — 신규 로그 (3초 폴링)
+//	GET /api/stream/alerts?service=svc&severity=warn  — 신규 이상 감지 알림 (10초 폴링)
+//
+// On-Demand:
+//
+//	GET /api/query?sql=SELECT+...  — SELECT 전용 raw SQL (화이트리스트 검증)
 //
 // 운영 경로:
 //
@@ -88,6 +102,12 @@ type RawQuerier interface {
 	QueryRaw(ctx context.Context, sql string) ([]map[string]any, error)
 }
 
+// HistogramMVQuerier는 mv_histogram_1m_state 집계 뷰를 조회하는 인터페이스다.
+// ClickHouseMetricStore가 구현한다.
+type HistogramMVQuerier interface {
+	QueryHistogramMV(ctx context.Context, service, name string, fromMs, toMs int64, limit int) ([]map[string]any, error)
+}
+
 // ReadinessChecker는 /readyz 상세 상태 조회를 위한 인터페이스다.
 type ReadinessChecker interface {
 	Ping(ctx context.Context) error
@@ -136,6 +156,10 @@ func NewHTTPServer(addr string, ing *ingester.Ingester,
 	mux.HandleFunc("/api/collector/topology", s.queryTopology)
 	mux.HandleFunc("/api/collector/error-logs", s.queryErrorLogs)
 	mux.HandleFunc("/api/collector/anomalies", s.queryAnomalies)
+	mux.HandleFunc("/api/collector/histogram", s.queryHistogram)
+	// SSE 실시간 스트리밍 엔드포인트
+	mux.HandleFunc("/api/stream/logs", s.streamLogs)
+	mux.HandleFunc("/api/stream/alerts", s.streamAlerts)
 	// ClickHouse 직접 쿼리 (화이트리스트 SELECT)
 	mux.HandleFunc("/api/query", s.queryRaw)
 
@@ -480,6 +504,166 @@ func (s *HTTPServer) queryAnomalies(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, result)
+}
+
+// queryHistogram은 mv_histogram_1m_state 집계 뷰에서 히스토그램 메트릭을 반환한다.
+// GET /api/collector/histogram?service=svc&name=http.server.duration&from=<ms>&to=<ms>&limit=100
+func (s *HTTPServer) queryHistogram(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	setCORSHeaders(w)
+
+	querier, ok := s.metricStore.(HistogramMVQuerier)
+	if !ok {
+		http.Error(w, "histogram MV not available (requires ClickHouse)", http.StatusNotImplemented)
+		return
+	}
+
+	result, err := querier.QueryHistogramMV(r.Context(),
+		r.URL.Query().Get("service"),
+		r.URL.Query().Get("name"),
+		queryInt64(r, "from"),
+		queryInt64(r, "to"),
+		queryLimit(r),
+	)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, result)
+}
+
+// streamLogs는 SSE(Server-Sent Events) 방식으로 신규 로그를 실시간 스트리밍한다.
+// GET /api/stream/logs?service=svc&severity=ERROR
+//
+// 동작: 3초마다 logStore를 폴링해 새로 수신된 로그를 "data: <json>\n\n" 형식으로 전송한다.
+// 클라이언트가 연결을 끊으면 자동으로 종료된다.
+func (s *HTTPServer) streamLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	setCORSHeaders(w)
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	// keepalive 코멘트: 프록시/방화벽의 유휴 연결 종료를 방지한다.
+	fmt.Fprintf(w, ": keepalive\n\n")
+	flusher.Flush()
+
+	service := r.URL.Query().Get("service")
+	severity := r.URL.Query().Get("severity")
+	lastMs := time.Now().UnixMilli()
+
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			now := time.Now().UnixMilli()
+			q := store.LogQuery{
+				Limit:        50,
+				FromMs:       lastMs,
+				ServiceName:  service,
+				SeverityText: severity,
+			}
+			logs, err := s.logStore.QueryLogs(r.Context(), q)
+			if err != nil {
+				slog.Warn("SSE log poll error", "err", err)
+				lastMs = now
+				continue
+			}
+			for _, log := range logs {
+				data, err := json.Marshal(log)
+				if err != nil {
+					continue
+				}
+				fmt.Fprintf(w, "data: %s\n\n", data)
+			}
+			if len(logs) > 0 {
+				flusher.Flush()
+			}
+			lastMs = now
+		}
+	}
+}
+
+// streamAlerts는 SSE 방식으로 신규 이상 감지 알림을 실시간 스트리밍한다.
+// GET /api/stream/alerts?service=svc&severity=critical
+//
+// 동작: 10초마다 anomalies 테이블을 폴링해 새로 탐지된 이벤트를 전송한다.
+// ClickHouse가 없으면 501을 반환한다.
+func (s *HTTPServer) streamAlerts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	setCORSHeaders(w)
+
+	querier, ok := s.traceStore.(AnomalyQuerier)
+	if !ok {
+		http.Error(w, "anomaly streaming not available (requires ClickHouse)", http.StatusNotImplemented)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	fmt.Fprintf(w, ": keepalive\n\n")
+	flusher.Flush()
+
+	service := r.URL.Query().Get("service")
+	severity := r.URL.Query().Get("severity")
+	lastMs := time.Now().UnixMilli()
+
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			now := time.Now().UnixMilli()
+			anomalies, err := querier.QueryAnomalies(r.Context(), service, severity, lastMs, now, 50)
+			if err != nil {
+				slog.Warn("SSE alert poll error", "err", err)
+				lastMs = now
+				continue
+			}
+			for _, a := range anomalies {
+				data, err := json.Marshal(a)
+				if err != nil {
+					continue
+				}
+				fmt.Fprintf(w, "data: %s\n\n", data)
+			}
+			if len(anomalies) > 0 {
+				flusher.Flush()
+			}
+			lastMs = now
+		}
+	}
 }
 
 // queryRaw는 화이트리스트를 통과한 SELECT SQL을 ClickHouse에 직접 실행한다.
