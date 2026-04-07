@@ -28,6 +28,8 @@ services:
       FLUSH_INTERVAL: "2s"
       CHANNEL_BUFFER_SIZE: "8192"
       DISABLE_CLICKHOUSE: "false"
+      EMBED_ENDPOINT: "${EMBED_ENDPOINT:-http://host.docker.internal:11434}"
+      QDRANT_ENDPOINT: "${QDRANT_ENDPOINT:-http://host.docker.internal:6333}"
     restart: unless-stopped
     extra_hosts:
       # macOS Docker Desktop에서 호스트 네트워크 접근

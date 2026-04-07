@@ -53,6 +53,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/kkc/javi-collector/internal/ingester"
+	"github.com/kkc/javi-collector/internal/rag"
 	"github.com/kkc/javi-collector/internal/sampling"
 	"github.com/kkc/javi-collector/internal/store"
 )
@@ -126,6 +127,10 @@ type HTTPServer struct {
 	// traceRouter는 멀티 인스턴스 Tail Sampling 시 traceID 기반 라우팅을 담당한다.
 	// nil이면 라우팅 비활성화 (단일 인스턴스 또는 Sampling 미사용 배포).
 	traceRouter *sampling.TraceRouter
+
+	// searcher는 RAG 벡터 검색을 담당한다.
+	// nil이면 검색 비활성화 (EMBED_ENABLED=false 배포).
+	searcher *rag.RAGSearcher
 }
 
 func NewHTTPServer(addr string, ing *ingester.Ingester,
@@ -162,6 +167,8 @@ func NewHTTPServer(addr string, ing *ingester.Ingester,
 	mux.HandleFunc("/api/stream/alerts", s.streamAlerts)
 	// ClickHouse 직접 쿼리 (화이트리스트 SELECT)
 	mux.HandleFunc("/api/query", s.queryRaw)
+	// RAG 벡터 검색 (EMBED_ENABLED=true 시 활성)
+	mux.HandleFunc("/api/collector/search", s.handleSearch)
 
 	// 운영 엔드포인트
 	// /healthz: liveness probe — 프로세스가 살아있으면 200
@@ -184,6 +191,93 @@ func NewHTTPServer(addr string, ing *ingester.Ingester,
 // Start() 전에 호출해야 한다.
 func (s *HTTPServer) SetTraceRouter(r *sampling.TraceRouter) {
 	s.traceRouter = r
+}
+
+// SetSearcher는 RAG 벡터 검색기를 등록한다.
+// Start() 전에 호출해야 한다. nil이면 /api/collector/search가 503을 반환한다.
+func (s *HTTPServer) SetSearcher(r *rag.RAGSearcher) {
+	s.searcher = r
+}
+
+// handleSearch는 자연어 질의를 RAG 벡터 검색으로 처리한다.
+//
+//	POST /api/collector/search
+//	body: {"query":"...","service":"...","from_ms":0,"limit":10}
+func (s *HTTPServer) handleSearch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.searcher == nil {
+		w.Header().Set("Content-Type", jsonContentType)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "RAG search unavailable (EMBED_ENABLED=false)"})
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		http.Error(w, "read body", http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		Query   string `json:"query"`
+		Service string `json:"service"`
+		FromMs  int64  `json:"from_ms"`
+		Limit   int    `json:"limit"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil || req.Query == "" {
+		w.Header().Set("Content-Type", jsonContentType)
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "query field required"})
+		return
+	}
+	if req.Limit <= 0 || req.Limit > 50 {
+		req.Limit = 10
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	results, err := s.searcher.Search(ctx, rag.SearchRequest{
+		Query:       req.Query,
+		ServiceName: req.Service,
+		FromMs:      req.FromMs,
+		Limit:       req.Limit,
+	})
+	if err != nil {
+		slog.Warn("rag search failed", "err", err)
+		w.Header().Set("Content-Type", jsonContentType)
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	type resultItem struct {
+		TraceID     string  `json:"trace_id"`
+		ServiceName string  `json:"service_name"`
+		Score       float32 `json:"score"`
+		Text        string  `json:"text"`
+		TimestampMs int64   `json:"timestamp_ms"`
+	}
+	items := make([]resultItem, len(results))
+	for i, res := range results {
+		items[i] = resultItem{
+			TraceID:     res.TraceID,
+			ServiceName: res.ServiceName,
+			Score:       res.Score,
+			Text:        res.Text,
+			TimestampMs: res.TimestampMs,
+		}
+	}
+
+	w.Header().Set("Content-Type", jsonContentType)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"query":   req.Query,
+		"results": items,
+		"total":   len(items),
+	})
 }
 
 // MarkReady는 서버가 트래픽을 받을 준비가 되었음을 신호한다.

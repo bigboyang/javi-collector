@@ -345,15 +345,15 @@ SELECT
     span_name,
     http_route,
     minute,
-    sumMerge(total_count)                                                   AS total_count,
-    sumMerge(error_count) / greatest(sumMerge(total_count), 1)             AS error_rate,
-    quantilesMerge(0.5, 0.95, 0.99)(duration_quantiles)[1] / 1e6          AS p50_ms,
-    quantilesMerge(0.5, 0.95, 0.99)(duration_quantiles)[2] / 1e6          AS p95_ms,
-    quantilesMerge(0.5, 0.95, 0.99)(duration_quantiles)[3] / 1e6          AS p99_ms
+    sum(total_count)                                                                            AS req_count,
+    if(sum(total_count) > 0, toFloat64(sum(error_count)) / toFloat64(sum(total_count)), 0)    AS error_rate,
+    quantilesMerge(0.5, 0.95, 0.99)(duration_quantiles)[1] / 1e6                              AS p50_ms,
+    quantilesMerge(0.5, 0.95, 0.99)(duration_quantiles)[2] / 1e6                              AS p95_ms,
+    quantilesMerge(0.5, 0.95, 0.99)(duration_quantiles)[3] / 1e6                              AS p99_ms
 FROM %s.mv_red_1m_state
 WHERE minute = toStartOfMinute(now()) - INTERVAL 1 MINUTE
 GROUP BY service_name, span_name, http_route, minute
-HAVING total_count >= 5`, d.db)
+HAVING req_count >= 5`, d.db)
 
 	rows, err := d.conn.Query(ctx, q)
 	if err != nil {

@@ -101,7 +101,7 @@ func (c *MetricForecastConsumer) Start(ctx context.Context) {
 func (c *MetricForecastConsumer) send(ctx context.Context, ev MetricEvent) {
 	data, _ := json.Marshal(ev)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.endpoint+"/ingest/metric", bytes.NewReader(data))
+		c.endpoint+"/v1/metric", bytes.NewReader(data))
 	if err != nil {
 		return
 	}

@@ -515,6 +515,11 @@ func main() {
 		grpcSrv.SetTraceRouter(traceRouter)
 	}
 
+	// RAG Searcher 주입 (EMBED_ENABLED=true 시에만 non-nil)
+	if ragSearcher != nil {
+		httpSrv.SetSearcher(ragSearcher)
+	}
+
 	// HTTP 서버 시작
 	go func() {
 		if err := httpSrv.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {

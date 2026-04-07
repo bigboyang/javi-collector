@@ -130,7 +130,7 @@ func (c *ForecastConsumer) Start(ctx context.Context) {
 func (c *ForecastConsumer) send(ctx context.Context, evt spanEvent) {
 	data, _ := json.Marshal(evt)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.endpoint+"/ingest/span", bytes.NewReader(data))
+		c.endpoint+"/v1/span", bytes.NewReader(data))
 	if err != nil {
 		return
 	}

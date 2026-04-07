@@ -408,18 +408,18 @@ func (s *ClickHouseTraceStore) QuerySpans(ctx context.Context, q SpanQuery) ([]*
 	for rows.Next() {
 		var (
 			sp           model.SpanData
-			attrsMap     map[string]string
+			attrsStr     string
 			durationNano int64
 		)
 		if err := rows.Scan(
 			&sp.TraceID, &sp.SpanID, &sp.ParentSpanID, &sp.Name, &sp.Kind,
 			&sp.StartTimeNano, &sp.EndTimeNano, &durationNano,
-			&attrsMap, &sp.StatusCode, &sp.StatusMessage,
+			&attrsStr, &sp.StatusCode, &sp.StatusMessage,
 			&sp.ServiceName, &sp.ScopeName, &sp.ReceivedAtMs,
 		); err != nil {
 			return nil, err
 		}
-		sp.Attributes = fromStringMap(attrsMap)
+		sp.Attributes = fromJSONString(attrsStr)
 		result = append(result, &sp)
 	}
 	return result, rows.Err()
@@ -454,9 +454,9 @@ SELECT
     span_name,
     http_route,
     minute,
-    sumMerge(total_count)                                              AS rps,
-    sumMerge(error_count)                                             AS errors,
-    sumMerge(error_count) / sumMerge(total_count) * 100              AS error_rate_pct,
+    sum(total_count)                                                   AS rps,
+    sum(error_count)                                                   AS errors,
+    sum(error_count) / sum(total_count) * 100                         AS error_rate_pct,
     quantilesMerge(0.5, 0.95, 0.99)(duration_quantiles)[1] / 1e6    AS p50_ms,
     quantilesMerge(0.5, 0.95, 0.99)(duration_quantiles)[2] / 1e6    AS p95_ms,
     quantilesMerge(0.5, 0.95, 0.99)(duration_quantiles)[3] / 1e6    AS p99_ms
@@ -523,10 +523,10 @@ func (s *ClickHouseTraceStore) QueryTopology(ctx context.Context, fromMs, toMs i
 SELECT
     caller_service,
     callee_service,
-    sumMerge(call_count)                                  AS total_calls,
-    sumMerge(error_count)                                 AS error_calls,
-    sumMerge(error_count) / sumMerge(call_count) * 100   AS error_rate_pct,
-    sumMerge(duration_sum) / sumMerge(call_count) / 1e6  AS avg_latency_ms
+    sum(call_count)                                  AS total_calls,
+    sum(error_count)                                 AS error_calls,
+    sum(error_count) / sum(call_count) * 100         AS error_rate_pct,
+    sum(duration_sum) / sum(call_count) / 1e6        AS avg_latency_ms
 FROM %s.mv_service_topology_state
 %s
 GROUP BY caller_service, callee_service
@@ -829,7 +829,7 @@ func (s *ClickHouseTraceStore) flushSpans(spans []*model.SpanData) error {
 		if err := batch.Append(
 			sp.TraceID, sp.SpanID, sp.ParentSpanID, sp.Name, sp.Kind,
 			sp.StartTimeNano, sp.EndTimeNano, sp.DurationNano(),
-			toStringMap(attrs), sp.StatusCode, sp.StatusMessage,
+			toJSONString(toStringMap(attrs)), sp.StatusCode, sp.StatusMessage,
 			sp.ServiceName, sp.ScopeName, sp.ReceivedAtMs,
 			strAttr(attrs, "http.request.method"),
 			strAttr(attrs, "http.route"),
@@ -1022,11 +1022,11 @@ func (s *ClickHouseMetricStore) QueryMetrics(ctx context.Context, q MetricQuery)
 	for rows.Next() {
 		var (
 			name, mtype, serviceName string
-			attrsMap                 map[string]string
+			attrsStr                 string
 			value                    float64
 			timestampNano, receivedAtMs int64
 		)
-		if err := rows.Scan(&name, &mtype, &value, &attrsMap, &serviceName, &timestampNano, &receivedAtMs); err != nil {
+		if err := rows.Scan(&name, &mtype, &value, &attrsStr, &serviceName, &timestampNano, &receivedAtMs); err != nil {
 			return nil, err
 		}
 		result = append(result, &model.MetricData{
@@ -1035,7 +1035,7 @@ func (s *ClickHouseMetricStore) QueryMetrics(ctx context.Context, q MetricQuery)
 			ServiceName:  serviceName,
 			ReceivedAtMs: receivedAtMs,
 			DataPoints: []model.DataPoint{
-				{Attributes: fromStringMap(attrsMap), TimeNanos: timestampNano, Value: value},
+				{Attributes: fromJSONString(attrsStr), TimeNanos: timestampNano, Value: value},
 			},
 		})
 	}
@@ -1090,10 +1090,10 @@ func (s *ClickHouseMetricStore) QueryMetrics(ctx context.Context, q MetricQuery)
 			bucketCounts            []uint64
 			totalCount              uint64
 			totalSum                float64
-			attrsMap                map[string]string
+			attrsStr                string
 			timestampNano, receivedAtMs int64
 		)
-		if err := hrows.Scan(&metricName, &bounds, &bucketCounts, &totalCount, &totalSum, &attrsMap, &serviceName, &timestampNano, &receivedAtMs); err != nil {
+		if err := hrows.Scan(&metricName, &bounds, &bucketCounts, &totalCount, &totalSum, &attrsStr, &serviceName, &timestampNano, &receivedAtMs); err != nil {
 			return nil, err
 		}
 		result = append(result, &model.MetricData{
@@ -1103,7 +1103,7 @@ func (s *ClickHouseMetricStore) QueryMetrics(ctx context.Context, q MetricQuery)
 			ReceivedAtMs: receivedAtMs,
 			DataPoints: []model.DataPoint{
 				{
-					Attributes:     fromStringMap(attrsMap),
+					Attributes:     fromJSONString(attrsStr),
 					TimeNanos:      timestampNano,
 					Count:          int64(totalCount),
 					Sum:            totalSum,
@@ -1348,7 +1348,7 @@ func (s *ClickHouseMetricStore) flushScalarMetrics(metrics []*model.MetricData) 
 			}
 			if err := batch.Append(
 				m.Name, string(m.Type), value,
-				toStringMap(dp.Attributes), m.ServiceName,
+				toJSONString(toStringMap(dp.Attributes)), m.ServiceName,
 				dp.TimeNanos, m.ReceivedAtMs,
 			); err != nil {
 				return 0, fmt.Errorf("batch append scalar metric: %w", err)
@@ -1406,7 +1406,7 @@ func (s *ClickHouseMetricStore) flushHistogramMetrics(metrics []*model.MetricDat
 				m.ServiceName, m.Name, dp.TimeNanos,
 				dp.ExplicitBounds, buckets,
 				uint64(dp.Count), dp.Sum,
-				toStringMap(dp.Attributes), m.ReceivedAtMs,
+				toJSONString(toStringMap(dp.Attributes)), m.ReceivedAtMs,
 			); err != nil {
 				return 0, fmt.Errorf("batch append histogram: %w", err)
 			}
@@ -1587,16 +1587,16 @@ func (s *ClickHouseLogStore) QueryLogs(ctx context.Context, q LogQuery) ([]*mode
 	for rows.Next() {
 		var (
 			l        model.LogData
-			attrsMap map[string]string
+			attrsStr string
 		)
 		if err := rows.Scan(
-			&l.SeverityText, &l.SeverityNumber, &l.Body, &attrsMap,
+			&l.SeverityText, &l.SeverityNumber, &l.Body, &attrsStr,
 			&l.ServiceName, &l.TraceID, &l.SpanID,
 			&l.TimestampNanos, &l.ReceivedAtMs,
 		); err != nil {
 			return nil, err
 		}
-		l.Attributes = fromStringMap(attrsMap)
+		l.Attributes = fromJSONString(attrsStr)
 		result = append(result, &l)
 	}
 	return result, rows.Err()
@@ -1630,7 +1630,7 @@ SELECT
     service_name,
     exception_type,
     minute,
-    sumMerge(error_count) AS error_count
+    sum(error_count) AS error_count
 FROM %s.mv_error_logs_1m_state
 %s
 GROUP BY service_name, exception_type, minute
@@ -1786,7 +1786,7 @@ func (s *ClickHouseLogStore) flushLogs(logs []*model.LogData) error {
 		}
 		if err := batch.Append(
 			l.SeverityText, l.SeverityNumber, l.Body,
-			toStringMap(attrs), l.ServiceName,
+			toJSONString(toStringMap(attrs)), l.ServiceName,
 			l.TraceID, l.SpanID, l.TimestampNanos, l.ReceivedAtMs,
 			strAttr(attrs, "exception.type"),
 			strAttr(attrs, "logger.name"),
@@ -1845,6 +1845,28 @@ func fromStringMap(m map[string]string) map[string]any {
 		attrs[k] = v
 	}
 	return attrs
+}
+
+// toJSONString은 map[string]string을 JSON 문자열로 직렬화한다.
+// ClickHouse String 컬럼에 attributes를 저장할 때 사용한다.
+func toJSONString(m map[string]string) string {
+	if len(m) == 0 {
+		return "{}"
+	}
+	b, _ := json.Marshal(m)
+	return string(b)
+}
+
+// fromJSONString은 ClickHouse String 컬럼의 JSON 문자열을 map[string]any로 역직렬화한다.
+func fromJSONString(s string) map[string]any {
+	if s == "" || s == "{}" {
+		return nil
+	}
+	var m map[string]string
+	if err := json.Unmarshal([]byte(s), &m); err != nil {
+		return nil
+	}
+	return fromStringMap(m)
 }
 
 func strAttr(attrs map[string]any, key string) string {
