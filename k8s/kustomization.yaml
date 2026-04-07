@@ -9,6 +9,11 @@ resources:
   - clickhouse/secret.yaml
   - clickhouse/service.yaml
   - clickhouse/statefulset.yaml
+  - ollama/pvc.yaml
+  - ollama/deployment.yaml
+  - ollama/service.yaml
+  - qdrant/statefulset.yaml
+  - qdrant/service.yaml
   - collector/pvc.yaml
   - collector/configmap.yaml
   - collector/secret.yaml

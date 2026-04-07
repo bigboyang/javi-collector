@@ -27,7 +27,7 @@ spec:
     spec:
       terminationGracePeriodSeconds: 30
 
-      # ClickHouse가 준비된 후에 시작
+      # ClickHouse / Ollama / Qdrant가 준비된 후에 시작
       initContainers:
         - name: wait-clickhouse
           image: busybox:1.36
@@ -37,6 +37,24 @@ spec:
             - |
               until nc -z clickhouse-svc 9000; do
                 echo "waiting for clickhouse..."; sleep 2
+              done
+        - name: wait-ollama
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z ollama 11434; do
+                echo "waiting for ollama..."; sleep 3
+              done
+        - name: wait-qdrant
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z qdrant 6333; do
+                echo "waiting for qdrant..."; sleep 2
               done
 
       containers:
