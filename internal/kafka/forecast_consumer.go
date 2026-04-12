@@ -57,13 +57,21 @@ func NewForecastConsumer(brokers []string, topic, group, endpoint string) *Forec
 	}
 }
 
-// spanEvent는 Forecast 서버로 전송할 span 이벤트의 최소 페이로드다.
+// spanEvent는 Forecast 서버로 전송할 span 이벤트다.
+// javi-forecast의 SpanEvent Pydantic 모델과 필드명·타입이 일치한다 (snake_case).
 type spanEvent struct {
-	ServiceName string  `json:"service_name"`
-	SpanName    string  `json:"span_name"`
-	DurationMs  int64   `json:"duration_ms"`
-	StatusCode  int32   `json:"status_code"`
-	TimestampMs int64   `json:"timestamp_ms"`
+	TraceID       string         `json:"trace_id"`
+	SpanID        string         `json:"span_id"`
+	ParentSpanID  string         `json:"parent_span_id,omitempty"`
+	Name          string         `json:"name"`
+	Kind          int32          `json:"kind"`
+	StartTimeNano int64          `json:"start_time_nano"`
+	EndTimeNano   int64          `json:"end_time_nano"`
+	Attributes    map[string]any `json:"attributes,omitempty"`
+	StatusCode    int32          `json:"status_code"`
+	StatusMessage string         `json:"status_message,omitempty"`
+	ServiceName   string         `json:"service_name"`
+	ScopeName     string         `json:"scope_name,omitempty"`
 }
 
 // Start는 백그라운드 goroutine으로 Kafka 메시지를 소비한다.
@@ -104,11 +112,18 @@ func (c *ForecastConsumer) Start(ctx context.Context) {
 			}
 
 			evt := spanEvent{
-				ServiceName: sp.ServiceName,
-				SpanName:    sp.Name,
-				DurationMs:  (sp.EndTimeNano - sp.StartTimeNano) / 1_000_000,
-				StatusCode:  sp.StatusCode,
-				TimestampMs: sp.ReceivedAtMs,
+				TraceID:       sp.TraceID,
+				SpanID:        sp.SpanID,
+				ParentSpanID:  sp.ParentSpanID,
+				Name:          sp.Name,
+				Kind:          sp.Kind,
+				StartTimeNano: sp.StartTimeNano,
+				EndTimeNano:   sp.EndTimeNano,
+				Attributes:    sp.Attributes,
+				StatusCode:    sp.StatusCode,
+				StatusMessage: sp.StatusMessage,
+				ServiceName:   sp.ServiceName,
+				ScopeName:     sp.ScopeName,
 			}
 			// semaphore로 최대 동시 goroutine 수를 제한한다.
 			// 전송 슬롯이 모두 사용 중이면 span을 드롭하고 경고를 남긴다.

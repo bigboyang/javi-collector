@@ -176,6 +176,17 @@ type Config struct {
 	// CardinalityBloomK: bloom filter 해시 함수 수 (기본 4)
 	CardinalityBloomK int
 
+	// ── Direct Forecast Forwarder ─────────────────────────────────────────
+	// FORECAST_ENDPOINT가 설정되고 KAFKA_ENABLED=false인 경우 활성화된다.
+	// Kafka 없이 javi-forecast로 span/metric/JVM 메트릭을 직접 HTTP 전송한다.
+	//
+	//   POST /v1/spans         — span 배치
+	//   POST /v1/metrics       — metric 배치
+	//   POST /v1/metrics/jvm   — JVM 메트릭 스냅샷 (jvm.* OTel 메트릭 자동 변환)
+	ForecastEndpoint      string        // javi-forecast base URL (FORECAST_ENDPOINT)
+	ForecastBatchSize     int           // 배치 최대 크기 (FORECAST_BATCH_SIZE, 기본 100)
+	ForecastFlushInterval time.Duration // flush 주기 (FORECAST_FLUSH_INTERVAL, 기본 5s)
+
 	// ── Kafka Event Bus ───────────────────────────────────────────────────
 	// KAFKA_ENABLED=true이면 Ingester가 span/metric/log 이벤트를 Kafka 토픽에 발행한다.
 	// 각 signal 타입별로 독립적인 토픽과 consumer group을 사용한다.
@@ -274,6 +285,9 @@ func Load() (*Config, error) {
 		CardinalityBloomBits:     envInt("CARDINALITY_BLOOM_BITS", 100_000),
 		CardinalityBloomK:        envInt("CARDINALITY_BLOOM_K", 4),
 		SelfTracingEnabled:       envBool("SELF_TRACING_ENABLED", false),
+		ForecastEndpoint:         envStr("FORECAST_ENDPOINT", ""),
+		ForecastBatchSize:        envInt("FORECAST_BATCH_SIZE", 100),
+		ForecastFlushInterval:    envDuration("FORECAST_FLUSH_INTERVAL", 5*time.Second),
 		KafkaEnabled:             envBool("KAFKA_ENABLED", false),
 		KafkaBrokers:             envStringSlice("KAFKA_BROKERS", []string{"localhost:9092"}),
 		KafkaTopic:               envStr("KAFKA_TOPIC", "spans.error"),

@@ -97,6 +97,24 @@ func (d *DirectSpanPublisher) Publish(sp *model.SpanData) {
 	}
 }
 
+// MultiSpanPublisher는 여러 SpanPublisher에 span 이벤트를 팬아웃한다.
+// RAG + Forecast 같이 복수의 하류가 필요한 경우에 사용한다.
+type MultiSpanPublisher struct {
+	publishers []SpanPublisher
+}
+
+// NewMultiSpanPublisher는 MultiSpanPublisher를 생성한다.
+func NewMultiSpanPublisher(pubs ...SpanPublisher) *MultiSpanPublisher {
+	return &MultiSpanPublisher{publishers: pubs}
+}
+
+// Publish는 모든 SpanPublisher에 span을 순차 전달한다.
+func (m *MultiSpanPublisher) Publish(sp *model.SpanData) {
+	for _, p := range m.publishers {
+		p.Publish(sp)
+	}
+}
+
 // Ingester는 OTLP 수신 → decode → process → store 파이프라인을 담당한다.
 type Ingester struct {
 	traceStore  store.TraceStore

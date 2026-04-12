@@ -16,6 +16,7 @@ import (
 	"github.com/kkc/javi-collector/internal/alerter"
 	"github.com/kkc/javi-collector/internal/anomaly"
 	"github.com/kkc/javi-collector/internal/config"
+	"github.com/kkc/javi-collector/internal/forecast"
 	"github.com/kkc/javi-collector/internal/ingester"
 	jkafka "github.com/kkc/javi-collector/internal/kafka"
 	"github.com/kkc/javi-collector/internal/processor"
@@ -351,7 +352,11 @@ func main() {
 	}
 
 	// Publisher 결정: Kafka 활성화 여부에 따라 팬아웃 방식이 달라진다.
-	//   KAFKA_ENABLED=false (기본): DirectSpanPublisher → EmbedPipeline (채널)
+	//
+	//   KAFKA_ENABLED=false (기본):
+	//     spanPub   → DirectSpanPublisher (RAG)  [+ ForecastForwarder if FORECAST_ENDPOINT 설정]
+	//     metricPub → ForecastForwarder (if FORECAST_ENDPOINT 설정)
+	//
 	//   KAFKA_ENABLED=true:
 	//     SpanProducer   → Kafka "spans.error" → [RAG + Forecast consumers]
 	//     MetricProducer → Kafka "metrics"      → [MetricForecast consumer]
@@ -359,6 +364,25 @@ func main() {
 	var spanPub ingester.SpanPublisher
 	var metricPub ingester.MetricPublisher
 	var logPub ingester.LogPublisher
+
+	// Direct Forecast Forwarder: KAFKA_ENABLED=false이고 FORECAST_ENDPOINT가 설정된 경우 활성화.
+	// span/metric을 배치로 묶어 javi-forecast HTTP 엔드포인트에 직접 전송한다.
+	// jvm.* OTel 메트릭은 자동으로 JvmMetricBatch로 변환해 /v1/metrics/jvm 으로 전송한다.
+	var forecaster *forecast.ForecastForwarder
+	if !cfg.KafkaEnabled && cfg.ForecastEndpoint != "" {
+		forecaster = forecast.New(forecast.Config{
+			Endpoint:      cfg.ForecastEndpoint,
+			BatchSize:     cfg.ForecastBatchSize,
+			FlushInterval: cfg.ForecastFlushInterval,
+		})
+		forecaster.Start(ctx)
+		metricPub = forecaster
+		slog.Info("forecast forwarder started",
+			"endpoint", cfg.ForecastEndpoint,
+			"batch_size", cfg.ForecastBatchSize,
+			"flush_interval", cfg.ForecastFlushInterval,
+		)
+	}
 
 	if cfg.KafkaEnabled {
 		// Span producer
@@ -416,11 +440,23 @@ func main() {
 		defer spanProducer.Close()   //nolint:errcheck
 		defer metricProducer.Close() //nolint:errcheck
 		defer logProducer.Close()    //nolint:errcheck
-	} else if embedPipeline != nil {
-		// 직접 모드: EmbedPipeline에 직접 제출 (Kafka 미사용)
-		spanPub = &ingester.DirectSpanPublisher{
-			Pipeline: embedPipeline,
-			Builder:  rag.DocumentBuilder{SlowMs: int64(cfg.RAGSlowThresholdMs)},
+	} else {
+		// 직접 모드 (Kafka 미사용): RAG + Forecast 팬아웃
+		var pubs []ingester.SpanPublisher
+		if embedPipeline != nil {
+			pubs = append(pubs, &ingester.DirectSpanPublisher{
+				Pipeline: embedPipeline,
+				Builder:  rag.DocumentBuilder{SlowMs: int64(cfg.RAGSlowThresholdMs)},
+			})
+		}
+		if forecaster != nil {
+			pubs = append(pubs, forecaster)
+		}
+		switch len(pubs) {
+		case 1:
+			spanPub = pubs[0]
+		case 2:
+			spanPub = ingester.NewMultiSpanPublisher(pubs...)
 		}
 	}
 
