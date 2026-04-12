@@ -42,10 +42,12 @@ func main() {
 	// DisableClickHouse=true 이면 인메모리 링버퍼로 fallback한다.
 	// 프로덕션에서는 DISABLE_CLICKHOUSE=false (기본값)로 ClickHouse를 사용한다.
 	var (
-		traceStore  store.TraceStore
-		metricStore store.MetricStore
-		logStore    store.LogStore
-		chConn      driver.Conn // ClickHouse 공유 커넥션 (RCA Engine 등에서 재사용)
+		traceStore      store.TraceStore
+		metricStore     store.MetricStore
+		logStore        store.LogStore
+		chConn          driver.Conn                  // ClickHouse 공유 커넥션 (RCA Engine 등에서 재사용)
+		catalogStore    *store.ServiceCatalogStore   // Gap 4: 서비스 카탈로그
+		errorGroupStore *store.ErrorGroupStore       // Gap 2: 에러 그룹 집계
 	)
 
 	if cfg.DisableClickHouse {
@@ -103,6 +105,20 @@ func main() {
 		traceStore = ts
 		metricStore = ms
 		logStore = ls
+
+		// Gap 4: 서비스 카탈로그 — 팀 소유권 · 운영 메타데이터 CRUD
+		if cs, cerr := store.NewServiceCatalogStore(chConn, cfg.ClickHouseDB); cerr != nil {
+			slog.Warn("service catalog init failed (continuing without catalog)", "err", cerr)
+		} else {
+			catalogStore = cs
+		}
+
+		// Gap 2: 에러 그룹 — fingerprint 기반 중복 에러 집계
+		if eg, egerr := store.NewErrorGroupStore(chConn, cfg.ClickHouseDB); egerr != nil {
+			slog.Warn("error groups init failed (continuing without error groups)", "err", egerr)
+		} else {
+			errorGroupStore = eg
+		}
 
 		// 공유 커넥션은 모든 store가 drain된 후 닫아야 한다.
 		// defer 실행 순서(LIFO)를 이용: store Close() → conn Close()
@@ -554,6 +570,16 @@ func main() {
 	// RAG Searcher 주입 (EMBED_ENABLED=true 시에만 non-nil)
 	if ragSearcher != nil {
 		httpSrv.SetSearcher(ragSearcher)
+	}
+
+	// Gap 4: 서비스 카탈로그 주입
+	if catalogStore != nil {
+		httpSrv.SetServiceCatalog(catalogStore)
+	}
+
+	// Gap 2: 에러 그룹 주입
+	if errorGroupStore != nil {
+		httpSrv.SetErrorGroups(errorGroupStore)
 	}
 
 	// HTTP 서버 시작

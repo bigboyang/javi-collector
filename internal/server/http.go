@@ -103,6 +103,23 @@ type RawQuerier interface {
 	QueryRaw(ctx context.Context, sql string) ([]map[string]any, error)
 }
 
+// BrokenTraceQuerier는 root span이 없는 브로큰 트레이스를 탐지하는 인터페이스다.
+type BrokenTraceQuerier interface {
+	QueryBrokenTraces(ctx context.Context, service string, fromMs, toMs int64, limit int) ([]map[string]any, error)
+}
+
+// ErrorGroupQuerier는 에러 그룹 집계를 지원하는 인터페이스다.
+type ErrorGroupQuerier interface {
+	QueryErrorGroups(ctx context.Context, service string, fromMs, toMs int64, limit int) ([]map[string]any, error)
+}
+
+// ServiceCatalogManager는 서비스 카탈로그 CRUD를 지원하는 인터페이스다.
+type ServiceCatalogManager interface {
+	UpsertService(ctx context.Context, e store.ServiceCatalogEntry) error
+	GetService(ctx context.Context, name string) (*store.ServiceCatalogEntry, error)
+	ListServices(ctx context.Context) ([]store.ServiceCatalogEntry, error)
+}
+
 // HistogramMVQuerier는 mv_histogram_1m_state 집계 뷰를 조회하는 인터페이스다.
 // ClickHouseMetricStore가 구현한다.
 type HistogramMVQuerier interface {
@@ -131,6 +148,14 @@ type HTTPServer struct {
 	// searcher는 RAG 벡터 검색을 담당한다.
 	// nil이면 검색 비활성화 (EMBED_ENABLED=false 배포).
 	searcher *rag.RAGSearcher
+
+	// catalog는 서비스 카탈로그 CRUD를 담당한다.
+	// nil이면 서비스 카탈로그 비활성화 (ClickHouse 미사용 배포).
+	catalog ServiceCatalogManager
+
+	// errorGroups는 에러 그룹 집계를 담당한다.
+	// nil이면 에러 그룹 비활성화.
+	errorGroups ErrorGroupQuerier
 }
 
 func NewHTTPServer(addr string, ing *ingester.Ingester,
@@ -169,6 +194,13 @@ func NewHTTPServer(addr string, ing *ingester.Ingester,
 	mux.HandleFunc("/api/query", s.queryRaw)
 	// RAG 벡터 검색 (EMBED_ENABLED=true 시 활성)
 	mux.HandleFunc("/api/collector/search", s.handleSearch)
+	// 브로큰 트레이스 탐지 (root span 없는 트레이스)
+	mux.HandleFunc("/api/collector/broken-traces", s.queryBrokenTraces)
+	// 에러 그룹 집계 (Error Tracking)
+	mux.HandleFunc("/api/collector/error-groups", s.queryErrorGroups)
+	// 서비스 카탈로그 (팀 소유권, 운영 메타데이터)
+	mux.HandleFunc("/api/catalog/services", s.listCatalogServices)
+	mux.HandleFunc("/api/catalog/service", s.catalogService)
 
 	// 운영 엔드포인트
 	// /healthz: liveness probe — 프로세스가 살아있으면 200
@@ -197,6 +229,18 @@ func (s *HTTPServer) SetTraceRouter(r *sampling.TraceRouter) {
 // Start() 전에 호출해야 한다. nil이면 /api/collector/search가 503을 반환한다.
 func (s *HTTPServer) SetSearcher(r *rag.RAGSearcher) {
 	s.searcher = r
+}
+
+// SetServiceCatalog는 서비스 카탈로그 관리자를 등록한다.
+// nil이면 /api/catalog/* 가 501을 반환한다.
+func (s *HTTPServer) SetServiceCatalog(c ServiceCatalogManager) {
+	s.catalog = c
+}
+
+// SetErrorGroups는 에러 그룹 집계기를 등록한다.
+// nil이면 /api/collector/error-groups 가 501을 반환한다.
+func (s *HTTPServer) SetErrorGroups(eg ErrorGroupQuerier) {
+	s.errorGroups = eg
 }
 
 // handleSearch는 자연어 질의를 RAG 벡터 검색으로 처리한다.
@@ -757,6 +801,149 @@ func (s *HTTPServer) streamAlerts(w http.ResponseWriter, r *http.Request) {
 			}
 			lastMs = now
 		}
+	}
+}
+
+// queryBrokenTraces는 root span이 없는 브로큰 트레이스를 반환한다.
+// GET /api/collector/broken-traces?service=svc&from=<ms>&to=<ms>&limit=100
+//
+// 브로큰 트레이스는 계측 미설정, 샘플링 불일치, 또는 네트워크 손실의 신호다.
+func (s *HTTPServer) queryBrokenTraces(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	setCORSHeaders(w)
+
+	querier, ok := s.traceStore.(BrokenTraceQuerier)
+	if !ok {
+		http.Error(w, "broken trace detection not available (requires ClickHouse)", http.StatusNotImplemented)
+		return
+	}
+
+	result, err := querier.QueryBrokenTraces(r.Context(),
+		r.URL.Query().Get("service"),
+		queryInt64(r, "from"),
+		queryInt64(r, "to"),
+		queryLimit(r),
+	)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, result)
+}
+
+// queryErrorGroups는 fingerprint 기반으로 집계된 에러 그룹 목록을 반환한다.
+// GET /api/collector/error-groups?service=svc&from=<ms>&to=<ms>&limit=100
+//
+// 동일한 exception_type + exception_message를 가진 에러를 하나의 그룹으로 집계해
+// alert fatigue를 줄이고 재발 패턴을 추적한다.
+func (s *HTTPServer) queryErrorGroups(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	setCORSHeaders(w)
+
+	if s.errorGroups == nil {
+		http.Error(w, "error groups not available (requires ClickHouse)", http.StatusNotImplemented)
+		return
+	}
+
+	result, err := s.errorGroups.QueryErrorGroups(r.Context(),
+		r.URL.Query().Get("service"),
+		queryInt64(r, "from"),
+		queryInt64(r, "to"),
+		queryLimit(r),
+	)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, result)
+}
+
+// listCatalogServices는 등록된 모든 서비스 카탈로그 항목을 반환한다.
+// GET /api/catalog/services
+func (s *HTTPServer) listCatalogServices(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	setCORSHeaders(w)
+
+	if s.catalog == nil {
+		http.Error(w, "service catalog not available (requires ClickHouse)", http.StatusNotImplemented)
+		return
+	}
+
+	result, err := s.catalog.ListServices(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if result == nil {
+		result = []store.ServiceCatalogEntry{}
+	}
+	writeJSON(w, result)
+}
+
+// catalogService는 서비스 카탈로그 단일 항목을 조회(GET)하거나 등록/수정(PUT)한다.
+//
+//	GET /api/catalog/service?name=<service>
+//	PUT /api/catalog/service  body: ServiceCatalogEntry JSON
+func (s *HTTPServer) catalogService(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	if s.catalog == nil {
+		http.Error(w, "service catalog not available (requires ClickHouse)", http.StatusNotImplemented)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		name := r.URL.Query().Get("name")
+		if name == "" {
+			http.Error(w, "name parameter required", http.StatusBadRequest)
+			return
+		}
+		entry, err := s.catalog.GetService(r.Context(), name)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if entry == nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, entry)
+
+	case http.MethodPut:
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			http.Error(w, "read body failed", http.StatusBadRequest)
+			return
+		}
+		var entry store.ServiceCatalogEntry
+		if err := json.Unmarshal(body, &entry); err != nil || entry.ServiceName == "" {
+			http.Error(w, "invalid body: service_name required", http.StatusBadRequest)
+			return
+		}
+		if err := s.catalog.UpsertService(r.Context(), entry); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 

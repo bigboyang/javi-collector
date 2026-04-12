@@ -632,6 +632,78 @@ LIMIT %d`, s.cfg.Database, where, limit)
 	return result, rows.Err()
 }
 
+// QueryBrokenTraces는 root span이 없는 트레이스를 감지한다.
+// traceID 기준으로 집계: parent_span_id=''인 span이 없는 trace = 브로큰 트레이스.
+// 계측 미설정, 샘플링 불일치, 또는 네트워크 손실이 원인일 수 있다.
+func (s *ClickHouseTraceStore) QueryBrokenTraces(ctx context.Context, service string, fromMs, toMs int64, limit int) ([]map[string]any, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+
+	var conds []string
+	var args []any
+
+	if fromMs > 0 {
+		conds = append(conds, "start_time_nano >= ?")
+		args = append(args, fromMs*1_000_000)
+	}
+	if toMs > 0 {
+		conds = append(conds, "start_time_nano <= ?")
+		args = append(args, toMs*1_000_000)
+	}
+	if service != "" {
+		conds = append(conds, "service_name = ?")
+		args = append(args, service)
+	}
+
+	where := ""
+	if len(conds) > 0 {
+		where = "WHERE " + strings.Join(conds, " AND ")
+	}
+
+	q := fmt.Sprintf(`
+SELECT
+    trace_id,
+    count()                                               AS span_count,
+    anyIf(service_name, service_name != '')               AS service_name,
+    min(intDiv(start_time_nano, 1000000))                 AS start_ms,
+    countIf(status_code = 2)                              AS error_count,
+    max(intDiv(end_time_nano - start_time_nano, 1000000)) AS max_duration_ms
+FROM %s.spans
+%s
+GROUP BY trace_id
+HAVING countIf(parent_span_id = '') = 0
+ORDER BY start_ms DESC
+LIMIT %d`, s.cfg.Database, where, limit)
+
+	rows, err := s.conn.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []map[string]any
+	for rows.Next() {
+		var (
+			traceID, serviceName   string
+			spanCount, errorCount  uint64
+			startMs, maxDurationMs int64
+		)
+		if err := rows.Scan(&traceID, &spanCount, &serviceName, &startMs, &errorCount, &maxDurationMs); err != nil {
+			return nil, err
+		}
+		result = append(result, map[string]any{
+			"trace_id":        traceID,
+			"span_count":      spanCount,
+			"service_name":    serviceName,
+			"start_ms":        startMs,
+			"error_count":     errorCount,
+			"max_duration_ms": maxDurationMs,
+		})
+	}
+	return result, rows.Err()
+}
+
 // QueryRaw는 화이트리스트를 통과한 SELECT 쿼리를 ClickHouse에 직접 실행하고
 // []map[string]any 형태로 결과를 반환한다.
 // 컬럼 이름과 값은 ClickHouse driver의 타입을 그대로 사용한다.
