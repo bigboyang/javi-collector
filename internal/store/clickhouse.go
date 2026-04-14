@@ -704,6 +704,157 @@ LIMIT %d`, s.cfg.Database, where, limit)
 	return result, rows.Err()
 }
 
+// QueryTraceContext는 trace_id로 연관된 spans·logs·RED 메트릭을 한 번에 반환한다.
+// Gap 1: Correlated Signal Navigation — Datadog의 "Trace to Logs/Metrics" 피벗에 해당.
+func (s *ClickHouseTraceStore) QueryTraceContext(ctx context.Context, traceID string) (map[string]any, error) {
+	// 1) Spans
+	spanRows, err := s.conn.Query(ctx, fmt.Sprintf(`
+SELECT
+    span_id, parent_span_id, service_name, span_name,
+    intDiv(start_time_nano, 1000000) AS start_ms,
+    intDiv(end_time_nano - start_time_nano, 1000000) AS duration_ms,
+    status_code, exception_type, exception_message, http_status_code
+FROM %s.spans
+WHERE trace_id = ?
+ORDER BY start_ms ASC
+LIMIT 500`, s.cfg.Database), traceID)
+	if err != nil {
+		return nil, fmt.Errorf("query spans: %w", err)
+	}
+	defer spanRows.Close()
+
+	var spans []map[string]any
+	var serviceName string
+	var fromMs, toMs int64
+	for spanRows.Next() {
+		var (
+			spanID, parentSpanID, svc, spanName string
+			startMs, durationMs                 int64
+			statusCode, httpStatus              int32
+			excType, excMsg                     string
+		)
+		if err := spanRows.Scan(&spanID, &parentSpanID, &svc, &spanName,
+			&startMs, &durationMs, &statusCode, &excType, &excMsg, &httpStatus); err != nil {
+			return nil, fmt.Errorf("scan span: %w", err)
+		}
+		if serviceName == "" {
+			serviceName = svc
+		}
+		if fromMs == 0 || startMs < fromMs {
+			fromMs = startMs
+		}
+		if endMs := startMs + durationMs; endMs > toMs {
+			toMs = endMs
+		}
+		spans = append(spans, map[string]any{
+			"span_id":          spanID,
+			"parent_span_id":   parentSpanID,
+			"service_name":     svc,
+			"span_name":        spanName,
+			"start_ms":         startMs,
+			"duration_ms":      durationMs,
+			"status_code":      statusCode,
+			"exception_type":   excType,
+			"exception_message": excMsg,
+			"http_status_code": httpStatus,
+		})
+	}
+	if err := spanRows.Err(); err != nil {
+		return nil, err
+	}
+
+	// 2) Logs: trace_id 또는 service_name + 시간 범위로 조회
+	logArgs := []any{traceID}
+	logWhere := "trace_id = ?"
+	if serviceName != "" && fromMs > 0 {
+		// trace_id가 비어 있는 로그도 서비스+시간으로 포함
+		logWhere = "(trace_id = ? OR (service_name = ? AND timestamp_nano BETWEEN ? AND ?))"
+		logArgs = []any{traceID, serviceName, fromMs * 1_000_000, toMs * 1_000_000}
+	}
+	logRows, err := s.conn.Query(ctx, fmt.Sprintf(`
+SELECT
+    severity_text, body, service_name,
+    intDiv(timestamp_nano, 1000000) AS ts_ms,
+    trace_id, span_id, exception_type
+FROM %s.logs
+WHERE %s
+ORDER BY ts_ms ASC
+LIMIT 200`, s.cfg.Database, logWhere), logArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("query logs: %w", err)
+	}
+	defer logRows.Close()
+
+	var logs []map[string]any
+	for logRows.Next() {
+		var (
+			severity, body, svc, trID, spID, excType string
+			tsMs                                     int64
+		)
+		if err := logRows.Scan(&severity, &body, &svc, &tsMs, &trID, &spID, &excType); err != nil {
+			return nil, fmt.Errorf("scan log: %w", err)
+		}
+		logs = append(logs, map[string]any{
+			"severity":       severity,
+			"body":           body,
+			"service_name":   svc,
+			"ts_ms":          tsMs,
+			"trace_id":       trID,
+			"span_id":        spID,
+			"exception_type": excType,
+		})
+	}
+	if err := logRows.Err(); err != nil {
+		return nil, err
+	}
+
+	// 3) RED 메트릭: 서비스 + 트레이스 시간 범위의 1분 집계
+	var redMetrics []map[string]any
+	if serviceName != "" && fromMs > 0 {
+		redRows, err := s.conn.Query(ctx, fmt.Sprintf(`
+SELECT
+    minute,
+    sum(total_count) AS rps,
+    sum(error_count) AS errors,
+    quantilesMerge(0.95)(duration_quantiles)[1] / 1e6 AS p95_ms
+FROM %s.mv_red_1m_state
+WHERE service_name = ?
+  AND minute BETWEEN toDateTime(?) AND toDateTime(?)
+GROUP BY minute
+ORDER BY minute ASC`, s.cfg.Database),
+			serviceName,
+			fromMs/1000-60, // -1분 여유
+			toMs/1000+60,
+		)
+		if err == nil {
+			defer redRows.Close()
+			for redRows.Next() {
+				var minute time.Time
+				var rps, errors uint64
+				var p95 float64
+				if err := redRows.Scan(&minute, &rps, &errors, &p95); err == nil {
+					redMetrics = append(redMetrics, map[string]any{
+						"minute_ms": minute.UnixMilli(),
+						"rps":       rps,
+						"errors":    errors,
+						"p95_ms":    p95,
+					})
+				}
+			}
+		}
+	}
+
+	return map[string]any{
+		"trace_id":     traceID,
+		"service_name": serviceName,
+		"from_ms":      fromMs,
+		"to_ms":        toMs,
+		"spans":        spans,
+		"logs":         logs,
+		"red_metrics":  redMetrics,
+	}, nil
+}
+
 // QueryRaw는 화이트리스트를 통과한 SELECT 쿼리를 ClickHouse에 직접 실행하고
 // []map[string]any 형태로 결과를 반환한다.
 // 컬럼 이름과 값은 ClickHouse driver의 타입을 그대로 사용한다.

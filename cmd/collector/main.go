@@ -48,6 +48,7 @@ func main() {
 		chConn          driver.Conn                  // ClickHouse 공유 커넥션 (RCA Engine 등에서 재사용)
 		catalogStore    *store.ServiceCatalogStore   // Gap 4: 서비스 카탈로그
 		errorGroupStore *store.ErrorGroupStore       // Gap 2: 에러 그룹 집계
+		sloStore        *store.SLOStore              // Gap 3: SLO/SLI + Burn-Rate
 	)
 
 	if cfg.DisableClickHouse {
@@ -118,6 +119,17 @@ func main() {
 			slog.Warn("error groups init failed (continuing without error groups)", "err", egerr)
 		} else {
 			errorGroupStore = eg
+		}
+
+		// Gap 3: SLO/SLI + Burn-Rate Alerting
+		if ss, slerr := store.NewSLOStore(chConn, cfg.ClickHouseDB); slerr != nil {
+			slog.Warn("slo store init failed (continuing without SLO)", "err", slerr)
+		} else {
+			sloStore = ss
+			burnCalc := store.NewSLOBurnCalculator(ss, chConn, cfg.ClickHouseDB, time.Minute)
+			burnCalc.Start()
+			defer burnCalc.Stop()
+			slog.Info("slo burn calculator started")
 		}
 
 		// 공유 커넥션은 모든 store가 drain된 후 닫아야 한다.
@@ -580,6 +592,16 @@ func main() {
 	// Gap 2: 에러 그룹 주입
 	if errorGroupStore != nil {
 		httpSrv.SetErrorGroups(errorGroupStore)
+	}
+
+	// Gap 1: Correlated Signal Navigation — ClickHouseTraceStore가 구현체를 제공한다.
+	if tc, ok := traceStore.(server.CorrelatedSignalQuerier); ok {
+		httpSrv.SetTraceContext(tc)
+	}
+
+	// Gap 3: SLO/SLI + Burn-Rate Alerting
+	if sloStore != nil {
+		httpSrv.SetSLOManager(sloStore)
 	}
 
 	// HTTP 서버 시작

@@ -120,6 +120,20 @@ type ServiceCatalogManager interface {
 	ListServices(ctx context.Context) ([]store.ServiceCatalogEntry, error)
 }
 
+// CorrelatedSignalQuerier는 trace_id 기반 통합 시그널 조회를 지원하는 인터페이스다.
+// Gap 1: Correlated Signal Navigation — spans·logs·RED 메트릭을 한 번에 반환한다.
+type CorrelatedSignalQuerier interface {
+	QueryTraceContext(ctx context.Context, traceID string) (map[string]any, error)
+}
+
+// SLOManager는 SLO 정의 관리와 번-레이트 알람 조회를 지원하는 인터페이스다.
+// Gap 3: SLO/SLI + Burn-Rate Alerting
+type SLOManager interface {
+	UpsertSLO(ctx context.Context, def store.SLODefinition) error
+	ListSLOs(ctx context.Context) ([]store.SLODefinition, error)
+	GetBurnAlerts(ctx context.Context, service string, limit int) ([]store.SLOBurnAlert, error)
+}
+
 // HistogramMVQuerier는 mv_histogram_1m_state 집계 뷰를 조회하는 인터페이스다.
 // ClickHouseMetricStore가 구현한다.
 type HistogramMVQuerier interface {
@@ -156,6 +170,14 @@ type HTTPServer struct {
 	// errorGroups는 에러 그룹 집계를 담당한다.
 	// nil이면 에러 그룹 비활성화.
 	errorGroups ErrorGroupQuerier
+
+	// traceContext는 trace_id 기반 통합 시그널 조회를 담당한다.
+	// nil이면 /api/collector/trace-context 가 501을 반환한다.
+	traceContext CorrelatedSignalQuerier
+
+	// sloManager는 SLO 정의·번-레이트 알람 관리를 담당한다.
+	// nil이면 /api/slo/* 가 501을 반환한다.
+	sloManager SLOManager
 }
 
 func NewHTTPServer(addr string, ing *ingester.Ingester,
@@ -198,9 +220,14 @@ func NewHTTPServer(addr string, ing *ingester.Ingester,
 	mux.HandleFunc("/api/collector/broken-traces", s.queryBrokenTraces)
 	// 에러 그룹 집계 (Error Tracking)
 	mux.HandleFunc("/api/collector/error-groups", s.queryErrorGroups)
+	// Gap 1: Correlated Signal Navigation — trace_id 기반 spans·logs·메트릭 통합 조회
+	mux.HandleFunc("/api/collector/trace-context", s.queryTraceContext)
 	// 서비스 카탈로그 (팀 소유권, 운영 메타데이터)
 	mux.HandleFunc("/api/catalog/services", s.listCatalogServices)
 	mux.HandleFunc("/api/catalog/service", s.catalogService)
+	// Gap 3: SLO/SLI + Burn-Rate Alerting
+	mux.HandleFunc("/api/slo/definitions", s.sloDefinitions)
+	mux.HandleFunc("/api/slo/burn-alerts", s.sloBurnAlerts)
 
 	// 운영 엔드포인트
 	// /healthz: liveness probe — 프로세스가 살아있으면 200
@@ -241,6 +268,18 @@ func (s *HTTPServer) SetServiceCatalog(c ServiceCatalogManager) {
 // nil이면 /api/collector/error-groups 가 501을 반환한다.
 func (s *HTTPServer) SetErrorGroups(eg ErrorGroupQuerier) {
 	s.errorGroups = eg
+}
+
+// SetTraceContext는 trace_id 기반 통합 시그널 조회기를 등록한다.
+// nil이면 /api/collector/trace-context 가 501을 반환한다.
+func (s *HTTPServer) SetTraceContext(tc CorrelatedSignalQuerier) {
+	s.traceContext = tc
+}
+
+// SetSLOManager는 SLO 관리자를 등록한다.
+// nil이면 /api/slo/* 가 501을 반환한다.
+func (s *HTTPServer) SetSLOManager(sm SLOManager) {
+	s.sloManager = sm
 }
 
 // handleSearch는 자연어 질의를 RAG 벡터 검색으로 처리한다.
@@ -945,6 +984,118 @@ func (s *HTTPServer) catalogService(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// queryTraceContext는 trace_id에 연관된 spans·logs·RED 메트릭을 한 번에 반환한다.
+// Gap 1: Correlated Signal Navigation
+//
+//	GET /api/collector/trace-context?trace_id=<id>
+func (s *HTTPServer) queryTraceContext(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	setCORSHeaders(w)
+
+	if s.traceContext == nil {
+		http.Error(w, "trace context not available (requires ClickHouse)", http.StatusNotImplemented)
+		return
+	}
+
+	traceID := strings.TrimSpace(r.URL.Query().Get("trace_id"))
+	if traceID == "" {
+		http.Error(w, "trace_id parameter required", http.StatusBadRequest)
+		return
+	}
+
+	result, err := s.traceContext.QueryTraceContext(r.Context(), traceID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, result)
+}
+
+// sloDefinitions는 SLO 정의를 조회(GET)하거나 등록/수정(PUT)한다.
+// Gap 3: SLO/SLI + Burn-Rate Alerting
+//
+//	GET /api/slo/definitions?service=<svc>
+//	PUT /api/slo/definitions  body: SLODefinition JSON
+func (s *HTTPServer) sloDefinitions(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	if s.sloManager == nil {
+		http.Error(w, "SLO manager not available (requires ClickHouse)", http.StatusNotImplemented)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		defs, err := s.sloManager.ListSLOs(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if defs == nil {
+			defs = []store.SLODefinition{}
+		}
+		writeJSON(w, defs)
+
+	case http.MethodPut:
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			http.Error(w, "read body failed", http.StatusBadRequest)
+			return
+		}
+		var def store.SLODefinition
+		if err := json.Unmarshal(body, &def); err != nil || def.ServiceName == "" || def.SLOName == "" {
+			http.Error(w, "invalid body: service_name and slo_name required", http.StatusBadRequest)
+			return
+		}
+		if err := s.sloManager.UpsertSLO(r.Context(), def); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// sloBurnAlerts는 번-레이트 초과 알람을 반환한다.
+//
+//	GET /api/slo/burn-alerts?service=<svc>&limit=100
+func (s *HTTPServer) sloBurnAlerts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	setCORSHeaders(w)
+
+	if s.sloManager == nil {
+		http.Error(w, "SLO manager not available (requires ClickHouse)", http.StatusNotImplemented)
+		return
+	}
+
+	service := r.URL.Query().Get("service")
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+
+	alerts, err := s.sloManager.GetBurnAlerts(r.Context(), service, limit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if alerts == nil {
+		alerts = []store.SLOBurnAlert{}
+	}
+	writeJSON(w, alerts)
 }
 
 // queryRaw는 화이트리스트를 통과한 SELECT SQL을 ClickHouse에 직접 실행한다.
