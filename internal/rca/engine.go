@@ -153,8 +153,14 @@ func (e *Engine) analyze(ctx context.Context, a AnomalyRow) (RCAReport, error) {
 		}
 	}
 
-	// 3. 규칙 기반 가설 생성
-	hypo := buildHypothesis(a, spans, similar)
+	// 3. Causal Chain: 토폴로지 인접 서비스 조회
+	neighbors, err := e.fetchTopologyNeighbors(ctx, a)
+	if err != nil {
+		slog.Warn("rca: topology fetch failed", "err", err)
+	}
+
+	// 4. 규칙 기반 가설 생성 (토폴로지 컨텍스트 포함)
+	hypo := buildHypothesis(a, spans, similar, neighbors)
 
 	// 4. LLM 기반 RCA 분석 (Generator가 설정된 경우)
 	var llmAnalysis string
@@ -172,19 +178,20 @@ func (e *Engine) analyze(ctx context.Context, a AnomalyRow) (RCAReport, error) {
 	}
 
 	return RCAReport{
-		ID:               newID(),
-		AnomalyID:        a.ID,
-		ServiceName:      a.ServiceName,
-		SpanName:         a.SpanName,
-		AnomalyType:      a.AnomalyType,
-		Minute:           a.Minute,
-		Severity:         a.Severity,
-		ZScore:           a.ZScore,
-		CorrelatedSpans:  spans,
-		SimilarIncidents: similar,
-		Hypothesis:       hypo,
-		LLMAnalysis:      llmAnalysis,
-		CreatedAt:        time.Now(),
+		ID:                newID(),
+		AnomalyID:         a.ID,
+		ServiceName:       a.ServiceName,
+		SpanName:          a.SpanName,
+		AnomalyType:       a.AnomalyType,
+		Minute:            a.Minute,
+		Severity:          a.Severity,
+		ZScore:            a.ZScore,
+		CorrelatedSpans:   spans,
+		SimilarIncidents:  similar,
+		TopologyNeighbors: neighbors,
+		Hypothesis:        hypo,
+		LLMAnalysis:       llmAnalysis,
+		CreatedAt:         time.Now(),
 	}, nil
 }
 
@@ -287,8 +294,60 @@ func (e *Engine) searchSimilarIncidents(ctx context.Context, a AnomalyRow) ([]Si
 	return out, nil
 }
 
+// fetchTopologyNeighbors는 mv_service_topology_state에서 이상 발생 서비스의
+// 직접 업스트림/다운스트림 서비스를 조회한다.
+func (e *Engine) fetchTopologyNeighbors(ctx context.Context, a AnomalyRow) ([]TopologyNeighbor, error) {
+	// 이상 발생 시간 ±30분 윈도우에서 토폴로지 조회
+	fromTime := a.Minute.Add(-30 * time.Minute)
+	toTime := a.Minute.Add(30 * time.Minute)
+
+	// downstream: 이 서비스가 호출한 서비스 (client spans)
+	// upstream: 이 서비스를 호출한 서비스 (this service appears as peer_service)
+	q := fmt.Sprintf(`
+SELECT
+    peer_service,
+    'downstream' AS direction,
+    sum(call_count) AS total_calls,
+    if(sum(call_count) > 0, toFloat64(sum(error_count)) / toFloat64(sum(call_count)), 0) AS error_rate
+FROM %s.mv_service_topology_state
+WHERE caller_service = '%s'
+  AND minute >= ? AND minute <= ?
+GROUP BY peer_service
+UNION ALL
+SELECT
+    caller_service,
+    'upstream' AS direction,
+    sum(call_count) AS total_calls,
+    if(sum(call_count) > 0, toFloat64(sum(error_count)) / toFloat64(sum(call_count)), 0) AS error_rate
+FROM %s.mv_service_topology_state
+WHERE peer_service = '%s'
+  AND minute >= ? AND minute <= ?
+GROUP BY caller_service
+ORDER BY total_calls DESC
+LIMIT 10`,
+		e.db, escapeStr(a.ServiceName),
+		e.db, escapeStr(a.ServiceName),
+	)
+
+	rows, err := e.conn.Query(ctx, q, fromTime, toTime, fromTime, toTime)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []TopologyNeighbor
+	for rows.Next() {
+		var n TopologyNeighbor
+		if err := rows.Scan(&n.ServiceName, &n.Direction, &n.CallCount, &n.ErrorRate); err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
 // buildHypothesis는 anomaly 유형과 연관 데이터를 기반으로 가설 문자열을 생성한다.
-func buildHypothesis(a AnomalyRow, spans []CorrelatedSpan, similar []SimilarIncident) string {
+func buildHypothesis(a AnomalyRow, spans []CorrelatedSpan, similar []SimilarIncident, neighbors []TopologyNeighbor) string {
 	var sb strings.Builder
 
 	switch a.AnomalyType {
@@ -326,6 +385,14 @@ func buildHypothesis(a AnomalyRow, spans []CorrelatedSpan, similar []SimilarInci
 	// 유사 과거 사례
 	if len(similar) > 0 {
 		fmt.Fprintf(&sb, " 유사 과거 사례 %d건 발견 (최고 유사도: %.2f).", len(similar), similar[0].Score)
+	}
+
+	// Causal Chain: 에러율이 높은 업/다운스트림 서비스 강조
+	for _, n := range neighbors {
+		if n.ErrorRate >= 0.05 { // 5% 이상 에러율인 인접 서비스만 언급
+			fmt.Fprintf(&sb, " %s 서비스(%s) 에러율 %.1f%% 감지.",
+				n.ServiceName, n.Direction, n.ErrorRate*100)
+		}
 	}
 
 	return sb.String()

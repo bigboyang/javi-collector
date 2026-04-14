@@ -134,6 +134,13 @@ type SLOManager interface {
 	GetBurnAlerts(ctx context.Context, service string, limit int) ([]store.SLOBurnAlert, error)
 }
 
+// RCAReportQuerier는 RCA 분석 결과 조회와 피드백 업데이트를 지원하는 인터페이스다.
+// P1: RCA 결과 소비 경로 — rca_reports 테이블을 조회한다.
+type RCAReportQuerier interface {
+	QueryRCAReports(ctx context.Context, service, severity string, fromMs, toMs int64, limit int) ([]store.RCAReport, error)
+	UpdateRCAFeedback(ctx context.Context, id string, resolved uint8, feedback string) error
+}
+
 // HistogramMVQuerier는 mv_histogram_1m_state 집계 뷰를 조회하는 인터페이스다.
 // ClickHouseMetricStore가 구현한다.
 type HistogramMVQuerier interface {
@@ -178,6 +185,10 @@ type HTTPServer struct {
 	// sloManager는 SLO 정의·번-레이트 알람 관리를 담당한다.
 	// nil이면 /api/slo/* 가 501을 반환한다.
 	sloManager SLOManager
+
+	// rcaReports는 RCA 결과 조회와 피드백 업데이트를 담당한다.
+	// nil이면 /api/rca/* 가 501을 반환한다.
+	rcaReports RCAReportQuerier
 }
 
 func NewHTTPServer(addr string, ing *ingester.Ingester,
@@ -228,6 +239,9 @@ func NewHTTPServer(addr string, ing *ingester.Ingester,
 	// Gap 3: SLO/SLI + Burn-Rate Alerting
 	mux.HandleFunc("/api/slo/definitions", s.sloDefinitions)
 	mux.HandleFunc("/api/slo/burn-alerts", s.sloBurnAlerts)
+	// P1: RCA 결과 조회 + 피드백
+	mux.HandleFunc("/api/rca/reports", s.queryRCAReports)
+	mux.HandleFunc("/api/rca/feedback", s.updateRCAFeedback)
 
 	// 운영 엔드포인트
 	// /healthz: liveness probe — 프로세스가 살아있으면 200
@@ -280,6 +294,12 @@ func (s *HTTPServer) SetTraceContext(tc CorrelatedSignalQuerier) {
 // nil이면 /api/slo/* 가 501을 반환한다.
 func (s *HTTPServer) SetSLOManager(sm SLOManager) {
 	s.sloManager = sm
+}
+
+// SetRCAReports는 RCA 보고서 조회기를 등록한다.
+// nil이면 /api/rca/* 가 501을 반환한다.
+func (s *HTTPServer) SetRCAReports(rq RCAReportQuerier) {
+	s.rcaReports = rq
 }
 
 // handleSearch는 자연어 질의를 RAG 벡터 검색으로 처리한다.
@@ -361,6 +381,99 @@ func (s *HTTPServer) handleSearch(w http.ResponseWriter, r *http.Request) {
 		"results": items,
 		"total":   len(items),
 	})
+}
+
+// queryRCAReports는 RCA 분석 결과를 반환한다.
+//
+//	GET /api/rca/reports?service=svc&severity=critical&from=<ms>&to=<ms>&limit=100
+func (s *HTTPServer) queryRCAReports(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.rcaReports == nil {
+		w.Header().Set("Content-Type", jsonContentType)
+		w.WriteHeader(http.StatusNotImplemented)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "RCA reports unavailable (ClickHouse disabled)"})
+		return
+	}
+
+	q := r.URL.Query()
+	service := q.Get("service")
+	severity := q.Get("severity")
+	fromMs, _ := strconv.ParseInt(q.Get("from"), 10, 64)
+	toMs, _ := strconv.ParseInt(q.Get("to"), 10, 64)
+	limit, _ := strconv.Atoi(q.Get("limit"))
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+
+	reports, err := s.rcaReports.QueryRCAReports(ctx, service, severity, fromMs, toMs, limit)
+	if err != nil {
+		slog.Warn("rca reports query failed", "err", err)
+		w.Header().Set("Content-Type", jsonContentType)
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	if reports == nil {
+		reports = []store.RCAReport{}
+	}
+	w.Header().Set("Content-Type", jsonContentType)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"reports": reports,
+		"total":   len(reports),
+	})
+}
+
+// updateRCAFeedback는 RCA 보고서의 resolved 상태와 피드백을 업데이트한다.
+//
+//	POST /api/rca/feedback
+//	body: {"id":"...","resolved":1,"feedback":"false positive — deploy skew"}
+func (s *HTTPServer) updateRCAFeedback(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.rcaReports == nil {
+		w.Header().Set("Content-Type", jsonContentType)
+		w.WriteHeader(http.StatusNotImplemented)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "RCA reports unavailable"})
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		http.Error(w, "read body", http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		ID       string `json:"id"`
+		Resolved uint8  `json:"resolved"`
+		Feedback string `json:"feedback"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil || req.ID == "" {
+		w.Header().Set("Content-Type", jsonContentType)
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "id field required"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	if err := s.rcaReports.UpdateRCAFeedback(ctx, req.ID, req.Resolved, req.Feedback); err != nil {
+		slog.Warn("rca feedback update failed", "id", req.ID, "err", err)
+		w.Header().Set("Content-Type", jsonContentType)
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", jsonContentType)
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 // MarkReady는 서버가 트래픽을 받을 준비가 되었음을 신호한다.

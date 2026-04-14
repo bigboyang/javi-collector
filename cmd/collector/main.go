@@ -49,6 +49,7 @@ func main() {
 		catalogStore    *store.ServiceCatalogStore   // Gap 4: 서비스 카탈로그
 		errorGroupStore *store.ErrorGroupStore       // Gap 2: 에러 그룹 집계
 		sloStore        *store.SLOStore              // Gap 3: SLO/SLI + Burn-Rate
+		rcaStore        *store.RCAStore              // P1: RCA 결과 조회
 	)
 
 	if cfg.DisableClickHouse {
@@ -131,6 +132,9 @@ func main() {
 			defer burnCalc.Stop()
 			slog.Info("slo burn calculator started")
 		}
+
+		// P1: RCA 결과 조회 스토어
+		rcaStore = store.NewRCAStore(chConn, cfg.ClickHouseDB)
 
 		// 공유 커넥션은 모든 store가 drain된 후 닫아야 한다.
 		// defer 실행 순서(LIFO)를 이용: store Close() → conn Close()
@@ -602,6 +606,11 @@ func main() {
 	// Gap 3: SLO/SLI + Burn-Rate Alerting
 	if sloStore != nil {
 		httpSrv.SetSLOManager(sloStore)
+	}
+
+	// P1: RCA 결과 조회
+	if rcaStore != nil {
+		httpSrv.SetRCAReports(rcaStore)
 	}
 
 	// HTTP 서버 시작

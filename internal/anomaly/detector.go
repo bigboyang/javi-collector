@@ -52,6 +52,10 @@ func DefaultConfig() Config {
 	}
 }
 
+// suppressionWindow는 동일 (service, span, anomaly_type) 조합에 대해
+// 반복 알람을 억제하는 기본 시간 윈도우다.
+const suppressionWindow = 10 * time.Minute
+
 // Detector manages the anomaly detection background goroutine.
 type Detector struct {
 	conn          driver.Conn
@@ -69,6 +73,11 @@ type Detector struct {
 	mu          sync.RWMutex
 	lastTrained time.Time
 
+	// suppressedUntil은 (service|span|type) 키가 suppressionWindow 내에
+	// 이미 삽입된 경우 중복 삽입을 방지하기 위한 맵이다.
+	// mu로 보호된다.
+	suppressedUntil map[string]time.Time
+
 	stopCh chan struct{}
 	wg     sync.WaitGroup
 }
@@ -76,17 +85,18 @@ type Detector struct {
 // NewDetector creates a new Detector.
 func NewDetector(conn driver.Conn, db string, cfg Config) *Detector {
 	return &Detector{
-		conn:          conn,
-		db:            db,
-		interval:      cfg.Interval,
-		trainInterval: cfg.TrainInterval,
-		zWarn:         cfg.ZWarn,
-		zCrit:         cfg.ZCritical,
-		ifThresh:      cfg.IFThreshold,
-		forest:        NewIsolationForest(cfg.NTrees, cfg.MaxSamples),
-		normMaxP95:    1.0,
-		normMaxRPS:    1.0,
-		stopCh:        make(chan struct{}),
+		conn:            conn,
+		db:              db,
+		interval:        cfg.Interval,
+		trainInterval:   cfg.TrainInterval,
+		zWarn:           cfg.ZWarn,
+		zCrit:           cfg.ZCritical,
+		ifThresh:        cfg.IFThreshold,
+		forest:          NewIsolationForest(cfg.NTrees, cfg.MaxSamples),
+		normMaxP95:      1.0,
+		normMaxRPS:      1.0,
+		suppressedUntil: make(map[string]time.Time),
+		stopCh:          make(chan struct{}),
 	}
 }
 
@@ -330,11 +340,35 @@ func (d *Detector) detect() {
 		return
 	}
 
-	if err := d.insertAnomalies(ctx, detected); err != nil {
-		slog.Error("anomaly: insert failed", "err", err, "count", len(detected))
+	// 억제 윈도우 필터링: suppressionWindow 내 동일 (service, span, type) 중복 삽입 방지
+	now := time.Now()
+	d.mu.Lock()
+	var toInsert []AnomalyRecord
+	for _, a := range detected {
+		key := a.ServiceName + "\x00" + a.SpanName + "\x00" + a.AnomalyType
+		if until, ok := d.suppressedUntil[key]; ok && now.Before(until) {
+			continue // 아직 억제 중
+		}
+		d.suppressedUntil[key] = now.Add(suppressionWindow)
+		toInsert = append(toInsert, a)
+	}
+	// 만료된 억제 항목 정리 (메모리 누수 방지)
+	for k, until := range d.suppressedUntil {
+		if now.After(until) {
+			delete(d.suppressedUntil, k)
+		}
+	}
+	d.mu.Unlock()
+
+	if len(toInsert) == 0 {
 		return
 	}
-	slog.Info("anomaly: recorded", "count", len(detected))
+
+	if err := d.insertAnomalies(ctx, toInsert); err != nil {
+		slog.Error("anomaly: insert failed", "err", err, "count", len(toInsert))
+		return
+	}
+	slog.Info("anomaly: recorded", "count", len(toInsert), "suppressed", len(detected)-len(toInsert))
 }
 
 // queryCurrentRED queries mv_red_1m_state for the last completed minute.
