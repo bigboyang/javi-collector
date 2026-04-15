@@ -263,3 +263,58 @@ func (p *LogProducer) PublishLog(l *model.LogData) {
 func (p *LogProducer) Close() error {
 	return p.writer.Close()
 }
+
+// ---- DeploymentProducer ----
+
+// DeploymentEvent는 CI/CD 파이프라인이 발행하는 배포 이벤트다.
+// Kafka "deploys" 토픽을 통해 javi-forecast로 전달되어
+// 이상 감지 베이스라인 리셋 및 배포 상관 분석에 사용된다.
+type DeploymentEvent struct {
+	ServiceName string         `json:"service_name"`
+	Version     string         `json:"version"`
+	Environment string         `json:"environment"`
+	DeployedBy  string         `json:"deployed_by,omitempty"`
+	TimestampMs int64          `json:"timestamp_ms"`
+	Metadata    map[string]any `json:"metadata,omitempty"`
+}
+
+// DeploymentProducer는 배포 이벤트를 Kafka deploys 토픽에 비동기로 발행한다.
+type DeploymentProducer struct {
+	writer *kafka.Writer
+}
+
+// NewDeploymentProducer는 DeploymentProducer를 생성한다.
+// ServiceName을 파티션 키로 사용해 같은 서비스의 배포 이벤트가 순서대로 처리된다.
+func NewDeploymentProducer(brokers []string, topic string) *DeploymentProducer {
+	w := &kafka.Writer{
+		Addr:         kafka.TCP(brokers...),
+		Topic:        topic,
+		Balancer:     &kafka.Hash{},
+		Async:        true,
+		MaxAttempts:  3,
+		WriteTimeout: 1 * time.Second,
+		Logger:       kafka.LoggerFunc(func(msg string, args ...interface{}) {}),
+		ErrorLogger: kafka.LoggerFunc(func(msg string, args ...interface{}) {
+			slog.Warn("kafka deployment producer error", "msg", msg)
+		}),
+	}
+	return &DeploymentProducer{writer: w}
+}
+
+// Publish는 배포 이벤트를 Kafka에 비동기로 발행한다.
+func (p *DeploymentProducer) Publish(ev DeploymentEvent) {
+	data, err := json.Marshal(ev)
+	if err != nil {
+		slog.Warn("kafka deployment producer marshal failed", "service", ev.ServiceName, "err", err)
+		return
+	}
+	_ = p.writer.WriteMessages(context.Background(), kafka.Message{
+		Key:   []byte(ev.ServiceName),
+		Value: data,
+	})
+}
+
+// Close는 Kafka writer를 닫는다.
+func (p *DeploymentProducer) Close() error {
+	return p.writer.Close()
+}

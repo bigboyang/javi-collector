@@ -203,6 +203,7 @@ type Config struct {
 	KafkaTopic                string   // span 이벤트 토픽 (KAFKA_TOPIC, 기본 "spans.error")
 	KafkaMetricsTopic         string   // metric 이벤트 토픽 (KAFKA_METRICS_TOPIC, 기본 "metrics")
 	KafkaLogsTopic            string   // log 이벤트 토픽 (KAFKA_LOGS_TOPIC, 기본 "logs")
+	KafkaDeployTopic          string   // 배포 이벤트 토픽 (KAFKA_DEPLOY_TOPIC, 기본 "deploys")
 	KafkaRAGGroup             string   // span RAG consumer group (KAFKA_RAG_GROUP, 기본 "rag-embedder")
 	KafkaForecastGroup        string   // span Forecast consumer group (KAFKA_FORECAST_GROUP, 기본 "forecast-feeder")
 	KafkaMetricForecastGroup  string   // metric Forecast consumer group (KAFKA_METRIC_FORECAST_GROUP, 기본 "metric-forecast-feeder")
@@ -293,6 +294,7 @@ func Load() (*Config, error) {
 		KafkaTopic:               envStr("KAFKA_TOPIC", "spans.error"),
 		KafkaMetricsTopic:        envStr("KAFKA_METRICS_TOPIC", "metrics"),
 		KafkaLogsTopic:           envStr("KAFKA_LOGS_TOPIC", "logs"),
+		KafkaDeployTopic:         envStr("KAFKA_DEPLOY_TOPIC", "deploys"),
 		KafkaRAGGroup:            envStr("KAFKA_RAG_GROUP", "rag-embedder"),
 		KafkaForecastGroup:       envStr("KAFKA_FORECAST_GROUP", "forecast-feeder"),
 		KafkaMetricForecastGroup: envStr("KAFKA_METRIC_FORECAST_GROUP", "metric-forecast-feeder"),

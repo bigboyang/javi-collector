@@ -25,9 +25,10 @@ type RCAReport struct {
 	Minute           time.Time `json:"minute"`
 	Severity         string    `json:"severity"`
 	ZScore           float64   `json:"z_score"`
-	CorrelatedSpans  string    `json:"correlated_spans"`  // JSON array
-	SimilarIncidents string    `json:"similar_incidents"` // JSON array
-	Hypothesis       string    `json:"hypothesis"`
+	CorrelatedSpans    string    `json:"correlated_spans"`    // JSON array
+	SimilarIncidents   string    `json:"similar_incidents"`   // JSON array
+	NearbyDeployments  string    `json:"nearby_deployments"`  // JSON array (GAP-04)
+	Hypothesis         string    `json:"hypothesis"`
 	LLMAnalysis      string    `json:"llm_analysis"`
 	Resolved         uint8     `json:"resolved"`
 	Feedback         string    `json:"feedback"`
@@ -77,7 +78,7 @@ func (s *RCAStore) QueryRCAReports(ctx context.Context, service, severity string
 
 	rows, err := s.conn.Query(ctx, fmt.Sprintf(`
 SELECT id, anomaly_id, service_name, span_name, anomaly_type, minute,
-       severity, z_score, correlated_spans, similar_incidents,
+       severity, z_score, correlated_spans, similar_incidents, nearby_deployments,
        hypothesis, llm_analysis, resolved, feedback, created_at
 FROM %s.rca_reports
 %s
@@ -93,7 +94,7 @@ LIMIT %d`, s.db, where, limit), args...)
 		var r RCAReport
 		if err := rows.Scan(
 			&r.ID, &r.AnomalyID, &r.ServiceName, &r.SpanName, &r.AnomalyType, &r.Minute,
-			&r.Severity, &r.ZScore, &r.CorrelatedSpans, &r.SimilarIncidents,
+			&r.Severity, &r.ZScore, &r.CorrelatedSpans, &r.SimilarIncidents, &r.NearbyDeployments,
 			&r.Hypothesis, &r.LLMAnalysis, &r.Resolved, &r.Feedback, &r.CreatedAt,
 		); err != nil {
 			return nil, err

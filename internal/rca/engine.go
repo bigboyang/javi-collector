@@ -159,8 +159,14 @@ func (e *Engine) analyze(ctx context.Context, a AnomalyRow) (RCAReport, error) {
 		slog.Warn("rca: topology fetch failed", "err", err)
 	}
 
-	// 4. 규칙 기반 가설 생성 (토폴로지 컨텍스트 포함)
-	hypo := buildHypothesis(a, spans, similar, neighbors)
+	// 4. GAP-04: 이상 발생 ±5분 이내 배포 이벤트 조회
+	deployments, err := e.fetchNearbyDeployments(ctx, a)
+	if err != nil {
+		slog.Warn("rca: deployment events fetch failed", "err", err)
+	}
+
+	// 5. 규칙 기반 가설 생성 (토폴로지 + 배포 이벤트 컨텍스트 포함)
+	hypo := buildHypothesis(a, spans, similar, neighbors, deployments)
 
 	// 4. LLM 기반 RCA 분석 (Generator가 설정된 경우)
 	var llmAnalysis string
@@ -189,6 +195,7 @@ func (e *Engine) analyze(ctx context.Context, a AnomalyRow) (RCAReport, error) {
 		CorrelatedSpans:   spans,
 		SimilarIncidents:  similar,
 		TopologyNeighbors: neighbors,
+		NearbyDeployments: deployments,
 		Hypothesis:        hypo,
 		LLMAnalysis:       llmAnalysis,
 		CreatedAt:         time.Now(),
@@ -346,8 +353,39 @@ LIMIT 10`,
 	return out, rows.Err()
 }
 
+// fetchNearbyDeployments는 이상 발생 시간 ±5분 이내 배포 이벤트를 조회한다.
+// GAP-04: Deployment Event Correlation — 배포가 이상의 원인인지 판단하는 핵심 신호.
+func (e *Engine) fetchNearbyDeployments(ctx context.Context, a AnomalyRow) ([]NearbyDeployment, error) {
+	const window = 5 * time.Minute
+	from := a.Minute.Add(-window)
+	to := a.Minute.Add(window)
+
+	rows, err := e.conn.Query(ctx, fmt.Sprintf(`
+SELECT id, service_name, version, environment, deployed_by, description, deployed_at
+FROM %s.deployment_events
+WHERE service_name = ?
+  AND deployed_at >= ? AND deployed_at <= ?
+ORDER BY deployed_at DESC
+LIMIT 5`, e.db), a.ServiceName, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []NearbyDeployment
+	for rows.Next() {
+		var d NearbyDeployment
+		if err := rows.Scan(&d.ID, &d.ServiceName, &d.Version, &d.Environment,
+			&d.DeployedBy, &d.Description, &d.DeployedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
 // buildHypothesis는 anomaly 유형과 연관 데이터를 기반으로 가설 문자열을 생성한다.
-func buildHypothesis(a AnomalyRow, spans []CorrelatedSpan, similar []SimilarIncident, neighbors []TopologyNeighbor) string {
+func buildHypothesis(a AnomalyRow, spans []CorrelatedSpan, similar []SimilarIncident, neighbors []TopologyNeighbor, deployments []NearbyDeployment) string {
 	var sb strings.Builder
 
 	switch a.AnomalyType {
@@ -395,6 +433,20 @@ func buildHypothesis(a AnomalyRow, spans []CorrelatedSpan, similar []SimilarInci
 		}
 	}
 
+	// GAP-04: 배포 이벤트 상관관계 — 이상 발생 ±5분 이내 배포가 있으면 강조
+	for _, d := range deployments {
+		diffMin := d.DeployedAt.Sub(a.Minute).Minutes()
+		direction := "전"
+		if diffMin > 0 {
+			direction = "후"
+		}
+		if diffMin < 0 {
+			diffMin = -diffMin
+		}
+		fmt.Fprintf(&sb, " [배포 감지] %s v%s (%s, by %s) — 이상 발생 %.0f분 %s.",
+			d.ServiceName, d.Version, d.Environment, d.DeployedBy, diffMin, direction)
+	}
+
 	return sb.String()
 }
 
@@ -403,7 +455,8 @@ func (e *Engine) insertReports(ctx context.Context, reports []RCAReport) error {
 	batch, err := e.conn.PrepareBatch(ctx, fmt.Sprintf(
 		`INSERT INTO %s.rca_reports
 		 (id, anomaly_id, service_name, span_name, anomaly_type, minute,
-		  severity, z_score, correlated_spans, similar_incidents, hypothesis, llm_analysis, created_at)`,
+		  severity, z_score, correlated_spans, similar_incidents,
+		  nearby_deployments, hypothesis, llm_analysis, created_at)`,
 		e.db))
 	if err != nil {
 		return err
@@ -412,10 +465,12 @@ func (e *Engine) insertReports(ctx context.Context, reports []RCAReport) error {
 	for _, r := range reports {
 		spansJSON, _ := json.Marshal(r.CorrelatedSpans)
 		similarJSON, _ := json.Marshal(r.SimilarIncidents)
+		deploymentsJSON, _ := json.Marshal(r.NearbyDeployments)
 		if err := batch.Append(
 			r.ID, r.AnomalyID, r.ServiceName, r.SpanName, r.AnomalyType, r.Minute,
 			r.Severity, r.ZScore,
 			string(spansJSON), string(similarJSON),
+			string(deploymentsJSON),
 			r.Hypothesis, r.LLMAnalysis, r.CreatedAt,
 		); err != nil {
 			return err

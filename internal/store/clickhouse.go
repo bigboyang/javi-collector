@@ -855,6 +855,195 @@ ORDER BY minute ASC`, s.cfg.Database),
 	}, nil
 }
 
+// ---- GAP-01: Trace Waterfall / Critical Path ----
+
+// waterfallNode는 Waterfall 트리 빌드에 사용되는 내부 타입이다.
+type waterfallNode struct {
+	spanID         string
+	parentSpanID   string
+	serviceName    string
+	spanName       string
+	kind           int32
+	startMs        int64
+	durationMs     int64
+	statusCode     int32
+	exceptionType  string
+	httpStatusCode int32
+	children       []*waterfallNode
+	// 계산 필드
+	onCriticalPath bool
+	maxLeafEndMs   int64 // 서브트리의 최대 end 시간 (criticalPath 계산용)
+	visited        bool  // 사이클 감지용
+}
+
+// QueryTraceWaterfall은 trace_id의 스팬을 폭포수 뷰 + 임계 경로 정보로 반환한다.
+// GAP-01: Trace Waterfall / Critical Path — Datadog의 Flame Graph / Waterfall에 해당.
+//
+// 반환 구조:
+//
+//	{
+//	  "summary": { trace_id, total_duration_ms, critical_path_ms, span_count, service_count, root_span_count },
+//	  "spans":   [ { span_id, parent_span_id, service_name, span_name, kind, start_ms, duration_ms,
+//	                 offset_ms, depth, on_critical_path, status_code, exception_type, http_status_code } ]
+//	}
+func (s *ClickHouseTraceStore) QueryTraceWaterfall(ctx context.Context, traceID string) (map[string]any, error) {
+	rows, err := s.conn.Query(ctx, fmt.Sprintf(`
+SELECT
+    span_id, parent_span_id, service_name, span_name, kind,
+    intDiv(start_time_nano, 1000000)                    AS start_ms,
+    intDiv(end_time_nano - start_time_nano, 1000000)    AS duration_ms,
+    status_code, exception_type, exception_message, http_status_code
+FROM %s.spans
+WHERE trace_id = ?
+ORDER BY start_ms ASC
+LIMIT 500`, s.cfg.Database), traceID)
+	if err != nil {
+		return nil, fmt.Errorf("query waterfall spans: %w", err)
+	}
+	defer rows.Close()
+
+	var nodes []*waterfallNode
+	for rows.Next() {
+		var n waterfallNode
+		var excMsg string
+		if err := rows.Scan(
+			&n.spanID, &n.parentSpanID, &n.serviceName, &n.spanName, &n.kind,
+			&n.startMs, &n.durationMs,
+			&n.statusCode, &n.exceptionType, &excMsg, &n.httpStatusCode,
+		); err != nil {
+			return nil, fmt.Errorf("scan waterfall span: %w", err)
+		}
+		nodes = append(nodes, &n)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(nodes) == 0 {
+		return nil, nil // handler에서 404 처리
+	}
+
+	// Phase 1: 인덱스 + 트레이스 시작 시간 탐색
+	byID := make(map[string]*waterfallNode, len(nodes))
+	traceStartMs := nodes[0].startMs
+	for _, n := range nodes {
+		byID[n.spanID] = n
+		if n.startMs < traceStartMs {
+			traceStartMs = n.startMs
+		}
+	}
+
+	// Phase 2: 부모-자식 연결 + 루트(orphan 포함) 탐색
+	services := make(map[string]struct{})
+	var roots []*waterfallNode
+	for _, n := range nodes {
+		services[n.serviceName] = struct{}{}
+		if n.parentSpanID == "" || byID[n.parentSpanID] == nil {
+			roots = append(roots, n)
+		} else {
+			byID[n.parentSpanID].children = append(byID[n.parentSpanID].children, n)
+		}
+	}
+
+	// Phase 3: maxLeafEndMs 계산 (포스트-오더 DFS, 사이클 방어)
+	var computeMax func(n *waterfallNode) int64
+	computeMax = func(n *waterfallNode) int64 {
+		if n.visited {
+			return n.startMs + n.durationMs // 사이클 감지: 현재 end 반환
+		}
+		n.visited = true
+		maxEnd := n.startMs + n.durationMs
+		for _, child := range n.children {
+			if childMax := computeMax(child); childMax > maxEnd {
+				maxEnd = childMax
+			}
+		}
+		n.maxLeafEndMs = maxEnd
+		return maxEnd
+	}
+	for _, r := range roots {
+		computeMax(r)
+	}
+
+	// Phase 4: 임계 경로 마킹 (글로벌 최대 end를 가진 루트부터 하향)
+	var globalMax int64
+	for _, r := range roots {
+		if r.maxLeafEndMs > globalMax {
+			globalMax = r.maxLeafEndMs
+		}
+	}
+	var markCritical func(n *waterfallNode, targetEnd int64)
+	markCritical = func(n *waterfallNode, targetEnd int64) {
+		n.onCriticalPath = true
+		for _, child := range n.children {
+			if child.maxLeafEndMs == targetEnd {
+				markCritical(child, targetEnd)
+				break
+			}
+		}
+	}
+	for _, r := range roots {
+		if r.maxLeafEndMs == globalMax {
+			markCritical(r, globalMax)
+			break
+		}
+	}
+
+	// Phase 5: DFS 평탄화 + depth/offset 할당 (자식은 startMs 오름차순)
+	var result []map[string]any
+	var flatten func(n *waterfallNode, depth int)
+	flatten = func(n *waterfallNode, depth int) {
+		// 자식을 startMs 기준으로 삽입 정렬 (일반적으로 span 수가 적어 충분)
+		for i := 1; i < len(n.children); i++ {
+			for j := i; j > 0 && n.children[j].startMs < n.children[j-1].startMs; j-- {
+				n.children[j], n.children[j-1] = n.children[j-1], n.children[j]
+			}
+		}
+		offsetMs := n.startMs - traceStartMs
+		if offsetMs < 0 {
+			offsetMs = 0 // 클럭 스큐 방어
+		}
+		result = append(result, map[string]any{
+			"span_id":          n.spanID,
+			"parent_span_id":   n.parentSpanID,
+			"service_name":     n.serviceName,
+			"span_name":        n.spanName,
+			"kind":             n.kind,
+			"start_ms":         n.startMs,
+			"duration_ms":      n.durationMs,
+			"offset_ms":        offsetMs,
+			"depth":            depth,
+			"on_critical_path": n.onCriticalPath,
+			"status_code":      n.statusCode,
+			"exception_type":   n.exceptionType,
+			"http_status_code": n.httpStatusCode,
+		})
+		for _, child := range n.children {
+			flatten(child, depth+1)
+		}
+	}
+	// 루트도 startMs 기준으로 정렬
+	for i := 1; i < len(roots); i++ {
+		for j := i; j > 0 && roots[j].startMs < roots[j-1].startMs; j-- {
+			roots[j], roots[j-1] = roots[j-1], roots[j]
+		}
+	}
+	for _, r := range roots {
+		flatten(r, 0)
+	}
+
+	return map[string]any{
+		"summary": map[string]any{
+			"trace_id":          traceID,
+			"total_duration_ms": globalMax - traceStartMs,
+			"critical_path_ms":  globalMax - traceStartMs,
+			"span_count":        len(nodes),
+			"service_count":     len(services),
+			"root_span_count":   len(roots),
+		},
+		"spans": result,
+	}, nil
+}
+
 // QueryRaw는 화이트리스트를 통과한 SELECT 쿼리를 ClickHouse에 직접 실행하고
 // []map[string]any 형태로 결과를 반환한다.
 // 컬럼 이름과 값은 ClickHouse driver의 타입을 그대로 사용한다.
@@ -2397,6 +2586,12 @@ TTL dt + INTERVAL 90 DAY;
 	)); err != nil {
 		slog.Warn("alter rca_reports feedback skipped", "err", err)
 	}
+	// GAP-04: 배포 이벤트 상관관계 컬럼 추가 (기존 테이블 대상 마이그레이션)
+	if err := conn.Exec(ctx, fmt.Sprintf(
+		`ALTER TABLE %s.rca_reports ADD COLUMN IF NOT EXISTS nearby_deployments String DEFAULT ''`, db,
+	)); err != nil {
+		slog.Warn("alter rca_reports nearby_deployments skipped", "err", err)
+	}
 
 	if err := conn.Exec(ctx, fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s.rca_reports (
@@ -2408,12 +2603,13 @@ CREATE TABLE IF NOT EXISTS %s.rca_reports (
     minute            DateTime,
     severity          LowCardinality(String),
     z_score           Float64,
-    correlated_spans  String,  -- JSON array of CorrelatedSpan
-    similar_incidents String,  -- JSON array of SimilarIncident
-    hypothesis        String,
-    llm_analysis      String DEFAULT '',  -- LLM 기반 RCA 분석 텍스트
-    resolved          UInt8  DEFAULT 0,   -- 0: open, 1: resolved
-    feedback          String DEFAULT '',  -- 운영자 피드백 텍스트
+    correlated_spans    String,            -- JSON array of CorrelatedSpan
+    similar_incidents   String,            -- JSON array of SimilarIncident
+    nearby_deployments  String DEFAULT '', -- JSON array of NearbyDeployment (GAP-04)
+    hypothesis          String,
+    llm_analysis        String DEFAULT '', -- LLM 기반 RCA 분석 텍스트
+    resolved            UInt8  DEFAULT 0,  -- 0: open, 1: resolved
+    feedback            String DEFAULT '', -- 운영자 피드백 텍스트
     created_at        DateTime DEFAULT now(),
     dt                Date DEFAULT toDate(minute)
 ) ENGINE = MergeTree()

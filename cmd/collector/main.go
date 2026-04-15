@@ -46,10 +46,11 @@ func main() {
 		metricStore     store.MetricStore
 		logStore        store.LogStore
 		chConn          driver.Conn                  // ClickHouse 공유 커넥션 (RCA Engine 등에서 재사용)
-		catalogStore    *store.ServiceCatalogStore   // Gap 4: 서비스 카탈로그
-		errorGroupStore *store.ErrorGroupStore       // Gap 2: 에러 그룹 집계
-		sloStore        *store.SLOStore              // Gap 3: SLO/SLI + Burn-Rate
-		rcaStore        *store.RCAStore              // P1: RCA 결과 조회
+		catalogStore         *store.ServiceCatalogStore    // Gap 4: 서비스 카탈로그
+		errorGroupStore      *store.ErrorGroupStore        // Gap 2: 에러 그룹 집계
+		sloStore             *store.SLOStore               // Gap 3: SLO/SLI + Burn-Rate
+		rcaStore             *store.RCAStore               // P1: RCA 결과 조회
+		deploymentEventStore *store.DeploymentEventStore   // GAP-04: 배포 이벤트 상관 분석
 	)
 
 	if cfg.DisableClickHouse {
@@ -135,6 +136,13 @@ func main() {
 
 		// P1: RCA 결과 조회 스토어
 		rcaStore = store.NewRCAStore(chConn, cfg.ClickHouseDB)
+
+		// GAP-04: 배포 이벤트 상관 분석 스토어
+		if ds, derr := store.NewDeploymentEventStore(chConn, cfg.ClickHouseDB); derr != nil {
+			slog.Warn("deployment event store init failed (continuing without deployment correlation)", "err", derr)
+		} else {
+			deploymentEventStore = ds
+		}
 
 		// 공유 커넥션은 모든 store가 drain된 후 닫아야 한다.
 		// defer 실행 순서(LIFO)를 이용: store Close() → conn Close()
@@ -396,6 +404,7 @@ func main() {
 	var spanPub ingester.SpanPublisher
 	var metricPub ingester.MetricPublisher
 	var logPub ingester.LogPublisher
+	var deployPub *jkafka.DeploymentProducer
 
 	// Direct Forecast Forwarder: KAFKA_ENABLED=false이고 FORECAST_ENDPOINT가 설정된 경우 활성화.
 	// span/metric을 배치로 묶어 javi-forecast HTTP 엔드포인트에 직접 전송한다.
@@ -434,6 +443,11 @@ func main() {
 		logProducer := jkafka.NewLogProducer(cfg.KafkaBrokers, cfg.KafkaLogsTopic)
 		logPub = logProducer
 		slog.Info("kafka log producer started", "topic", cfg.KafkaLogsTopic)
+
+		// Deployment producer
+		deployPub = jkafka.NewDeploymentProducer(cfg.KafkaBrokers, cfg.KafkaDeployTopic)
+		defer deployPub.Close() //nolint:errcheck
+		slog.Info("kafka deployment producer started", "topic", cfg.KafkaDeployTopic)
 
 		// Span RAG Consumer: Kafka → EmbedPipeline → Qdrant
 		if embedPipeline != nil {
@@ -603,6 +617,11 @@ func main() {
 		httpSrv.SetTraceContext(tc)
 	}
 
+	// GAP-01: Trace Waterfall / Critical Path — ClickHouseTraceStore가 구현체를 제공한다.
+	if tw, ok := traceStore.(server.TraceWaterfallQuerier); ok {
+		httpSrv.SetTraceWaterfall(tw)
+	}
+
 	// Gap 3: SLO/SLI + Burn-Rate Alerting
 	if sloStore != nil {
 		httpSrv.SetSLOManager(sloStore)
@@ -611,6 +630,16 @@ func main() {
 	// P1: RCA 결과 조회
 	if rcaStore != nil {
 		httpSrv.SetRCAReports(rcaStore)
+	}
+
+	// GAP-04: 배포 이벤트 ClickHouse 저장소 주입
+	if deploymentEventStore != nil {
+		httpSrv.SetDeploymentStore(deploymentEventStore)
+	}
+
+	// 배포 이벤트 프로듀서 주입
+	if deployPub != nil {
+		httpSrv.SetDeployProducer(deployPub)
 	}
 
 	// HTTP 서버 시작

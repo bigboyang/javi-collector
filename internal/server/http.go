@@ -38,6 +38,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -53,6 +55,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/kkc/javi-collector/internal/ingester"
+	jkafka "github.com/kkc/javi-collector/internal/kafka"
 	"github.com/kkc/javi-collector/internal/rag"
 	"github.com/kkc/javi-collector/internal/sampling"
 	"github.com/kkc/javi-collector/internal/store"
@@ -141,6 +144,18 @@ type RCAReportQuerier interface {
 	UpdateRCAFeedback(ctx context.Context, id string, resolved uint8, feedback string) error
 }
 
+// DeploymentEventWriter는 배포 이벤트 기록을 지원하는 인터페이스다.
+// GAP-04: Deployment Event Correlation — CI/CD 파이프라인에서 POST /api/events/deployment 호출.
+type DeploymentEventWriter interface {
+	InsertEvent(ctx context.Context, e store.DeploymentEvent) error
+}
+
+// TraceWaterfallQuerier는 trace_id 기반 폭포수 뷰 + 임계 경로 분석을 지원하는 인터페이스다.
+// GAP-01: Trace Waterfall / Critical Path — Datadog Flame Graph에 해당.
+type TraceWaterfallQuerier interface {
+	QueryTraceWaterfall(ctx context.Context, traceID string) (map[string]any, error)
+}
+
 // HistogramMVQuerier는 mv_histogram_1m_state 집계 뷰를 조회하는 인터페이스다.
 // ClickHouseMetricStore가 구현한다.
 type HistogramMVQuerier interface {
@@ -189,6 +204,23 @@ type HTTPServer struct {
 	// rcaReports는 RCA 결과 조회와 피드백 업데이트를 담당한다.
 	// nil이면 /api/rca/* 가 501을 반환한다.
 	rcaReports RCAReportQuerier
+
+	// deployProducer는 CI/CD 배포 이벤트를 Kafka deploys 토픽에 발행한다.
+	// nil이면 Kafka 발행을 건너뛴다.
+	deployProducer DeploymentPublisher
+
+	// deploymentStore는 배포 이벤트를 ClickHouse에 직접 기록한다.
+	// GAP-04: nil이면 ClickHouse 저장을 건너뛴다.
+	deploymentStore DeploymentEventWriter
+
+	// traceWaterfall은 trace_id 기반 폭포수 뷰 + 임계 경로 분석을 담당한다.
+	// GAP-01: nil이면 /api/collector/trace-waterfall 가 501을 반환한다.
+	traceWaterfall TraceWaterfallQuerier
+}
+
+// DeploymentPublisher는 배포 이벤트 발행 인터페이스다.
+type DeploymentPublisher interface {
+	Publish(ev jkafka.DeploymentEvent)
 }
 
 func NewHTTPServer(addr string, ing *ingester.Ingester,
@@ -208,6 +240,8 @@ func NewHTTPServer(addr string, ing *ingester.Ingester,
 	mux.HandleFunc("/v1/traces", s.handleTraces)
 	mux.HandleFunc("/v1/metrics", s.handleMetrics)
 	mux.HandleFunc("/v1/logs", s.handleLogs)
+	// CI/CD 배포 이벤트 수신 엔드포인트
+	mux.HandleFunc("/v1/events/deploy", s.handleDeployEvent)
 
 	// REST 조회 엔드포인트
 	mux.HandleFunc("/api/collector/traces", s.queryTraces)
@@ -233,6 +267,8 @@ func NewHTTPServer(addr string, ing *ingester.Ingester,
 	mux.HandleFunc("/api/collector/error-groups", s.queryErrorGroups)
 	// Gap 1: Correlated Signal Navigation — trace_id 기반 spans·logs·메트릭 통합 조회
 	mux.HandleFunc("/api/collector/trace-context", s.queryTraceContext)
+	// GAP-01: Trace Waterfall / Critical Path — 폭포수 뷰 + 임계 경로 분석
+	mux.HandleFunc("/api/collector/trace-waterfall", s.queryTraceWaterfall)
 	// 서비스 카탈로그 (팀 소유권, 운영 메타데이터)
 	mux.HandleFunc("/api/catalog/services", s.listCatalogServices)
 	mux.HandleFunc("/api/catalog/service", s.catalogService)
@@ -300,6 +336,96 @@ func (s *HTTPServer) SetSLOManager(sm SLOManager) {
 // nil이면 /api/rca/* 가 501을 반환한다.
 func (s *HTTPServer) SetRCAReports(rq RCAReportQuerier) {
 	s.rcaReports = rq
+}
+
+// SetDeployProducer는 배포 이벤트 Kafka 프로듀서를 등록한다.
+func (s *HTTPServer) SetDeployProducer(p DeploymentPublisher) {
+	s.deployProducer = p
+}
+
+// SetDeploymentStore는 배포 이벤트 ClickHouse 저장소를 등록한다.
+// GAP-04: RCA Engine이 이상 발생 시간대 ±5분 배포 이벤트를 가설에 포함시킨다.
+func (s *HTTPServer) SetDeploymentStore(ds DeploymentEventWriter) {
+	s.deploymentStore = ds
+}
+
+// SetTraceWaterfall은 Trace Waterfall / Critical Path 조회기를 등록한다.
+// GAP-01: nil이면 /api/collector/trace-waterfall 가 501을 반환한다.
+func (s *HTTPServer) SetTraceWaterfall(tw TraceWaterfallQuerier) {
+	s.traceWaterfall = tw
+}
+
+// handleDeployEvent는 CI/CD 파이프라인이 전송하는 배포 이벤트를 수신한다.
+//
+//	POST /v1/events/deploy
+//	body: {"service_name":"...","version":"...","environment":"...","deployed_by":"...","timestamp_ms":0,"metadata":{}}
+func (s *HTTPServer) handleDeployEvent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.deployProducer == nil && s.deploymentStore == nil {
+		w.Header().Set("Content-Type", jsonContentType)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "deployment events unavailable (KAFKA_ENABLED=false and ClickHouse disabled)"})
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		http.Error(w, "read body", http.StatusBadRequest)
+		return
+	}
+
+	var ev jkafka.DeploymentEvent
+	if err := json.Unmarshal(body, &ev); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if ev.ServiceName == "" || ev.Version == "" {
+		http.Error(w, "service_name and version are required", http.StatusBadRequest)
+		return
+	}
+	if ev.TimestampMs == 0 {
+		ev.TimestampMs = time.Now().UnixMilli()
+	}
+
+	// Kafka 발행 (KAFKA_ENABLED=true 시)
+	if s.deployProducer != nil {
+		s.deployProducer.Publish(ev)
+	}
+
+	// GAP-04: ClickHouse 직접 기록 (RCA Engine 상관 분석용)
+	if s.deploymentStore != nil {
+		storeEv := store.DeploymentEvent{
+			ID:          deploymentEventID(),
+			ServiceName: ev.ServiceName,
+			Version:     ev.Version,
+			Environment: ev.Environment,
+			DeployedBy:  ev.DeployedBy,
+			DeployedAt:  time.UnixMilli(ev.TimestampMs),
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		if err := s.deploymentStore.InsertEvent(ctx, storeEv); err != nil {
+			slog.Warn("deployment event clickhouse insert failed", "service", ev.ServiceName, "err", err)
+		}
+	}
+
+	slog.Info("deployment event received", "service", ev.ServiceName, "version", ev.Version, "env", ev.Environment)
+
+	w.Header().Set("Content-Type", jsonContentType)
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
+}
+
+// deploymentEventID는 배포 이벤트용 랜덤 16진수 ID를 생성한다.
+func deploymentEventID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // handleSearch는 자연어 질의를 RAG 벡터 검색으로 처리한다.
@@ -1124,6 +1250,40 @@ func (s *HTTPServer) queryTraceContext(w http.ResponseWriter, r *http.Request) {
 	result, err := s.traceContext.QueryTraceContext(r.Context(), traceID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, result)
+}
+
+// queryTraceWaterfall은 trace_id에 해당하는 스팬을 폭포수 뷰 + 임계 경로 정보로 반환한다.
+// GAP-01: Trace Waterfall / Critical Path
+//
+//	GET /api/collector/trace-waterfall?trace_id=<id>
+func (s *HTTPServer) queryTraceWaterfall(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	setCORSHeaders(w)
+
+	if s.traceWaterfall == nil {
+		http.Error(w, "trace waterfall not available (requires ClickHouse)", http.StatusNotImplemented)
+		return
+	}
+
+	traceID := strings.TrimSpace(r.URL.Query().Get("trace_id"))
+	if traceID == "" {
+		http.Error(w, "trace_id parameter required", http.StatusBadRequest)
+		return
+	}
+
+	result, err := s.traceWaterfall.QueryTraceWaterfall(r.Context(), traceID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if result == nil {
+		http.Error(w, "trace not found", http.StatusNotFound)
 		return
 	}
 	writeJSON(w, result)

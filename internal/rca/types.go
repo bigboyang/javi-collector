@@ -2,6 +2,18 @@ package rca
 
 import "time"
 
+// NearbyDeployment는 이상 발생 시간 ±5분 이내에 발생한 배포 이벤트 요약.
+// GAP-04: Deployment Event Correlation
+type NearbyDeployment struct {
+	ID          string    `json:"id"`
+	ServiceName string    `json:"service_name"`
+	Version     string    `json:"version"`
+	Environment string    `json:"environment"`
+	DeployedBy  string    `json:"deployed_by"`
+	Description string    `json:"description"`
+	DeployedAt  time.Time `json:"deployed_at"`
+}
+
 // TopologyNeighbor는 서비스 토폴로지에서 직접 연결된 인접 서비스를 나타낸다.
 type TopologyNeighbor struct {
 	ServiceName string  `json:"service_name"`
@@ -56,6 +68,7 @@ type RCAReport struct {
 	CorrelatedSpans   []CorrelatedSpan   // 최대 5개
 	SimilarIncidents  []SimilarIncident  // 최대 3개
 	TopologyNeighbors []TopologyNeighbor // Causal Chain: 인접 서비스 컨텍스트
+	NearbyDeployments []NearbyDeployment // GAP-04: 이상 발생 ±5분 이내 배포 이벤트
 	Hypothesis        string             // 규칙 기반 가설 문자열
 	LLMAnalysis       string             // LLM 기반 RCA 분석 (EMBED_ENABLED+LLM_ENABLED 시)
 	CreatedAt         time.Time
