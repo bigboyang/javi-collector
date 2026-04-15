@@ -156,6 +156,16 @@ type TraceWaterfallQuerier interface {
 	QueryTraceWaterfall(ctx context.Context, traceID string) (map[string]any, error)
 }
 
+// AlertRouteManager는 Alert Routing & Escalation 규칙 관리와 이벤트 ack를 지원한다.
+// GAP-05: Alert Routing & Escalation — *store.AlertRouteStore 가 구현한다.
+type AlertRouteManager interface {
+	UpsertRoute(ctx context.Context, r *store.AlertRoute) error
+	DeleteRoute(ctx context.Context, id string) error
+	ListRoutes(ctx context.Context) ([]store.AlertRoute, error)
+	ListAlertHistory(ctx context.Context, service string, limit int) ([]store.AlertEvent, error)
+	AckEvent(eventID string)
+}
+
 // HistogramMVQuerier는 mv_histogram_1m_state 집계 뷰를 조회하는 인터페이스다.
 // ClickHouseMetricStore가 구현한다.
 type HistogramMVQuerier interface {
@@ -216,6 +226,10 @@ type HTTPServer struct {
 	// traceWaterfall은 trace_id 기반 폭포수 뷰 + 임계 경로 분석을 담당한다.
 	// GAP-01: nil이면 /api/collector/trace-waterfall 가 501을 반환한다.
 	traceWaterfall TraceWaterfallQuerier
+
+	// alertRoutes는 Alert Routing & Escalation 규칙 관리를 담당한다.
+	// GAP-05: nil이면 /api/alerts/* 가 501을 반환한다.
+	alertRoutes AlertRouteManager
 }
 
 // DeploymentPublisher는 배포 이벤트 발행 인터페이스다.
@@ -278,6 +292,11 @@ func NewHTTPServer(addr string, ing *ingester.Ingester,
 	// P1: RCA 결과 조회 + 피드백
 	mux.HandleFunc("/api/rca/reports", s.queryRCAReports)
 	mux.HandleFunc("/api/rca/feedback", s.updateRCAFeedback)
+
+	// GAP-05: Alert Routing & Escalation
+	mux.HandleFunc("/api/alerts/routes", s.alertRoutes_)
+	mux.HandleFunc("/api/alerts/history", s.alertHistory)
+	mux.HandleFunc("/api/alerts/ack", s.alertAck)
 
 	// 운영 엔드포인트
 	// /healthz: liveness probe — 프로세스가 살아있으면 200
@@ -353,6 +372,164 @@ func (s *HTTPServer) SetDeploymentStore(ds DeploymentEventWriter) {
 // GAP-01: nil이면 /api/collector/trace-waterfall 가 501을 반환한다.
 func (s *HTTPServer) SetTraceWaterfall(tw TraceWaterfallQuerier) {
 	s.traceWaterfall = tw
+}
+
+// SetAlertRoutes는 Alert Routing & Escalation 관리자를 등록한다.
+// GAP-05: nil이면 /api/alerts/* 가 501을 반환한다.
+func (s *HTTPServer) SetAlertRoutes(arm AlertRouteManager) {
+	s.alertRoutes = arm
+}
+
+// alertRoutes_ 는 /api/alerts/routes 엔드포인트를 처리한다.
+//
+//	GET  /api/alerts/routes              — 활성 라우팅 규칙 목록
+//	POST /api/alerts/routes              — 라우팅 규칙 생성/업데이트
+//	DELETE /api/alerts/routes?id=<id>    — 라우팅 규칙 삭제 (소프트)
+func (s *HTTPServer) alertRoutes_(w http.ResponseWriter, r *http.Request) {
+	if s.alertRoutes == nil {
+		w.Header().Set("Content-Type", jsonContentType)
+		w.WriteHeader(http.StatusNotImplemented)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "alert routing unavailable (ClickHouse disabled)"})
+		return
+	}
+
+	ctx := r.Context()
+	w.Header().Set("Content-Type", jsonContentType)
+
+	switch r.Method {
+	case http.MethodGet:
+		routes, err := s.alertRoutes.ListRoutes(ctx)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		if routes == nil {
+			routes = []store.AlertRoute{}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"routes": routes, "count": len(routes)})
+
+	case http.MethodPost:
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			http.Error(w, "read body", http.StatusBadRequest)
+			return
+		}
+		var route store.AlertRoute
+		if err := json.Unmarshal(body, &route); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON: " + err.Error()})
+			return
+		}
+		if route.Name == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "name is required"})
+			return
+		}
+		if !route.HasDestination() {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "at least one of slack_url or webhook_url is required"})
+			return
+		}
+		if err := s.alertRoutes.UpsertRoute(ctx, &route); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "id": route.ID})
+
+	case http.MethodDelete:
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "id query parameter is required"})
+			return
+		}
+		if err := s.alertRoutes.DeleteRoute(ctx, id); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// alertHistory는 최근 알림 이벤트 이력을 반환한다.
+//
+//	GET /api/alerts/history?service=<svc>&limit=<n>
+func (s *HTTPServer) alertHistory(w http.ResponseWriter, r *http.Request) {
+	if s.alertRoutes == nil {
+		w.Header().Set("Content-Type", jsonContentType)
+		w.WriteHeader(http.StatusNotImplemented)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "alert routing unavailable"})
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	q := r.URL.Query()
+	service := q.Get("service")
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	if limit <= 0 {
+		limit = 100
+	}
+
+	events, err := s.alertRoutes.ListAlertHistory(r.Context(), service, limit)
+	if err != nil {
+		w.Header().Set("Content-Type", jsonContentType)
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	if events == nil {
+		events = []store.AlertEvent{}
+	}
+
+	w.Header().Set("Content-Type", jsonContentType)
+	_ = json.NewEncoder(w).Encode(map[string]any{"events": events, "count": len(events)})
+}
+
+// alertAck는 발송된 알림 이벤트를 ack 처리해 에스컬레이션을 억제한다.
+//
+//	POST /api/alerts/ack
+//	body: {"id": "<event_id>"}
+func (s *HTTPServer) alertAck(w http.ResponseWriter, r *http.Request) {
+	if s.alertRoutes == nil {
+		w.Header().Set("Content-Type", jsonContentType)
+		w.WriteHeader(http.StatusNotImplemented)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "alert routing unavailable"})
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 4096))
+	if err != nil {
+		http.Error(w, "read body", http.StatusBadRequest)
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil || req.ID == "" {
+		w.Header().Set("Content-Type", jsonContentType)
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "id is required"})
+		return
+	}
+
+	s.alertRoutes.AckEvent(req.ID)
+
+	w.Header().Set("Content-Type", jsonContentType)
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "acked": req.ID})
 }
 
 // handleDeployEvent는 CI/CD 파이프라인이 전송하는 배포 이벤트를 수신한다.

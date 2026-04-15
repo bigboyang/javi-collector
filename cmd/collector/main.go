@@ -302,9 +302,22 @@ func main() {
 		}
 	}
 
+	// GAP-05: Alert Routing & Escalation
+	// alert_routes / alert_events 테이블을 관리하는 저장소를 초기화한다.
+	var alertRouteStore *store.AlertRouteStore
+	if !cfg.DisableClickHouse {
+		if ars, err := store.NewAlertRouteStore(chConn, cfg.ClickHouseDB); err != nil {
+			slog.Warn("alert route store init failed (continuing without alert routing)", "err", err)
+		} else {
+			alertRouteStore = ars
+			slog.Info("alert route store initialized")
+		}
+	}
+
 	// AIOps Alert: Webhook / Slack Push Alerter
 	// anomalies 테이블을 폴링해 신규 이상 이벤트를 외부로 Push한다.
-	// ALERT_WEBHOOK_URL 또는 ALERT_SLACK_WEBHOOK_URL 중 하나라도 설정하면 활성화된다.
+	// ALERT_WEBHOOK_URL 또는 ALERT_SLACK_WEBHOOK_URL 중 하나라도 설정하거나
+	// alertRouteStore가 초기화되면 활성화된다.
 	if !cfg.DisableClickHouse {
 		alertCfg := alerter.Config{
 			WebhookURL:      cfg.AlertWebhookURL,
@@ -313,6 +326,9 @@ func main() {
 			MinSeverity:     cfg.AlertMinSeverity,
 		}
 		al := alerter.New(chConn, cfg.ClickHouseDB, alertCfg)
+		if alertRouteStore != nil {
+			al.SetRouteStore(alertRouteStore)
+		}
 		if al.Enabled() {
 			al.Start()
 			defer al.Stop()
@@ -321,6 +337,7 @@ func main() {
 				"min_severity", cfg.AlertMinSeverity,
 				"slack", cfg.AlertSlackWebhookURL != "",
 				"webhook", cfg.AlertWebhookURL != "",
+				"routing", alertRouteStore != nil,
 			)
 		}
 	}
@@ -635,6 +652,11 @@ func main() {
 	// GAP-04: 배포 이벤트 ClickHouse 저장소 주입
 	if deploymentEventStore != nil {
 		httpSrv.SetDeploymentStore(deploymentEventStore)
+	}
+
+	// GAP-05: Alert Routing & Escalation
+	if alertRouteStore != nil {
+		httpSrv.SetAlertRoutes(alertRouteStore)
 	}
 
 	// 배포 이벤트 프로듀서 주입
