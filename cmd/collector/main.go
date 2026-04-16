@@ -51,6 +51,7 @@ func main() {
 		sloStore             *store.SLOStore               // Gap 3: SLO/SLI + Burn-Rate
 		rcaStore             *store.RCAStore               // P1: RCA 결과 조회
 		deploymentEventStore *store.DeploymentEventStore   // GAP-04: 배포 이벤트 상관 분석
+		logAnalyticsStore    *store.LogAnalyticsStore      // GAP-06: Log Analytics
 	)
 
 	if cfg.DisableClickHouse {
@@ -311,6 +312,17 @@ func main() {
 		} else {
 			alertRouteStore = ars
 			slog.Info("alert route store initialized")
+		}
+	}
+
+	// GAP-06: Log Analytics
+	// mv_log_volume_1m_state MV를 생성하고 5가지 로그 분석 쿼리를 제공한다.
+	if !cfg.DisableClickHouse {
+		if las, err := store.NewLogAnalyticsStore(chConn, cfg.ClickHouseDB); err != nil {
+			slog.Warn("log analytics store init failed (continuing without log analytics)", "err", err)
+		} else {
+			logAnalyticsStore = las
+			slog.Info("log analytics store initialized")
 		}
 	}
 
@@ -657,6 +669,11 @@ func main() {
 	// GAP-05: Alert Routing & Escalation
 	if alertRouteStore != nil {
 		httpSrv.SetAlertRoutes(alertRouteStore)
+	}
+
+	// GAP-06: Log Analytics
+	if logAnalyticsStore != nil {
+		httpSrv.SetLogAnalytics(logAnalyticsStore)
 	}
 
 	// 배포 이벤트 프로듀서 주입
