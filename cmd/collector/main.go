@@ -676,6 +676,11 @@ func main() {
 		httpSrv.SetLogAnalytics(logAnalyticsStore)
 	}
 
+	// DB Slow Query MV 조회기 주입
+	if sq, ok := traceStore.(server.SlowQueryQuerier); ok {
+		httpSrv.SetSlowQueryQuerier(sq)
+	}
+
 	// 배포 이벤트 프로듀서 주입
 	if deployPub != nil {
 		httpSrv.SetDeployProducer(deployPub)

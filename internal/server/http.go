@@ -182,6 +182,12 @@ type HistogramMVQuerier interface {
 	QueryHistogramMV(ctx context.Context, service, name string, fromMs, toMs int64, limit int) ([]map[string]any, error)
 }
 
+// SlowQueryQuerier는 DB 슬로우 쿼리 MV 조회를 지원하는 인터페이스다.
+// ClickHouseTraceStore가 구현하며, nil이면 /api/collector/slow-queries가 501을 반환한다.
+type SlowQueryQuerier interface {
+	QuerySlowQueries(ctx context.Context, service string, fromMs, toMs, thresholdMs int64, limit int) ([]map[string]any, error)
+}
+
 // ReadinessChecker는 /readyz 상세 상태 조회를 위한 인터페이스다.
 type ReadinessChecker interface {
 	Ping(ctx context.Context) error
@@ -244,6 +250,10 @@ type HTTPServer struct {
 	// logAnalytics는 Log Analytics 쿼리를 담당한다.
 	// GAP-06: nil이면 /api/logs/* 가 501을 반환한다.
 	logAnalytics LogAnalyticsQuerier
+
+	// slowQueryQuerier는 DB 슬로우 쿼리 MV 조회를 담당한다.
+	// nil이면 /api/collector/slow-queries 가 501을 반환한다.
+	slowQueryQuerier SlowQueryQuerier
 }
 
 // DeploymentPublisher는 배포 이벤트 발행 인터페이스다.
@@ -318,6 +328,8 @@ func NewHTTPServer(addr string, ing *ingester.Ingester,
 	mux.HandleFunc("/api/logs/patterns", s.queryLogPatterns)
 	mux.HandleFunc("/api/logs/context", s.queryLogContext)
 	mux.HandleFunc("/api/logs/fields", s.queryLogFields)
+	// DB Slow Query MV — db_system != '' 스팬 중 임계값 초과 쿼리 조회
+	mux.HandleFunc("/api/collector/slow-queries", s.querySlowQueries)
 
 	// 운영 엔드포인트
 	// /healthz: liveness probe — 프로세스가 살아있으면 200
@@ -405,6 +417,12 @@ func (s *HTTPServer) SetAlertRoutes(arm AlertRouteManager) {
 // GAP-06: nil이면 /api/logs/* 가 501을 반환한다.
 func (s *HTTPServer) SetLogAnalytics(laq LogAnalyticsQuerier) {
 	s.logAnalytics = laq
+}
+
+// SetSlowQueryQuerier는 DB 슬로우 쿼리 MV 조회기를 등록한다.
+// nil이면 /api/collector/slow-queries 가 501을 반환한다.
+func (s *HTTPServer) SetSlowQueryQuerier(sq SlowQueryQuerier) {
+	s.slowQueryQuerier = sq
 }
 
 // alertRoutes_ 는 /api/alerts/routes 엔드포인트를 처리한다.
@@ -1337,6 +1355,35 @@ func (s *HTTPServer) queryErrorGroups(w http.ResponseWriter, r *http.Request) {
 		r.URL.Query().Get("service"),
 		queryInt64(r, "from"),
 		queryInt64(r, "to"),
+		queryLimit(r),
+	)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, result)
+}
+
+// querySlowQueries는 DB 슬로우 쿼리 MV에서 임계값 이상 소요된 DB 쿼리를 반환한다.
+// GET /api/collector/slow-queries?service=svc&from=<ms>&to=<ms>&threshold_ms=500&limit=100
+func (s *HTTPServer) querySlowQueries(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	setCORSHeaders(w)
+
+	if s.slowQueryQuerier == nil {
+		http.Error(w, "slow query not available (requires ClickHouse)", http.StatusNotImplemented)
+		return
+	}
+
+	thresholdMs := queryInt64(r, "threshold_ms")
+	result, err := s.slowQueryQuerier.QuerySlowQueries(r.Context(),
+		r.URL.Query().Get("service"),
+		queryInt64(r, "from"),
+		queryInt64(r, "to"),
+		thresholdMs,
 		queryLimit(r),
 	)
 	if err != nil {

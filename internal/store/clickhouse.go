@@ -704,6 +704,90 @@ LIMIT %d`, s.cfg.Database, where, limit)
 	return result, rows.Err()
 }
 
+// QuerySlowQueries는 mv_slow_queries_state에서 thresholdMs 이상 소요된 DB 쿼리를 반환한다.
+// GET /api/collector/slow-queries?service=svc&from=<ms>&to=<ms>&threshold_ms=500&limit=100
+func (s *ClickHouseTraceStore) QuerySlowQueries(ctx context.Context, service string, fromMs, toMs, thresholdMs int64, limit int) ([]map[string]any, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if thresholdMs <= 0 {
+		thresholdMs = 500
+	}
+
+	var conds []string
+	var args []any
+
+	conds = append(conds, "duration_ms >= ?")
+	args = append(args, float64(thresholdMs))
+
+	if fromMs > 0 {
+		conds = append(conds, "start_time >= ?")
+		args = append(args, fromMs/1000)
+	}
+	if toMs > 0 {
+		conds = append(conds, "start_time <= ?")
+		args = append(args, toMs/1000)
+	}
+	if service != "" {
+		conds = append(conds, "service_name = ?")
+		args = append(args, service)
+	}
+
+	where := "WHERE " + strings.Join(conds, " AND ")
+
+	q := fmt.Sprintf(`
+SELECT
+    trace_id,
+    span_id,
+    service_name,
+    db_system,
+    db_name,
+    db_operation,
+    db_statement,
+    round(duration_ms, 2) AS duration_ms,
+    start_time,
+    status_code
+FROM %s.mv_slow_queries_state
+%s
+ORDER BY duration_ms DESC
+LIMIT %d`, s.cfg.Database, where, limit)
+
+	rows, err := s.conn.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []map[string]any
+	for rows.Next() {
+		var (
+			traceID, spanID, serviceName string
+			dbSystem, dbName, dbOp, dbStmt string
+			durationMs                   float64
+			startTime                    time.Time
+			statusCode                   int32
+		)
+		if err := rows.Scan(&traceID, &spanID, &serviceName,
+			&dbSystem, &dbName, &dbOp, &dbStmt,
+			&durationMs, &startTime, &statusCode); err != nil {
+			return nil, err
+		}
+		result = append(result, map[string]any{
+			"trace_id":     traceID,
+			"span_id":      spanID,
+			"service_name": serviceName,
+			"db_system":    dbSystem,
+			"db_name":      dbName,
+			"db_operation": dbOp,
+			"db_statement": dbStmt,
+			"duration_ms":  durationMs,
+			"start_time":   startTime.UnixMilli(),
+			"status_code":  statusCode,
+		})
+	}
+	return result, rows.Err()
+}
+
 // QueryTraceContext는 trace_id로 연관된 spans·logs·RED 메트릭을 한 번에 반환한다.
 // Gap 1: Correlated Signal Navigation — Datadog의 "Trace to Logs/Metrics" 피벗에 해당.
 func (s *ClickHouseTraceStore) QueryTraceContext(ctx context.Context, traceID string) (map[string]any, error) {
@@ -2505,6 +2589,48 @@ FROM %s.spans
 WHERE status_code = 2 AND status_message != '';
 `, db, db, db)); err != nil {
 		return fmt.Errorf("create mv_rag_from_spans: %w", err)
+	}
+
+	if err := conn.Exec(ctx, fmt.Sprintf(`
+CREATE TABLE IF NOT EXISTS %s.mv_slow_queries_state (
+    trace_id      String,
+    span_id       String,
+    service_name  LowCardinality(String),
+    db_system     LowCardinality(String),
+    db_name       LowCardinality(String),
+    db_operation  LowCardinality(String),
+    db_statement  String,
+    duration_ms   Float64,
+    start_time    DateTime64(3),
+    status_code   Int32,
+    dt            Date
+) ENGINE = MergeTree()
+PARTITION BY dt
+ORDER BY (service_name, dt, start_time)
+TTL dt + INTERVAL 7 DAY;
+`, db)); err != nil {
+		return fmt.Errorf("create mv_slow_queries_state: %w", err)
+	}
+
+	if err := conn.Exec(ctx, fmt.Sprintf(`
+CREATE MATERIALIZED VIEW IF NOT EXISTS %s.mv_slow_queries
+TO %s.mv_slow_queries_state
+AS SELECT
+    trace_id,
+    span_id,
+    service_name,
+    db_system,
+    db_name,
+    db_operation,
+    attributes['db.statement']                          AS db_statement,
+    duration_nano / 1e6                                 AS duration_ms,
+    fromUnixTimestamp64Nano(start_time_nano)             AS start_time,
+    status_code,
+    dt
+FROM %s.spans
+WHERE db_system != '';
+`, db, db, db)); err != nil {
+		return fmt.Errorf("create mv_slow_queries: %w", err)
 	}
 
 	if err := ensureAIopsSchema(conn, db); err != nil {
