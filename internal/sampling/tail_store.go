@@ -42,6 +42,14 @@ var (
 		Name:      "adaptive_observed_tps",
 		Help:      "EWMA-smoothed observed TPS in the adaptive sampler.",
 	})
+
+	// URL 패턴 제외로 버퍼링 전에 드롭된 span 수
+	samplingURLExcludedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "javi",
+		Subsystem: "sampling",
+		Name:      "url_excluded_spans_total",
+		Help:      "Total spans dropped before buffering due to exclude_url_patterns match.",
+	})
 )
 
 // TailSamplingStore는 store.TraceStore를 래핑하는 Decorator다.
@@ -98,10 +106,26 @@ func NewTailSamplingStore(downstream store.TraceStore, cfgProv ConfigProvider) *
 
 // AppendSpans는 store.TraceStore 인터페이스를 구현한다.
 //
-// spans를 버퍼에 추가하고 root span이 포함된 경우 즉시 flush를 시도한다.
+// ExcludeURLPatterns에 매칭되는 spans를 버퍼링 전에 제거한 뒤 나머지를 버퍼에 추가한다.
 // sampling 결정은 비동기로 발생하므로 항상 nil을 반환한다.
 // (에러 반환 시 OTLP 클라이언트가 재전송을 시도해 중복 수집이 발생한다.)
 func (ts *TailSamplingStore) AppendSpans(ctx context.Context, spans []*model.SpanData) error {
+	cfg := ts.cfgProv.Current()
+	if len(cfg.ExcludeURLPatterns) > 0 {
+		filtered := make([]*model.SpanData, 0, len(spans))
+		for _, sp := range spans {
+			if spanMatchesExcludePattern(sp, cfg.ExcludeURLPatterns) {
+				samplingURLExcludedTotal.Inc()
+				continue
+			}
+			filtered = append(filtered, sp)
+		}
+		spans = filtered
+	}
+	if len(spans) == 0 {
+		return nil
+	}
+
 	ts.buffer.append(spans)
 
 	// root span이 포함된 경우 즉시 flush 시도 (timeout 대기 단축)
@@ -203,14 +227,20 @@ func (ts *TailSamplingStore) expiryLoop(ctx context.Context) {
 }
 
 // onFlush는 traceBuffer의 콜백으로 호출된다.
-// PolicyEvaluator와 AdaptiveController를 통과한 spans만 downstream으로 전달한다.
+// 서비스별 오버라이드를 적용한 뒤 PolicyEvaluator와 AdaptiveController를 통과한 spans만 downstream으로 전달한다.
 func (ts *TailSamplingStore) onFlush(spans []*model.SpanData) {
 	if len(spans) == 0 {
 		return
 	}
 
 	cfg := ts.cfgProv.Current()
-	decision := ts.policy.Evaluate(spans, cfg)
+
+	// 서비스별 오버라이드 적용: 첫 번째 매칭 ServiceSamplingRule의 정책을 사용한다.
+	// Adaptive TPS 제어는 항상 전역 cfg 기준으로 동작한다.
+	svcName := spanServiceName(spans)
+	effectiveCfg := resolveEffective(svcName, cfg)
+
+	decision := ts.policy.Evaluate(spans, effectiveCfg)
 
 	if decision == DecisionDrop {
 		ts.droppedTotal.Add(1)
@@ -220,7 +250,7 @@ func (ts *TailSamplingStore) onFlush(spans []*model.SpanData) {
 
 	// critical trace(error/latency)는 AdaptiveController를 우회한다.
 	// SLA 위반 신호가 rate 조정에 의해 drop되면 alert 누락이 발생한다.
-	if cfg.Adaptive.Enabled && !isCritical(spans, cfg) {
+	if cfg.Adaptive.Enabled && !isCritical(spans, effectiveCfg) {
 		if !ts.adaptive.Allow() {
 			ts.droppedTotal.Add(1)
 			samplingDecisionsTotal.WithLabelValues("adaptive_drop").Inc()

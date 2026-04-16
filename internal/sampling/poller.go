@@ -184,7 +184,7 @@ func (p *RemoteConfigPoller) poll() {
 // configChanged는 두 config 간에 의미 있는 변경이 있는지 확인한다.
 // deep equal 대신 주요 필드만 비교해 불필요한 업데이트를 줄인다.
 func configChanged(old, new *SamplingConfig) bool {
-	return old.Enabled != new.Enabled ||
+	if old.Enabled != new.Enabled ||
 		old.Adaptive.Enabled != new.Adaptive.Enabled ||
 		old.Adaptive.TargetTPS != new.Adaptive.TargetTPS ||
 		old.Adaptive.EWMAAlpha != new.Adaptive.EWMAAlpha ||
@@ -194,5 +194,13 @@ func configChanged(old, new *SamplingConfig) bool {
 		old.LatencySampling.ThresholdMs != new.LatencySampling.ThresholdMs ||
 		old.ErrorSampling.Enabled != new.ErrorSampling.Enabled ||
 		old.TraceTimeoutSec != new.TraceTimeoutSec ||
-		old.MaxBufferTraces != new.MaxBufferTraces
+		old.MaxBufferTraces != new.MaxBufferTraces {
+		return true
+	}
+	// service_rules 또는 exclude_url_patterns 변경 감지 (길이 비교로 충분)
+	if len(old.ServiceRules) != len(new.ServiceRules) ||
+		len(old.ExcludeURLPatterns) != len(new.ExcludeURLPatterns) {
+		return true
+	}
+	return false
 }

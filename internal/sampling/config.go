@@ -30,6 +30,11 @@ import "encoding/json"
 //	    "max_rate": 1.0,
 //	    "ewma_alpha": 0.3
 //	  },
+//	  "service_rules": [
+//	    { "service_pattern": "payment-*", "override": { "probabilistic_sampling": { "enabled": true, "rate": 0.01 } } },
+//	    { "service_pattern": "auth-service", "override": { "probabilistic_sampling": { "enabled": true, "rate": 1.0 } } }
+//	  ],
+//	  "exclude_url_patterns": ["/health", "/ping", "/metrics", "/actuator/*"],
 //	  "trace_timeout_sec": 30,
 //	  "max_buffer_traces": 50000
 //	}
@@ -42,11 +47,36 @@ type SamplingConfig struct {
 	ProbabilisticSampling ProbabilisticSamplingConfig `json:"probabilistic_sampling"`
 	Adaptive              AdaptiveConfig              `json:"adaptive"`
 
+	// ServiceRules: 서비스별 샘플링 정책 오버라이드 목록.
+	// 순서가 우선순위 — 첫 번째 매칭 규칙이 적용된다.
+	// glob 패턴 지원 (*, ?). Adaptive TPS 제어는 항상 전역 설정을 사용한다.
+	ServiceRules []ServiceSamplingRule `json:"service_rules,omitempty"`
+
+	// ExcludeURLPatterns: 이 패턴에 매칭되는 span은 버퍼링 전에 제거된다.
+	// span.Name 또는 http.url/url.path/http.target 어트리뷰트에 대해 glob 매칭한다.
+	// 예: ["/health", "/ping", "/actuator/*", "GET /metrics"]
+	ExcludeURLPatterns []string `json:"exclude_url_patterns,omitempty"`
+
 	// trace 완성 대기 timeout. 초과 시 수집된 spans로 즉시 결정. (기본 30s)
 	TraceTimeoutSec int `json:"trace_timeout_sec"`
 
 	// 동시에 버퍼에 보관할 최대 trace 수. 초과 시 가장 오래된 trace 강제 flush. (기본 50000)
 	MaxBufferTraces int `json:"max_buffer_traces"`
+}
+
+// ServiceSamplingOverride는 서비스별로 재정의할 샘플링 정책이다.
+// 설정된 필드만 전역 설정을 덮어쓴다. Adaptive TPS 제어는 재정의 불가.
+type ServiceSamplingOverride struct {
+	ErrorSampling         ErrorSamplingConfig         `json:"error_sampling"`
+	LatencySampling       LatencySamplingConfig       `json:"latency_sampling"`
+	ProbabilisticSampling ProbabilisticSamplingConfig `json:"probabilistic_sampling"`
+}
+
+// ServiceSamplingRule은 서비스 패턴과 오버라이드 정책을 묶은 규칙이다.
+// ServicePattern: glob 패턴 (*, ? 지원). e.g. "payment-*", "auth-service"
+type ServiceSamplingRule struct {
+	ServicePattern string                  `json:"service_pattern"`
+	Override       ServiceSamplingOverride `json:"override"`
 }
 
 // ErrorSamplingConfig는 error span 포함 trace를 항상 보존하는 설정이다.

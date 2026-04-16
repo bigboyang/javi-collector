@@ -2,6 +2,7 @@ package sampling
 
 import (
 	"math/rand/v2"
+	"path"
 
 	"github.com/kkc/javi-collector/internal/model"
 )
@@ -84,6 +85,68 @@ func isCritical(spans []*model.SpanData, cfg *SamplingConfig) bool {
 	}
 	if cfg.LatencySampling.Enabled && exceedsLatency(spans, cfg.LatencySampling.ThresholdMs) {
 		return true
+	}
+	return false
+}
+
+// resolveEffective는 spans의 서비스명에 매칭되는 첫 번째 ServiceSamplingRule을
+// 전역 cfg에 오버라이드한 effective config를 반환한다.
+// 매칭 규칙이 없으면 cfg를 그대로 반환한다 (복사 없음).
+// ServiceRules는 순서대로 평가하며 첫 번째 매칭 규칙이 우선한다.
+func resolveEffective(serviceName string, cfg *SamplingConfig) *SamplingConfig {
+	for _, rule := range cfg.ServiceRules {
+		matched, _ := path.Match(rule.ServicePattern, serviceName)
+		if !matched {
+			continue
+		}
+		merged := *cfg // shallow copy — ServiceRules/ExcludeURLPatterns는 포인터 공유
+		merged.ErrorSampling = rule.Override.ErrorSampling
+		merged.LatencySampling = rule.Override.LatencySampling
+		merged.ProbabilisticSampling = rule.Override.ProbabilisticSampling
+		return &merged
+	}
+	return cfg
+}
+
+// spanServiceName은 spans에서 서비스명을 추출한다.
+// root span(ParentSpanID=="") 우선, 없으면 첫 번째 span을 사용한다.
+func spanServiceName(spans []*model.SpanData) string {
+	for _, s := range spans {
+		if s.ParentSpanID == "" {
+			return s.ServiceName
+		}
+	}
+	if len(spans) > 0 {
+		return spans[0].ServiceName
+	}
+	return ""
+}
+
+// spanMatchesExcludePattern은 span name 또는 URL 어트리뷰트가 패턴과 일치하면 true를 반환한다.
+// 패턴 문법은 path.Match (glob: *, ?)이며 슬래시도 *로 매칭된다.
+// 검사 순서: span.Name → http.url → url.path → http.target → url.full
+func spanMatchesExcludePattern(sp *model.SpanData, patterns []string) bool {
+	// span name 검사 (e.g. "GET /health", "grpc.health.v1.Health/Check")
+	for _, p := range patterns {
+		if m, _ := path.Match(p, sp.Name); m {
+			return true
+		}
+	}
+	// HTTP/URL 어트리뷰트 검사
+	for _, attr := range []string{"http.url", "url.path", "http.target", "url.full"} {
+		v, ok := sp.Attributes[attr]
+		if !ok {
+			continue
+		}
+		s, ok := v.(string)
+		if !ok || s == "" {
+			continue
+		}
+		for _, p := range patterns {
+			if m, _ := path.Match(p, s); m {
+				return true
+			}
+		}
 	}
 	return false
 }
