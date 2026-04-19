@@ -52,6 +52,8 @@ func main() {
 		rcaStore             *store.RCAStore               // P1: RCA 결과 조회
 		deploymentEventStore *store.DeploymentEventStore   // GAP-04: 배포 이벤트 상관 분석
 		logAnalyticsStore    *store.LogAnalyticsStore      // GAP-06: Log Analytics
+		profilingStore       *store.ProfilingStore         // GAP-07: Continuous Profiling
+		k8sPodMetricsStore   *store.K8sPodMetricsStore    // GAP-08 확장: K8s Pod 리소스 메트릭
 	)
 
 	if cfg.DisableClickHouse {
@@ -143,6 +145,22 @@ func main() {
 			slog.Warn("deployment event store init failed (continuing without deployment correlation)", "err", derr)
 		} else {
 			deploymentEventStore = ds
+		}
+
+		// GAP-07: Continuous Profiling 스토어
+		if ps, perr := store.NewProfilingStore(chConn, cfg.ClickHouseDB); perr != nil {
+			slog.Warn("profiling store init failed (continuing without profiling)", "err", perr)
+		} else {
+			profilingStore = ps
+			slog.Info("profiling store initialized")
+		}
+
+		// GAP-08 확장: K8s Pod 리소스 메트릭 스토어
+		if km, kmerr := store.NewK8sPodMetricsStore(chConn, cfg.ClickHouseDB); kmerr != nil {
+			slog.Warn("k8s pod metrics store init failed (continuing without k8s metrics)", "err", kmerr)
+		} else {
+			k8sPodMetricsStore = km
+			slog.Info("k8s pod metrics store initialized")
 		}
 
 		// 공유 커넥션은 모든 store가 drain된 후 닫아야 한다.
@@ -679,6 +697,21 @@ func main() {
 	// DB Slow Query MV 조회기 주입
 	if sq, ok := traceStore.(server.SlowQueryQuerier); ok {
 		httpSrv.SetSlowQueryQuerier(sq)
+	}
+
+	// GAP-08: Infra Metrics Correlation — ClickHouseTraceStore가 구현체를 제공한다.
+	if ic, ok := traceStore.(server.InfraCorrelationQuerier); ok {
+		httpSrv.SetInfraCorrelation(ic)
+	}
+
+	// GAP-07: Continuous Profiling 스토어 주입
+	if profilingStore != nil {
+		httpSrv.SetProfilingStore(profilingStore)
+	}
+
+	// GAP-08 확장: K8s Pod 리소스 메트릭 스토어 주입
+	if k8sPodMetricsStore != nil {
+		httpSrv.SetK8sMetrics(k8sPodMetricsStore)
 	}
 
 	// 배포 이벤트 프로듀서 주입

@@ -2393,6 +2393,144 @@ func uint16Attr(attrs map[string]any, key string) uint16 {
 	return 0
 }
 
+// ---- Infra Metrics Correlation ----
+
+// QueryInfraCorrelation은 서비스의 k8s 배포 컨텍스트와 JVM/인프라 메트릭을 상관 분석한다.
+//
+// 동작 방식:
+//  1. spans 테이블에서 서비스의 k8s.node.name / k8s.pod.name / host.name 추출
+//  2. metrics 테이블에서 동일 pod/host의 jvm.*/process.* 메트릭 조회
+//
+// 반환:
+//   - k8s_context: 서비스가 실행 중인 pod/node/namespace 목록
+//   - jvm_metrics: 해당 인스턴스들의 JVM 주요 메트릭 시계열
+//   - infra_metrics: process.cpu, host.memory 등 인프라 지표
+func (s *ClickHouseTraceStore) QueryInfraCorrelation(ctx context.Context, service string, fromMs, toMs int64) (map[string]any, error) {
+	// Step 1: spans 테이블에서 k8s 컨텍스트 추출
+	k8sRows, err := s.conn.Query(ctx, fmt.Sprintf(`
+SELECT
+    attributes['k8s.pod.name']       AS pod_name,
+    attributes['k8s.node.name']      AS node_name,
+    attributes['k8s.namespace.name'] AS namespace,
+    attributes['host.name']          AS host_name,
+    count()                          AS span_count
+FROM %s.spans
+WHERE service_name = ?
+  AND start_time_nano BETWEEN ? AND ?
+  AND (notEmpty(attributes['k8s.pod.name']) OR notEmpty(attributes['host.name']))
+GROUP BY pod_name, node_name, namespace, host_name
+ORDER BY span_count DESC
+LIMIT 20`, s.cfg.Database),
+		service,
+		fromMs*1_000_000,
+		toMs*1_000_000,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("infra correlation k8s query: %w", err)
+	}
+	defer k8sRows.Close()
+
+	type k8sContext struct {
+		PodName   string `json:"pod_name"`
+		NodeName  string `json:"node_name"`
+		Namespace string `json:"namespace"`
+		HostName  string `json:"host_name"`
+		SpanCount uint64 `json:"span_count"`
+	}
+	var k8sContexts []k8sContext
+	var hostNames []string
+	hostSet := make(map[string]bool)
+
+	for k8sRows.Next() {
+		var kc k8sContext
+		if err := k8sRows.Scan(&kc.PodName, &kc.NodeName, &kc.Namespace, &kc.HostName, &kc.SpanCount); err != nil {
+			return nil, err
+		}
+		k8sContexts = append(k8sContexts, kc)
+		// host.name 기반으로 메트릭 조회 (pod.name과 host.name 둘 다 수집)
+		for _, h := range []string{kc.PodName, kc.HostName} {
+			if h != "" && !hostSet[h] {
+				hostSet[h] = true
+				hostNames = append(hostNames, h)
+			}
+		}
+	}
+	if err := k8sRows.Err(); err != nil {
+		return nil, err
+	}
+
+	if len(k8sContexts) == 0 {
+		return map[string]any{
+			"service_name": service,
+			"k8s_context":  []any{},
+			"jvm_metrics":  []any{},
+			"message":      "no k8s/host context found in spans — ensure Java agent has k8s resource attributes",
+		}, nil
+	}
+
+	// Step 2: metrics 테이블에서 JVM / 인프라 메트릭 조회
+	// attributes['host.name'] 또는 attributes['service.instance.id']로 매칭
+	// jvm.*, process.*, system.* 메트릭만 대상으로 한다
+	metricRows, err := s.conn.Query(ctx, fmt.Sprintf(`
+SELECT
+    name,
+    toStartOfMinute(fromUnixTimestamp64Nano(timestamp_nano)) AS minute,
+    avg(value) AS avg_val,
+    max(value) AS max_val,
+    min(value) AS min_val
+FROM %s.metrics
+WHERE service_name = ?
+  AND timestamp_nano BETWEEN ? AND ?
+  AND (
+      name LIKE 'jvm.%%'
+      OR name LIKE 'process.%%'
+      OR name LIKE 'system.%%'
+      OR name IN ('runtime.jvm.gc.duration', 'runtime.jvm.memory.used',
+                  'runtime.jvm.memory.limit', 'runtime.jvm.thread.count')
+  )
+GROUP BY name, minute
+ORDER BY name, minute`, s.cfg.Database),
+		service,
+		fromMs*1_000_000,
+		toMs*1_000_000,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("infra correlation metrics query: %w", err)
+	}
+	defer metricRows.Close()
+
+	type metricPoint struct {
+		Name   string  `json:"name"`
+		Minute string  `json:"minute"`
+		Avg    float64 `json:"avg"`
+		Max    float64 `json:"max"`
+		Min    float64 `json:"min"`
+	}
+	var jvmMetrics []metricPoint
+	for metricRows.Next() {
+		var mp metricPoint
+		var minute time.Time
+		if err := metricRows.Scan(&mp.Name, &minute, &mp.Avg, &mp.Max, &mp.Min); err != nil {
+			return nil, err
+		}
+		mp.Minute = minute.UTC().Format(time.RFC3339)
+		jvmMetrics = append(jvmMetrics, mp)
+	}
+	if err := metricRows.Err(); err != nil {
+		return nil, err
+	}
+
+	return map[string]any{
+		"service_name": service,
+		"k8s_context":  k8sContexts,
+		"jvm_metrics":  jvmMetrics,
+		"time_range": map[string]int64{
+			"from_ms": fromMs,
+			"to_ms":   toMs,
+		},
+	}, nil
+}
+
 // ---- DDL ----
 
 func ensureSpansTable(conn driver.Conn, db string, retentionDays int) error {

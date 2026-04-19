@@ -188,10 +188,54 @@ type SlowQueryQuerier interface {
 	QuerySlowQueries(ctx context.Context, service string, fromMs, toMs, thresholdMs int64, limit int) ([]map[string]any, error)
 }
 
+// InfraCorrelationQuerier는 서비스의 k8s 컨텍스트와 JVM/인프라 메트릭 상관 분석을 지원한다.
+// GAP-08: Infra Metrics Correlation — ClickHouseTraceStore가 구현한다.
+type InfraCorrelationQuerier interface {
+	QueryInfraCorrelation(ctx context.Context, service string, fromMs, toMs int64) (map[string]any, error)
+}
+
+// ProfilingWriter는 프로파일링 스냅샷 쓰기/조회를 지원한다.
+// GAP-07: Continuous Profiling — *store.ProfilingStore가 구현한다.
+type ProfilingWriter interface {
+	InsertSnapshot(ctx context.Context, snap store.ProfilingSnapshot) error
+	QuerySnapshots(ctx context.Context, p store.QuerySnapshotsParams) ([]store.ProfilingSnapshot, error)
+	GetSnapshotPayload(ctx context.Context, id string) (*store.ProfilingSnapshot, error)
+	QueryProfileSummary(ctx context.Context, fromMs, toMs int64) ([]map[string]any, error)
+}
+
+// K8sMetricsWriter는 Pod 리소스 메트릭 쓰기/조회를 지원한다.
+// GAP-08 확장: Infra Metrics Correlation — *store.K8sPodMetricsStore가 구현한다.
+type K8sMetricsWriter interface {
+	InsertMetric(ctx context.Context, m store.K8sPodMetric) error
+	QueryMetrics(ctx context.Context, p store.QueryK8sMetricsParams) ([]store.K8sPodMetric, error)
+	QueryPodSummary(ctx context.Context, service string, fromMs, toMs int64) ([]map[string]any, error)
+}
+
 // ReadinessChecker는 /readyz 상세 상태 조회를 위한 인터페이스다.
 type ReadinessChecker interface {
 	Ping(ctx context.Context) error
 	ChannelStatus() map[string]any
+}
+
+// topologyCacheKey는 토폴로지 캐시의 버킷 키다.
+// 5분 단위로 버킷팅하여 같은 시간 창의 요청이 동일한 캐시 엔트리를 공유한다.
+type topologyCacheKey struct{ fromBucket, toBucket int64 }
+
+// topologyCacheEntry는 캐시된 토폴로지 결과와 만료 시각을 저장한다.
+type topologyCacheEntry struct {
+	data      []map[string]any
+	expiresAt time.Time
+}
+
+// topoBucketMs는 캐시 버킷 크기다 (5분).
+// mv_service_topology_state도 5분 단위로 집계하므로 동일 창으로 맞춘다.
+const topoBucketMs = 5 * 60 * 1000
+
+func roundTopoBucket(ms int64) int64 {
+	if ms <= 0 {
+		return 0
+	}
+	return (ms / topoBucketMs) * topoBucketMs
 }
 
 // HTTPServer는 OTLP/HTTP 수신 + REST 조회 API + 운영 엔드포인트 서버다.
@@ -254,6 +298,24 @@ type HTTPServer struct {
 	// slowQueryQuerier는 DB 슬로우 쿼리 MV 조회를 담당한다.
 	// nil이면 /api/collector/slow-queries 가 501을 반환한다.
 	slowQueryQuerier SlowQueryQuerier
+
+	// infraCorrelation은 서비스의 k8s 컨텍스트와 JVM/인프라 메트릭 상관 분석을 담당한다.
+	// GAP-08: nil이면 /api/collector/infra-correlation 가 501을 반환한다.
+	infraCorrelation InfraCorrelationQuerier
+
+	// profilingStore는 프로파일링 스냅샷 쓰기/조회를 담당한다.
+	// GAP-07: nil이면 /api/collector/profiling 가 501을 반환한다.
+	profilingStore ProfilingWriter
+
+	// k8sMetrics는 Pod 리소스 메트릭(CPU/메모리) 쓰기/조회를 담당한다.
+	// GAP-08 확장: nil이면 /api/collector/k8s-metrics 가 501을 반환한다.
+	k8sMetrics K8sMetricsWriter
+
+	// topoCache는 서비스 토폴로지 조회 결과를 TTL 기반으로 캐싱한다.
+	// 키: topologyCacheKey (5분 버킷), 값: topologyCacheEntry
+	// 매 요청마다 ClickHouse MV를 재스캔하는 오버헤드를 제거한다.
+	topoCache    sync.Map
+	topoCacheTTL time.Duration // 기본 60초
 }
 
 // DeploymentPublisher는 배포 이벤트 발행 인터페이스다.
@@ -265,11 +327,12 @@ func NewHTTPServer(addr string, ing *ingester.Ingester,
 	ts store.TraceStore, ms store.MetricStore, ls store.LogStore) *HTTPServer {
 
 	s := &HTTPServer{
-		ingester:    ing,
-		traceStore:  ts,
-		metricStore: ms,
-		logStore:    ls,
-		ready:       make(chan struct{}),
+		ingester:     ing,
+		traceStore:   ts,
+		metricStore:  ms,
+		logStore:     ls,
+		ready:        make(chan struct{}),
+		topoCacheTTL: 60 * time.Second,
 	}
 
 	mux := http.NewServeMux()
@@ -330,6 +393,15 @@ func NewHTTPServer(addr string, ing *ingester.Ingester,
 	mux.HandleFunc("/api/logs/fields", s.queryLogFields)
 	// DB Slow Query MV — db_system != '' 스팬 중 임계값 초과 쿼리 조회
 	mux.HandleFunc("/api/collector/slow-queries", s.querySlowQueries)
+	// GAP-08: Infra Metrics Correlation — k8s 컨텍스트 + JVM/인프라 메트릭 상관
+	mux.HandleFunc("/api/collector/infra-correlation", s.queryInfraCorrelation)
+	// GAP-07: Continuous Profiling — 프로파일링 스냅샷 수신/조회
+	mux.HandleFunc("/api/collector/profiling", s.handleProfiling)
+	mux.HandleFunc("/api/collector/profiling/payload", s.handleProfilingPayload)
+	mux.HandleFunc("/api/collector/profiling/summary", s.handleProfilingSummary)
+	// GAP-08 확장: K8s Pod 리소스 메트릭 수신/조회 — Agent cgroup 수집값
+	mux.HandleFunc("/api/collector/k8s-metrics", s.handleK8sMetrics)
+	mux.HandleFunc("/api/collector/k8s-metrics/summary", s.handleK8sMetricsSummary)
 
 	// 운영 엔드포인트
 	// /healthz: liveness probe — 프로세스가 살아있으면 200
@@ -423,6 +495,331 @@ func (s *HTTPServer) SetLogAnalytics(laq LogAnalyticsQuerier) {
 // nil이면 /api/collector/slow-queries 가 501을 반환한다.
 func (s *HTTPServer) SetSlowQueryQuerier(sq SlowQueryQuerier) {
 	s.slowQueryQuerier = sq
+}
+
+// SetInfraCorrelation은 Infra Metrics Correlation 조회기를 등록한다.
+// GAP-08: nil이면 /api/collector/infra-correlation 가 501을 반환한다.
+func (s *HTTPServer) SetInfraCorrelation(ic InfraCorrelationQuerier) {
+	s.infraCorrelation = ic
+}
+
+// SetProfilingStore는 Continuous Profiling 저장소를 등록한다.
+// GAP-07: nil이면 /api/collector/profiling 가 501을 반환한다.
+func (s *HTTPServer) SetProfilingStore(ps ProfilingWriter) {
+	s.profilingStore = ps
+}
+
+// SetK8sMetrics는 K8s Pod 메트릭 저장소를 등록한다.
+// GAP-08 확장: nil이면 /api/collector/k8s-metrics 가 501을 반환한다.
+func (s *HTTPServer) SetK8sMetrics(km K8sMetricsWriter) {
+	s.k8sMetrics = km
+}
+
+// queryInfraCorrelation은 /api/collector/infra-correlation 엔드포인트를 처리한다.
+//
+//	GET /api/collector/infra-correlation?service=<svc>&from=<ms>&to=<ms>
+//
+// 서비스의 k8s 배포 컨텍스트(pod/node/namespace)와 JVM/인프라 메트릭을 상관 분석해 반환한다.
+// Datadog Infrastructure Correlation, Dynatrace Smartscape와 동일한 기능을 제공한다.
+func (s *HTTPServer) queryInfraCorrelation(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", jsonContentType)
+	if s.infraCorrelation == nil {
+		w.WriteHeader(http.StatusNotImplemented)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "infra correlation unavailable (ClickHouse disabled)"})
+		return
+	}
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	q := r.URL.Query()
+	service := q.Get("service")
+	if service == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "service parameter is required"})
+		return
+	}
+	fromMs, _ := strconv.ParseInt(q.Get("from"), 10, 64)
+	toMs, _ := strconv.ParseInt(q.Get("to"), 10, 64)
+	if toMs == 0 {
+		toMs = time.Now().UnixMilli()
+	}
+	if fromMs == 0 {
+		fromMs = toMs - 30*60*1000 // 기본 30분
+	}
+
+	result, err := s.infraCorrelation.QueryInfraCorrelation(r.Context(), service, fromMs, toMs)
+	if err != nil {
+		slog.Warn("infra correlation query failed", "service", service, "err", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+// handleProfiling은 /api/collector/profiling 엔드포인트를 처리한다.
+//
+//	POST /api/collector/profiling         — 스냅샷 저장 (Java Agent → Collector)
+//	GET  /api/collector/profiling?service=<svc>&type=<type>&from=<ms>&to=<ms>&limit=<n>
+//	                                      — 스냅샷 목록 조회 (payload 제외)
+func (s *HTTPServer) handleProfiling(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", jsonContentType)
+	if s.profilingStore == nil {
+		w.WriteHeader(http.StatusNotImplemented)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "profiling unavailable (ClickHouse disabled)"})
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPost:
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
+		if err != nil {
+			http.Error(w, "read body", http.StatusBadRequest)
+			return
+		}
+		var snap store.ProfilingSnapshot
+		if err := json.Unmarshal(body, &snap); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON: " + err.Error()})
+			return
+		}
+		if snap.ServiceName == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "service_name is required"})
+			return
+		}
+		if snap.ID == "" {
+			// 클라이언트가 ID를 제공하지 않은 경우 생성
+			idBytes := make([]byte, 16)
+			_, _ = rand.Read(idBytes)
+			snap.ID = hex.EncodeToString(idBytes)
+		}
+		if err := s.profilingStore.InsertSnapshot(r.Context(), snap); err != nil {
+			slog.Warn("profiling snapshot insert failed", "service", snap.ServiceName, "err", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]string{"id": snap.ID, "status": "accepted"})
+
+	case http.MethodGet:
+		q := r.URL.Query()
+		service := q.Get("service")
+		if service == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "service parameter is required"})
+			return
+		}
+		fromMs, _ := strconv.ParseInt(q.Get("from"), 10, 64)
+		toMs, _ := strconv.ParseInt(q.Get("to"), 10, 64)
+		limit, _ := strconv.Atoi(q.Get("limit"))
+
+		snaps, err := s.profilingStore.QuerySnapshots(r.Context(), store.QuerySnapshotsParams{
+			ServiceName: service,
+			ProfileType: q.Get("type"),
+			FromMs:      fromMs,
+			ToMs:        toMs,
+			Limit:       limit,
+		})
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		if snaps == nil {
+			snaps = []store.ProfilingSnapshot{}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"snapshots": snaps, "count": len(snaps)})
+
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// handleProfilingPayload는 /api/collector/profiling/payload?id=<id> 엔드포인트를 처리한다.
+// 특정 스냅샷의 payload(Flame Graph 원본 데이터)를 반환한다.
+func (s *HTTPServer) handleProfilingPayload(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", jsonContentType)
+	if s.profilingStore == nil {
+		w.WriteHeader(http.StatusNotImplemented)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "profiling unavailable"})
+		return
+	}
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "id parameter is required"})
+		return
+	}
+	snap, err := s.profilingStore.GetSnapshotPayload(r.Context(), id)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	if snap == nil {
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "snapshot not found"})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(snap)
+}
+
+// handleProfilingSummary는 /api/collector/profiling/summary 엔드포인트를 처리한다.
+//
+//	GET /api/collector/profiling/summary?from=<ms>&to=<ms>
+func (s *HTTPServer) handleProfilingSummary(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", jsonContentType)
+	if s.profilingStore == nil {
+		w.WriteHeader(http.StatusNotImplemented)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "profiling unavailable"})
+		return
+	}
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	q := r.URL.Query()
+	toMs, _ := strconv.ParseInt(q.Get("to"), 10, 64)
+	fromMs, _ := strconv.ParseInt(q.Get("from"), 10, 64)
+	if toMs == 0 {
+		toMs = time.Now().UnixMilli()
+	}
+	if fromMs == 0 {
+		fromMs = toMs - 24*60*60*1000 // 기본 24시간
+	}
+	summary, err := s.profilingStore.QueryProfileSummary(r.Context(), fromMs, toMs)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	if summary == nil {
+		summary = []map[string]any{}
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"summary": summary})
+}
+
+// handleK8sMetrics는 /api/collector/k8s-metrics 엔드포인트를 처리한다.
+//
+//	POST /api/collector/k8s-metrics       — Pod 리소스 메트릭 저장 (Java Agent → Collector)
+//	GET  /api/collector/k8s-metrics?service=<svc>&pod=<pod>&from=<ms>&to=<ms>&limit=<n>
+//	                                      — 시계열 조회
+func (s *HTTPServer) handleK8sMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", jsonContentType)
+	if s.k8sMetrics == nil {
+		w.WriteHeader(http.StatusNotImplemented)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "k8s metrics unavailable (ClickHouse disabled)"})
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPost:
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
+		if err != nil {
+			http.Error(w, "read body", http.StatusBadRequest)
+			return
+		}
+		var m store.K8sPodMetric
+		if err := json.Unmarshal(body, &m); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON: " + err.Error()})
+			return
+		}
+		if m.ServiceName == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "service_name is required"})
+			return
+		}
+		if err := s.k8sMetrics.InsertMetric(r.Context(), m); err != nil {
+			slog.Warn("k8s metric insert failed", "service", m.ServiceName, "err", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
+
+	case http.MethodGet:
+		q := r.URL.Query()
+		service := q.Get("service")
+		if service == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "service parameter is required"})
+			return
+		}
+		fromMs, _ := strconv.ParseInt(q.Get("from"), 10, 64)
+		toMs, _ := strconv.ParseInt(q.Get("to"), 10, 64)
+		limit, _ := strconv.Atoi(q.Get("limit"))
+
+		metrics, err := s.k8sMetrics.QueryMetrics(r.Context(), store.QueryK8sMetricsParams{
+			ServiceName: service,
+			PodName:     q.Get("pod"),
+			FromMs:      fromMs,
+			ToMs:        toMs,
+			Limit:       limit,
+		})
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		if metrics == nil {
+			metrics = []store.K8sPodMetric{}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"metrics": metrics, "count": len(metrics)})
+
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// handleK8sMetricsSummary는 /api/collector/k8s-metrics/summary 엔드포인트를 처리한다.
+//
+//	GET /api/collector/k8s-metrics/summary?service=<svc>&from=<ms>&to=<ms>
+func (s *HTTPServer) handleK8sMetricsSummary(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", jsonContentType)
+	if s.k8sMetrics == nil {
+		w.WriteHeader(http.StatusNotImplemented)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "k8s metrics unavailable"})
+		return
+	}
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	q := r.URL.Query()
+	service := q.Get("service")
+	if service == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "service parameter is required"})
+		return
+	}
+	toMs, _ := strconv.ParseInt(q.Get("to"), 10, 64)
+	fromMs, _ := strconv.ParseInt(q.Get("from"), 10, 64)
+	if toMs == 0 {
+		toMs = time.Now().UnixMilli()
+	}
+	if fromMs == 0 {
+		fromMs = toMs - 60*60*1000 // 기본 1시간
+	}
+	summary, err := s.k8sMetrics.QueryPodSummary(r.Context(), service, fromMs, toMs)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	if summary == nil {
+		summary = []map[string]any{}
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"pods": summary})
 }
 
 // alertRoutes_ 는 /api/alerts/routes 엔드포인트를 처리한다.
@@ -1064,6 +1461,11 @@ func (s *HTTPServer) queryRED(w http.ResponseWriter, r *http.Request) {
 
 // queryTopology는 서비스 간 호출 관계 (토폴로지 맵)를 반환한다.
 // GET /api/collector/topology?from=<ms>&to=<ms>
+//
+// 캐시 전략:
+//   - 쿼리 파라미터를 5분 버킷으로 정규화하여 같은 창의 요청이 캐시를 공유한다.
+//   - TTL(기본 60초) 이내 요청은 ClickHouse를 거치지 않고 즉시 반환한다.
+//   - 캐시 미스 또는 만료 시에만 DB를 조회하고 결과를 갱신한다.
 func (s *HTTPServer) queryTopology(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1077,14 +1479,35 @@ func (s *HTTPServer) queryTopology(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := querier.QueryTopology(r.Context(),
-		queryInt64(r, "from"),
-		queryInt64(r, "to"),
-	)
+	fromMs := queryInt64(r, "from")
+	toMs := queryInt64(r, "to")
+
+	// 캐시 조회: 5분 버킷으로 정규화하여 키 생성
+	cacheKey := topologyCacheKey{
+		fromBucket: roundTopoBucket(fromMs),
+		toBucket:   roundTopoBucket(toMs),
+	}
+	if v, ok := s.topoCache.Load(cacheKey); ok {
+		entry := v.(topologyCacheEntry)
+		if time.Now().Before(entry.expiresAt) {
+			writeJSON(w, entry.data)
+			return
+		}
+	}
+
+	// 캐시 미스 또는 만료: DB 조회
+	result, err := querier.QueryTopology(r.Context(), fromMs, toMs)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	// 결과를 캐시에 저장
+	s.topoCache.Store(cacheKey, topologyCacheEntry{
+		data:      result,
+		expiresAt: time.Now().Add(s.topoCacheTTL),
+	})
+
 	writeJSON(w, result)
 }
 
