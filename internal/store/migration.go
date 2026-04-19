@@ -193,7 +193,41 @@ var SpansMigrations = []Migration{
 }
 
 // MetricsMigrations는 metrics 테이블에 대한 버전 관리 마이그레이션 목록이다.
-var MetricsMigrations = []Migration{}
+// 버전 범위: 100–199 (SpansMigrations 1–99와 충돌 방지)
+var MetricsMigrations = []Migration{
+	{
+		Version:     100,
+		Description: "drop old mv_histogram_1m to prepare for bucket-aware rebuild",
+		SQL:         `DROP TABLE IF EXISTS %DB%.mv_histogram_1m`,
+	},
+	{
+		Version:     101,
+		Description: "add bucket_counts_state column to mv_histogram_1m_state for percentile support",
+		SQL:         `ALTER TABLE %DB%.mv_histogram_1m_state ADD COLUMN IF NOT EXISTS bucket_counts_state AggregateFunction(sumForEach, Array(UInt64))`,
+	},
+	{
+		Version:     102,
+		Description: "add bounds_state column to mv_histogram_1m_state for bucket boundary storage",
+		SQL:         `ALTER TABLE %DB%.mv_histogram_1m_state ADD COLUMN IF NOT EXISTS bounds_state AggregateFunction(any, Array(Float64))`,
+	},
+	{
+		Version:     103,
+		Description: "recreate mv_histogram_1m with bucket_counts and bounds aggregation for accurate P50/P95/P99",
+		SQL: `CREATE MATERIALIZED VIEW IF NOT EXISTS %DB%.mv_histogram_1m
+TO %DB%.mv_histogram_1m_state
+AS SELECT
+    service_name,
+    metric_name,
+    toStartOfMinute(fromUnixTimestamp64Nano(timestamp_nano)) AS minute,
+    sumState(total_count)          AS count_state,
+    sumState(total_sum)            AS sum_state,
+    sumForEachState(bucket_counts) AS bucket_counts_state,
+    anyState(bounds)               AS bounds_state,
+    dt
+FROM %DB%.metric_histograms
+GROUP BY service_name, metric_name, minute, dt`,
+	},
+}
 
 // LogsMigrations는 logs 테이블에 대한 버전 관리 마이그레이션 목록이다.
 var LogsMigrations = []Migration{}
@@ -201,6 +235,19 @@ var LogsMigrations = []Migration{}
 // BuildSpansMigrations는 데이터베이스 이름을 치환한 SpansMigrations를 반환한다.
 func BuildSpansMigrations(db string) []Migration {
 	return buildMigrations(SpansMigrations, db+".spans")
+}
+
+// BuildMetricsMigrations는 %DB% 플레이스홀더를 db로 치환한 MetricsMigrations를 반환한다.
+func BuildMetricsMigrations(db string) []Migration {
+	result := make([]Migration, len(MetricsMigrations))
+	for i, m := range MetricsMigrations {
+		result[i] = Migration{
+			Version:     m.Version,
+			Description: m.Description,
+			SQL:         strings.ReplaceAll(m.SQL, "%DB%", db),
+		}
+	}
+	return result
 }
 
 // buildMigrations는 마이그레이션 SQL에서 %TABLE% 플레이스홀더를 table로 치환한다.

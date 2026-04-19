@@ -1404,6 +1404,13 @@ func NewClickHouseMetricStore(conn driver.Conn, cfg ClickHouseConfig) (*ClickHou
 		return nil, fmt.Errorf("clickhouse metric DDL: %w", err)
 	}
 
+	// 히스토그램 MV 스키마 마이그레이션 (bucket_counts_state / bounds_state 컬럼 추가 및 MV 재생성)
+	migrator := NewMigrator(conn, cfg.Database)
+	if err := migrator.Run(context.Background(), BuildMetricsMigrations(cfg.Database)); err != nil {
+		// 마이그레이션 실패는 경고로만 처리 — IF NOT EXISTS / IF EXISTS로 idempotent
+		slog.Warn("metrics schema migration failed", "err", err)
+	}
+
 	var dlq *FileBackupWriter
 	if cfg.DLQDir != "" {
 		var err error
@@ -1613,6 +1620,7 @@ func (s *ClickHouseMetricStore) QueryMetrics(ctx context.Context, q MetricQuery)
 }
 
 // QueryHistogramMV는 mv_histogram_1m_state에서 1분 집계 히스토그램 메트릭을 반환한다.
+// 버킷 분포로부터 P50/P95/P99를 선형 보간으로 계산한다.
 // GET /api/collector/histogram?service=svc&name=http.server.duration&from=<ms>&to=<ms>&limit=100
 func (s *ClickHouseMetricStore) QueryHistogramMV(ctx context.Context, service, name string, fromMs, toMs int64, limit int) ([]map[string]any, error) {
 	if limit <= 0 {
@@ -1645,8 +1653,10 @@ func (s *ClickHouseMetricStore) QueryHistogramMV(ctx context.Context, service, n
 
 	q := fmt.Sprintf(`
 SELECT service_name, metric_name, minute,
-       sumMerge(count_state) AS count,
-       sumMerge(sum_state)   AS sum
+       sumMerge(count_state)               AS count,
+       sumMerge(sum_state)                 AS sum,
+       sumForEachMerge(bucket_counts_state) AS bucket_counts,
+       anyMerge(bounds_state)              AS bounds
 FROM %s.mv_histogram_1m_state
 %s
 GROUP BY service_name, metric_name, minute
@@ -1666,9 +1676,15 @@ LIMIT %d`, s.cfg.Database, where, limit)
 			minute                  time.Time
 			count                   uint64
 			sum                     float64
+			bucketCounts            []uint64
+			bounds                  []float64
 		)
-		if err := rows.Scan(&serviceName, &metricName, &minute, &count, &sum); err != nil {
+		if err := rows.Scan(&serviceName, &metricName, &minute, &count, &sum, &bucketCounts, &bounds); err != nil {
 			return nil, err
+		}
+		avg := float64(0)
+		if count > 0 {
+			avg = sum / float64(count)
 		}
 		result = append(result, map[string]any{
 			"service_name": serviceName,
@@ -1676,15 +1692,56 @@ LIMIT %d`, s.cfg.Database, where, limit)
 			"minute":       minute.UnixMilli(),
 			"count":        count,
 			"sum":          sum,
-			"avg":          func() float64 {
-				if count == 0 {
-					return 0
-				}
-				return sum / float64(count)
-			}(),
+			"avg":          avg,
+			"p50_ms":       histogramPercentile(50.0, bucketCounts, bounds),
+			"p95_ms":       histogramPercentile(95.0, bucketCounts, bounds),
+			"p99_ms":       histogramPercentile(99.0, bucketCounts, bounds),
 		})
 	}
 	return result, rows.Err()
+}
+
+// histogramPercentile는 명시적 버킷 히스토그램에서 퍼센타일을 선형 보간으로 추정한다.
+// Prometheus histogram_quantile()과 동일한 알고리즘을 사용한다.
+//
+// bucketCounts: 버킷별 카운트 (길이 = len(bounds)+1, 마지막이 overflow)
+// bounds: 버킷 상한 경계 (OTel ExplicitBucketHistogram explicit_bounds)
+func histogramPercentile(percentile float64, bucketCounts []uint64, bounds []float64) float64 {
+	if len(bucketCounts) == 0 || len(bounds) == 0 {
+		return 0
+	}
+	var total uint64
+	for _, c := range bucketCounts {
+		total += c
+	}
+	if total == 0 {
+		return 0
+	}
+
+	target := float64(total) * percentile / 100.0
+	cumulative := float64(0)
+
+	for i, bc := range bucketCounts {
+		cumulative += float64(bc)
+		if cumulative >= target {
+			// overflow 버킷 (i >= len(bounds)): 마지막 경계값 반환
+			if i >= len(bounds) {
+				return bounds[len(bounds)-1]
+			}
+			upperBound := bounds[i]
+			lowerBound := float64(0)
+			if i > 0 {
+				lowerBound = bounds[i-1]
+			}
+			if bc == 0 {
+				return upperBound
+			}
+			// 선형 보간: lowerBound + (upperBound - lowerBound) * (target - prevCumul) / bc
+			prevCumul := cumulative - float64(bc)
+			return lowerBound + (upperBound-lowerBound)*(target-prevCumul)/float64(bc)
+		}
+	}
+	return bounds[len(bounds)-1]
 }
 
 func (s *ClickHouseMetricStore) Close() error {
@@ -2943,11 +3000,13 @@ TTL dt + INTERVAL %d DAY;
 
 	if err := conn.Exec(ctx, fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s.mv_histogram_1m_state (
-    service_name LowCardinality(String),
-    metric_name  LowCardinality(String),
-    minute       DateTime,
-    count_state  AggregateFunction(sum, UInt64),
-    sum_state    AggregateFunction(sum, Float64),
+    service_name         LowCardinality(String),
+    metric_name          LowCardinality(String),
+    minute               DateTime,
+    count_state          AggregateFunction(sum, UInt64),
+    sum_state            AggregateFunction(sum, Float64),
+    bucket_counts_state  AggregateFunction(sumForEach, Array(UInt64)),
+    bounds_state         AggregateFunction(any, Array(Float64)),
     dt Date
 ) ENGINE = AggregatingMergeTree()
 PARTITION BY dt
@@ -2964,8 +3023,10 @@ AS SELECT
     service_name,
     metric_name,
     toStartOfMinute(fromUnixTimestamp64Nano(timestamp_nano)) AS minute,
-    sumState(total_count) AS count_state,
-    sumState(total_sum)   AS sum_state,
+    sumState(total_count)          AS count_state,
+    sumState(total_sum)            AS sum_state,
+    sumForEachState(bucket_counts) AS bucket_counts_state,
+    anyState(bounds)               AS bounds_state,
     dt
 FROM %s.metric_histograms
 GROUP BY service_name, metric_name, minute, dt;
