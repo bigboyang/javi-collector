@@ -215,6 +215,12 @@ type Config struct {
 	// 스팬으로 기록해 ClickHouse의 일반 스팬과 함께 저장한다.
 	// serviceName="javi-collector", attr "javi.internal"=true 로 필터 가능.
 	SelfTracingEnabled bool
+
+	// ── API Key 인증 ──────────────────────────────────────────────────────
+	// API_KEY가 설정된 경우 /api/* 엔드포인트에 X-Api-Key 헤더 인증을 적용한다.
+	// 빈 문자열이면 인증 비활성화 (개발/테스트 환경).
+	// OTLP 수신 경로(/v1/*), 운영 경로(/healthz, /readyz, /metrics)는 인증 제외.
+	APIKey string
 }
 
 // Load는 환경변수에서 설정을 읽어 Config를 반환한다.
@@ -300,6 +306,7 @@ func Load() (*Config, error) {
 		KafkaMetricForecastGroup: envStr("KAFKA_METRIC_FORECAST_GROUP", "metric-forecast-feeder"),
 		KafkaLogRAGGroup:         envStr("KAFKA_LOG_RAG_GROUP", "log-rag-embedder"),
 		KafkaForecastEndpoint:    envStr("KAFKA_FORECAST_ENDPOINT", ""),
+		APIKey:                   envStr("API_KEY", ""),
 	}
 
 	if err := cfg.validate(); err != nil {

@@ -20,6 +20,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
@@ -111,25 +112,33 @@ func (s *K8sPodMetricsStore) QueryMetrics(ctx context.Context, p QueryK8sMetrics
 		p.Limit = 200
 	}
 
-	where := fmt.Sprintf("service_name = '%s'", p.ServiceName)
+	var conditions []string
+	var args []any
+
+	conditions = append(conditions, "service_name = ?")
+	args = append(args, p.ServiceName)
+
 	if p.PodName != "" {
-		where += fmt.Sprintf(" AND pod_name = '%s'", p.PodName)
+		conditions = append(conditions, "pod_name = ?")
+		args = append(args, p.PodName)
 	}
 	if p.FromMs > 0 {
-		where += fmt.Sprintf(" AND timestamp >= fromUnixTimestamp64Milli(%d)", p.FromMs)
+		conditions = append(conditions, fmt.Sprintf("timestamp >= fromUnixTimestamp64Milli(%d)", p.FromMs))
 	}
 	if p.ToMs > 0 {
-		where += fmt.Sprintf(" AND timestamp <= fromUnixTimestamp64Milli(%d)", p.ToMs)
+		conditions = append(conditions, fmt.Sprintf("timestamp <= fromUnixTimestamp64Milli(%d)", p.ToMs))
 	}
 
-	rows, err := s.conn.Query(ctx, fmt.Sprintf(`
+	query := fmt.Sprintf(`
 SELECT service_name, pod_name, node_name, namespace, host, container_id,
        cpu_usage_millicore, cpu_limit_millicore,
        memory_usage_bytes, memory_limit_bytes, memory_rss_bytes, timestamp
 FROM %s.k8s_pod_metrics
 WHERE %s
 ORDER BY timestamp DESC
-LIMIT %d`, s.db, where, p.Limit))
+LIMIT %d`, s.db, strings.Join(conditions, " AND "), p.Limit)
+
+	rows, err := s.conn.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

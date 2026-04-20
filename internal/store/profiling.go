@@ -17,6 +17,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
@@ -111,24 +112,32 @@ func (s *ProfilingStore) QuerySnapshots(ctx context.Context, p QuerySnapshotsPar
 		p.Limit = 50
 	}
 
-	where := fmt.Sprintf("service_name = '%s'", p.ServiceName)
+	var conditions []string
+	var args []any
+
+	conditions = append(conditions, "service_name = ?")
+	args = append(args, p.ServiceName)
+
 	if p.ProfileType != "" {
-		where += fmt.Sprintf(" AND profile_type = '%s'", p.ProfileType)
+		conditions = append(conditions, "profile_type = ?")
+		args = append(args, p.ProfileType)
 	}
 	if p.FromMs > 0 {
-		where += fmt.Sprintf(" AND sampled_at >= fromUnixTimestamp64Milli(%d)", p.FromMs)
+		conditions = append(conditions, fmt.Sprintf("sampled_at >= fromUnixTimestamp64Milli(%d)", p.FromMs))
 	}
 	if p.ToMs > 0 {
-		where += fmt.Sprintf(" AND sampled_at <= fromUnixTimestamp64Milli(%d)", p.ToMs)
+		conditions = append(conditions, fmt.Sprintf("sampled_at <= fromUnixTimestamp64Milli(%d)", p.ToMs))
 	}
 
-	rows, err := s.conn.Query(ctx, fmt.Sprintf(`
+	query := fmt.Sprintf(`
 SELECT id, service_name, profile_type, format,
        host, k8s_pod, k8s_node, k8s_namespace, duration_ms, sampled_at
 FROM %s.profiling_snapshots
 WHERE %s
 ORDER BY sampled_at DESC
-LIMIT %d`, s.db, where, p.Limit))
+LIMIT %d`, s.db, strings.Join(conditions, " AND "), p.Limit)
+
+	rows, err := s.conn.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

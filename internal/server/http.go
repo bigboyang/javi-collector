@@ -316,6 +316,10 @@ type HTTPServer struct {
 	// 매 요청마다 ClickHouse MV를 재스캔하는 오버헤드를 제거한다.
 	topoCache    sync.Map
 	topoCacheTTL time.Duration // 기본 60초
+
+	// apiKey가 비어 있지 않으면 /api/* 요청에 X-Api-Key 헤더 인증을 적용한다.
+	// OTLP 수신 경로(/v1/*), 운영 경로(/healthz, /readyz, /metrics)는 제외.
+	apiKey string
 }
 
 // DeploymentPublisher는 배포 이벤트 발행 인터페이스다.
@@ -337,73 +341,78 @@ func NewHTTPServer(addr string, ing *ingester.Ingester,
 
 	mux := http.NewServeMux()
 
-	// OTLP 수신 엔드포인트
+	// apiHandle은 /api/* 경로 등록 시 API Key 인증 미들웨어를 자동으로 감싼다.
+	apiHandle := func(pattern string, handler http.HandlerFunc) {
+		mux.HandleFunc(pattern, s.requireAPIKey(handler))
+	}
+
+	// OTLP 수신 엔드포인트 — 인증 제외 (Agent 측 헤더 설정 없음)
 	mux.HandleFunc("/v1/traces", s.handleTraces)
 	mux.HandleFunc("/v1/metrics", s.handleMetrics)
 	mux.HandleFunc("/v1/logs", s.handleLogs)
 	// CI/CD 배포 이벤트 수신 엔드포인트
 	mux.HandleFunc("/v1/events/deploy", s.handleDeployEvent)
 
-	// REST 조회 엔드포인트
-	mux.HandleFunc("/api/collector/traces", s.queryTraces)
-	mux.HandleFunc("/api/collector/metrics", s.queryMetrics)
-	mux.HandleFunc("/api/collector/logs", s.queryLogs)
-	mux.HandleFunc("/api/collector/stats", s.stats)
+	// REST 조회 엔드포인트 — API Key 인증 적용 (API_KEY 설정 시)
+	apiHandle("/api/collector/traces", s.queryTraces)
+	apiHandle("/api/collector/metrics", s.queryMetrics)
+	apiHandle("/api/collector/logs", s.queryLogs)
+	apiHandle("/api/collector/stats", s.stats)
 	// 대시보드용 집계 엔드포인트 (ClickHouse MV 기반)
-	mux.HandleFunc("/api/collector/red", s.queryRED)
-	mux.HandleFunc("/api/collector/topology", s.queryTopology)
-	mux.HandleFunc("/api/collector/error-logs", s.queryErrorLogs)
-	mux.HandleFunc("/api/collector/anomalies", s.queryAnomalies)
-	mux.HandleFunc("/api/collector/histogram", s.queryHistogram)
+	apiHandle("/api/collector/red", s.queryRED)
+	apiHandle("/api/collector/topology", s.queryTopology)
+	apiHandle("/api/collector/error-logs", s.queryErrorLogs)
+	apiHandle("/api/collector/anomalies", s.queryAnomalies)
+	apiHandle("/api/collector/histogram", s.queryHistogram)
 	// SSE 실시간 스트리밍 엔드포인트
-	mux.HandleFunc("/api/stream/logs", s.streamLogs)
-	mux.HandleFunc("/api/stream/alerts", s.streamAlerts)
+	apiHandle("/api/stream/logs", s.streamLogs)
+	apiHandle("/api/stream/alerts", s.streamAlerts)
 	// ClickHouse 직접 쿼리 (화이트리스트 SELECT)
-	mux.HandleFunc("/api/query", s.queryRaw)
+	apiHandle("/api/query", s.queryRaw)
 	// RAG 벡터 검색 (EMBED_ENABLED=true 시 활성)
-	mux.HandleFunc("/api/collector/search", s.handleSearch)
+	apiHandle("/api/collector/search", s.handleSearch)
 	// 브로큰 트레이스 탐지 (root span 없는 트레이스)
-	mux.HandleFunc("/api/collector/broken-traces", s.queryBrokenTraces)
+	apiHandle("/api/collector/broken-traces", s.queryBrokenTraces)
 	// 에러 그룹 집계 (Error Tracking)
-	mux.HandleFunc("/api/collector/error-groups", s.queryErrorGroups)
+	apiHandle("/api/collector/error-groups", s.queryErrorGroups)
 	// Gap 1: Correlated Signal Navigation — trace_id 기반 spans·logs·메트릭 통합 조회
-	mux.HandleFunc("/api/collector/trace-context", s.queryTraceContext)
+	apiHandle("/api/collector/trace-context", s.queryTraceContext)
 	// GAP-01: Trace Waterfall / Critical Path — 폭포수 뷰 + 임계 경로 분석
-	mux.HandleFunc("/api/collector/trace-waterfall", s.queryTraceWaterfall)
+	apiHandle("/api/collector/trace-waterfall", s.queryTraceWaterfall)
 	// 서비스 카탈로그 (팀 소유권, 운영 메타데이터)
-	mux.HandleFunc("/api/catalog/services", s.listCatalogServices)
-	mux.HandleFunc("/api/catalog/service", s.catalogService)
+	apiHandle("/api/catalog/services", s.listCatalogServices)
+	apiHandle("/api/catalog/service", s.catalogService)
 	// Gap 3: SLO/SLI + Burn-Rate Alerting
-	mux.HandleFunc("/api/slo/definitions", s.sloDefinitions)
-	mux.HandleFunc("/api/slo/burn-alerts", s.sloBurnAlerts)
+	apiHandle("/api/slo/definitions", s.sloDefinitions)
+	apiHandle("/api/slo/burn-alerts", s.sloBurnAlerts)
 	// P1: RCA 결과 조회 + 피드백
-	mux.HandleFunc("/api/rca/reports", s.queryRCAReports)
-	mux.HandleFunc("/api/rca/feedback", s.updateRCAFeedback)
+	apiHandle("/api/rca/reports", s.queryRCAReports)
+	apiHandle("/api/rca/feedback", s.updateRCAFeedback)
 
 	// GAP-05: Alert Routing & Escalation
-	mux.HandleFunc("/api/alerts/routes", s.alertRoutes_)
-	mux.HandleFunc("/api/alerts/history", s.alertHistory)
-	mux.HandleFunc("/api/alerts/ack", s.alertAck)
+	apiHandle("/api/alerts/routes", s.alertRoutes_)
+	apiHandle("/api/alerts/history", s.alertHistory)
+	apiHandle("/api/alerts/ack", s.alertAck)
 
 	// GAP-06: Log Analytics
-	mux.HandleFunc("/api/logs/volume", s.queryLogVolume)
-	mux.HandleFunc("/api/logs/search", s.queryLogSearch)
-	mux.HandleFunc("/api/logs/patterns", s.queryLogPatterns)
-	mux.HandleFunc("/api/logs/context", s.queryLogContext)
-	mux.HandleFunc("/api/logs/fields", s.queryLogFields)
+	apiHandle("/api/logs/volume", s.queryLogVolume)
+	apiHandle("/api/logs/search", s.queryLogSearch)
+	apiHandle("/api/logs/patterns", s.queryLogPatterns)
+	apiHandle("/api/logs/context", s.queryLogContext)
+	apiHandle("/api/logs/fields", s.queryLogFields)
 	// DB Slow Query MV — db_system != '' 스팬 중 임계값 초과 쿼리 조회
-	mux.HandleFunc("/api/collector/slow-queries", s.querySlowQueries)
+	apiHandle("/api/collector/slow-queries", s.querySlowQueries)
 	// GAP-08: Infra Metrics Correlation — k8s 컨텍스트 + JVM/인프라 메트릭 상관
-	mux.HandleFunc("/api/collector/infra-correlation", s.queryInfraCorrelation)
+	apiHandle("/api/collector/infra-correlation", s.queryInfraCorrelation)
 	// GAP-07: Continuous Profiling — 프로파일링 스냅샷 수신/조회
-	mux.HandleFunc("/api/collector/profiling", s.handleProfiling)
-	mux.HandleFunc("/api/collector/profiling/payload", s.handleProfilingPayload)
-	mux.HandleFunc("/api/collector/profiling/summary", s.handleProfilingSummary)
+	apiHandle("/api/collector/profiling", s.handleProfiling)
+	apiHandle("/api/collector/profiling/payload", s.handleProfilingPayload)
+	apiHandle("/api/collector/profiling/summary", s.handleProfilingSummary)
 	// GAP-08 확장: K8s Pod 리소스 메트릭 수신/조회 — Agent cgroup 수집값
-	mux.HandleFunc("/api/collector/k8s-metrics", s.handleK8sMetrics)
-	mux.HandleFunc("/api/collector/k8s-metrics/summary", s.handleK8sMetricsSummary)
+	apiHandle("/api/collector/k8s-metrics", s.handleK8sMetrics)
+	apiHandle("/api/collector/k8s-metrics/summary", s.handleK8sMetricsSummary)
 
-	// 운영 엔드포인트
+	// 운영 엔드포인트 — 인증 제외 (로드밸런서/프로메테우스 헬스체크)
 	// /healthz: liveness probe — 프로세스가 살아있으면 200
 	// /readyz:  readiness probe — MarkReady() 호출 후 200 (로드밸런서 트래픽 수신 여부 제어)
 	// /metrics: Prometheus scrape 엔드포인트
@@ -513,6 +522,37 @@ func (s *HTTPServer) SetProfilingStore(ps ProfilingWriter) {
 // GAP-08 확장: nil이면 /api/collector/k8s-metrics 가 501을 반환한다.
 func (s *HTTPServer) SetK8sMetrics(km K8sMetricsWriter) {
 	s.k8sMetrics = km
+}
+
+// SetAPIKey는 /api/* 엔드포인트에 적용할 API Key를 설정한다.
+// 빈 문자열이면 인증 비활성화. Start() 전에 호출해야 한다.
+func (s *HTTPServer) SetAPIKey(key string) {
+	s.apiKey = key
+}
+
+// requireAPIKey는 API Key 인증 미들웨어다.
+// s.apiKey가 설정된 경우 X-Api-Key 헤더 또는 Authorization: Bearer <key>를 검증한다.
+// 빈 apiKey이면 인증 없이 통과시킨다.
+func (s *HTTPServer) requireAPIKey(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.apiKey == "" {
+			next(w, r)
+			return
+		}
+		provided := r.Header.Get("X-Api-Key")
+		if provided == "" {
+			if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+				provided = strings.TrimPrefix(auth, "Bearer ")
+			}
+		}
+		if provided != s.apiKey {
+			w.Header().Set("Content-Type", jsonContentType)
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+			return
+		}
+		next(w, r)
+	}
 }
 
 // queryInfraCorrelation은 /api/collector/infra-correlation 엔드포인트를 처리한다.

@@ -719,6 +719,12 @@ func main() {
 		httpSrv.SetDeployProducer(deployPub)
 	}
 
+	// API Key 인증 주입 (API_KEY 설정 시 /api/* 엔드포인트에 적용)
+	if cfg.APIKey != "" {
+		httpSrv.SetAPIKey(cfg.APIKey)
+		slog.Info("API key authentication enabled for /api/* endpoints")
+	}
+
 	// HTTP 서버 시작
 	go func() {
 		if err := httpSrv.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
