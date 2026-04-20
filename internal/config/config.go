@@ -221,6 +221,14 @@ type Config struct {
 	// 빈 문자열이면 인증 비활성화 (개발/테스트 환경).
 	// OTLP 수신 경로(/v1/*), 운영 경로(/healthz, /readyz, /metrics)는 인증 제외.
 	APIKey string
+
+	// ── MemoryStore WAL ───────────────────────────────────────────────────────
+	// DISABLE_CLICKHOUSE=true 인 경우 인메모리 링버퍼에 WAL(Write-Ahead Log)을 활성화해
+	// 프로세스 재시작 후 데이터를 복구한다.
+	// WAL_ENABLED=false로 명시하면 비활성화한다(기본: DISABLE_CLICKHOUSE와 동일).
+	WALEnabled  bool   // WAL 활성화 여부 (WAL_ENABLED)
+	WALDir      string // WAL 파일 저장 디렉터리 (WAL_DIR, 기본: ./wal)
+	WALMaxBytes int64  // 이 크기 초과 시 compact 수행 (WAL_MAX_BYTES, 기본: 67108864 = 64 MiB)
 }
 
 // Load는 환경변수에서 설정을 읽어 Config를 반환한다.
@@ -307,6 +315,14 @@ func Load() (*Config, error) {
 		KafkaLogRAGGroup:         envStr("KAFKA_LOG_RAG_GROUP", "log-rag-embedder"),
 		KafkaForecastEndpoint:    envStr("KAFKA_FORECAST_ENDPOINT", ""),
 		APIKey:                   envStr("API_KEY", ""),
+		WALDir:      envStr("WAL_DIR", "./wal"),
+		WALMaxBytes: int64(envInt("WAL_MAX_BYTES", 64<<20)),
+	}
+	// WAL_ENABLED 환경변수가 명시되지 않으면 DISABLE_CLICKHOUSE 값을 따른다.
+	if walEnv := os.Getenv("WAL_ENABLED"); walEnv != "" {
+		cfg.WALEnabled = envBool("WAL_ENABLED", false)
+	} else {
+		cfg.WALEnabled = cfg.DisableClickHouse
 	}
 
 	if err := cfg.validate(); err != nil {

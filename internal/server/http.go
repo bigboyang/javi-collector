@@ -48,6 +48,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -246,6 +247,7 @@ type HTTPServer struct {
 	logStore    store.LogStore
 	srv         *http.Server
 	ready       chan struct{} // close되면 readyz가 200을 반환한다
+	draining    atomic.Bool  // true이면 readyz가 503을 반환한다 (graceful shutdown 드레인)
 
 	// traceRouter는 멀티 인스턴스 Tail Sampling 시 traceID 기반 라우팅을 담당한다.
 	// nil이면 라우팅 비활성화 (단일 인스턴스 또는 Sampling 미사용 배포).
@@ -1273,6 +1275,13 @@ func (s *HTTPServer) MarkReady() {
 	}
 }
 
+// UnmarkReady는 graceful shutdown 드레인 단계에서 /readyz가 503을 반환하도록 한다.
+// Shutdown() 전에 호출하면 로드밸런서가 이 인스턴스로의 라우팅을 중단할 시간을 확보한다.
+// 예: UnmarkReady() → sleep(5s) → Shutdown()
+func (s *HTTPServer) UnmarkReady() {
+	s.draining.Store(true)
+}
+
 func (s *HTTPServer) Start() error {
 	slog.Info("HTTP server starting", "addr", s.srv.Addr)
 	return s.srv.ListenAndServe()
@@ -2169,32 +2178,58 @@ func (s *HTTPServer) healthz(w http.ResponseWriter, r *http.Request) {
 }
 
 // readyz는 readiness probe 엔드포인트다.
-// MarkReady()가 호출된 이후에만 200을 반환한다.
-// ReadinessChecker 인터페이스를 구현한 traceStore가 있으면 상세 JSON을 함께 반환한다.
+// 다음 세 가지 조건을 순서대로 확인한다:
+//  1. MarkReady()가 호출되어 초기화가 완료되었는지 (미완료 → 503)
+//  2. UnmarkReady()로 드레인 중인지 (드레인 중 → 503)
+//  3. ClickHouse 생존 여부 (실패 → 503 + JSON 상세)
 //
-// 응답 예시:
+// Kubernetes readiness probe는 HTTP 상태코드만 확인하므로
+// 초기화 이후 ClickHouse 장애 시에도 503을 반환해 로드밸런서에서 제외된다.
+//
+// 응답 예시 (정상):
 //
 //	{"ready":true,"clickhouse":"ok","channel":{"ch_len":12,"ch_cap":1000,"cb_state":"closed"}}
+//
+// 응답 예시 (ClickHouse 장애):
+//
+//	{"ready":false,"clickhouse":"error: dial tcp: connection refused","channel":{...}}
 func (s *HTTPServer) readyz(w http.ResponseWriter, r *http.Request) {
+	// 1. 초기화 게이트: MarkReady() 호출 전이면 503
 	select {
 	case <-s.ready:
-		// ready 상태: 상세 진단 정보 포함
-		status := map[string]any{"ready": true}
-		if checker, ok := s.traceStore.(ReadinessChecker); ok {
-			pingCtx := r.Context()
-			if err := checker.Ping(pingCtx); err != nil {
-				status["clickhouse"] = "error: " + err.Error()
-			} else {
-				status["clickhouse"] = "ok"
-			}
-			status["channel"] = checker.ChannelStatus()
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(status)
+		// 초기화 완료
 	default:
 		http.Error(w, "not ready", http.StatusServiceUnavailable)
+		return
 	}
+
+	// 2. Graceful shutdown 드레인: UnmarkReady() 호출 후 503
+	if s.draining.Load() {
+		http.Error(w, "draining", http.StatusServiceUnavailable)
+		return
+	}
+
+	// 3. 백엔드 생존 여부: ClickHouse ping 실패 시 503
+	status := map[string]any{"ready": true}
+	healthy := true
+	if checker, ok := s.traceStore.(ReadinessChecker); ok {
+		pingCtx := r.Context()
+		if err := checker.Ping(pingCtx); err != nil {
+			status["clickhouse"] = "error: " + err.Error()
+			status["ready"] = false
+			healthy = false
+		} else {
+			status["clickhouse"] = "ok"
+		}
+		status["channel"] = checker.ChannelStatus()
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if healthy {
+		w.WriteHeader(http.StatusOK)
+	} else {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+	_ = json.NewEncoder(w).Encode(status)
 }
 
 // ---- 헬퍼 ----

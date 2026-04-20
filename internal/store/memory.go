@@ -119,6 +119,11 @@ func (s *MemoryTraceStore) Close() error { return nil }
 
 func (s *MemoryTraceStore) Size() int { return s.buf.len() }
 
+// Snapshot은 현재 링버퍼의 모든 항목을 반환한다. WAL compact 시 사용한다.
+func (s *MemoryTraceStore) Snapshot() []*model.SpanData {
+	return s.buf.latest(s.buf.len())
+}
+
 // MemoryMetricStore는 인메모리 링버퍼 기반 MetricStore 구현체다.
 type MemoryMetricStore struct {
 	buf *ringBuffer[*model.MetricData]
@@ -165,6 +170,11 @@ func (s *MemoryMetricStore) QueryMetrics(_ context.Context, q MetricQuery) ([]*m
 func (s *MemoryMetricStore) Close() error { return nil }
 
 func (s *MemoryMetricStore) Size() int { return s.buf.len() }
+
+// Snapshot은 현재 링버퍼의 모든 항목을 반환한다. WAL compact 시 사용한다.
+func (s *MemoryMetricStore) Snapshot() []*model.MetricData {
+	return s.buf.latest(s.buf.len())
+}
 
 // MemoryLogStore는 인메모리 링버퍼 기반 LogStore 구현체다.
 type MemoryLogStore struct {
@@ -215,3 +225,8 @@ func (s *MemoryLogStore) QueryLogs(_ context.Context, q LogQuery) ([]*model.LogD
 func (s *MemoryLogStore) Close() error { return nil }
 
 func (s *MemoryLogStore) Size() int { return s.buf.len() }
+
+// Snapshot은 현재 링버퍼의 모든 항목을 반환한다. WAL compact 시 사용한다.
+func (s *MemoryLogStore) Snapshot() []*model.LogData {
+	return s.buf.latest(s.buf.len())
+}

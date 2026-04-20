@@ -58,9 +58,37 @@ func main() {
 
 	if cfg.DisableClickHouse {
 		slog.Info("using in-memory store (ClickHouse disabled)")
-		traceStore = store.NewMemoryTraceStore(cfg.MemoryBufferSize)
-		metricStore = store.NewMemoryMetricStore(cfg.MemoryBufferSize)
-		logStore = store.NewMemoryLogStore(cfg.MemoryBufferSize)
+		memTrace := store.NewMemoryTraceStore(cfg.MemoryBufferSize)
+		memMetric := store.NewMemoryMetricStore(cfg.MemoryBufferSize)
+		memLog := store.NewMemoryLogStore(cfg.MemoryBufferSize)
+
+		if cfg.WALEnabled {
+			walCfg := store.WALConfig{Dir: cfg.WALDir, MaxBytes: cfg.WALMaxBytes}
+			slog.Info("wal enabled", "dir", cfg.WALDir, "max_bytes", cfg.WALMaxBytes)
+
+			if ws, werr := store.NewWALTraceStore(memTrace, walCfg); werr != nil {
+				slog.Warn("wal trace store init failed, falling back to memory-only", "err", werr)
+				traceStore = memTrace
+			} else {
+				traceStore = ws
+			}
+			if ws, werr := store.NewWALMetricStore(memMetric, walCfg); werr != nil {
+				slog.Warn("wal metric store init failed, falling back to memory-only", "err", werr)
+				metricStore = memMetric
+			} else {
+				metricStore = ws
+			}
+			if ws, werr := store.NewWALLogStore(memLog, walCfg); werr != nil {
+				slog.Warn("wal log store init failed, falling back to memory-only", "err", werr)
+				logStore = memLog
+			} else {
+				logStore = ws
+			}
+		} else {
+			traceStore = memTrace
+			metricStore = memMetric
+			logStore = memLog
+		}
 	} else {
 		chCfg := store.ClickHouseConfig{
 			Addr:               cfg.ClickHouseAddr,
@@ -755,8 +783,11 @@ func main() {
 	slog.Info("shutting down...")
 
 	// readyz를 먼저 비활성화해 새 연결을 차단한다.
-	// (HTTPServer.Shutdown 전에 readyz가 503을 반환하도록 하면
-	//  로드밸런서가 이 인스턴스로의 라우팅을 중단할 시간을 확보할 수 있다.)
+	// UnmarkReady() 호출 → readyz가 즉시 503 반환 →
+	// 로드밸런서가 이 인스턴스를 제거할 시간(terminationGracePeriodSeconds)을 확보한다.
+	httpSrv.UnmarkReady()
+	slog.Info("readyz deactivated, waiting for load balancer drain")
+
 	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
