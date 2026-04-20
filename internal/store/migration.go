@@ -164,6 +164,10 @@ func (m *Migrator) recordApplied(ctx context.Context, mg Migration) error {
 // SpansMigrations는 spans 테이블에 대한 버전 관리 마이그레이션 목록이다.
 // 새 컬럼/인덱스 추가 시 이 슬라이스에 항목을 추가한다.
 // SQL은 반드시 멱등적(idempotent)이어야 한다 (IF NOT EXISTS / IF EXISTS 사용).
+//
+// 버전 범위:
+//   - 1–5:  spans 테이블 컬럼 추가 (%SPANS_TABLE% 플레이스홀더)
+//   - 6–99: RED 롤업 테이블 추가 (%DB% 플레이스홀더)
 var SpansMigrations = []Migration{
 	{
 		Version:     1,
@@ -190,10 +194,88 @@ var SpansMigrations = []Migration{
 		Description: "add span_kind_str materialized column for human-readable span kind filtering",
 		SQL:         `ALTER TABLE %SPANS_TABLE% ADD COLUMN IF NOT EXISTS span_kind_str LowCardinality(String) MATERIALIZED multiIf(kind=1,'INTERNAL',kind=2,'SERVER',kind=3,'CLIENT',kind=4,'PRODUCER',kind=5,'CONSUMER','UNSPECIFIED')`,
 	},
+	// M-7: 데이터 티어링 — 5분/1시간 RED 롤업 테이블
+	{
+		Version:     6,
+		Description: "create mv_red_5m_state for 5-minute RED rollup (180-day retention)",
+		SQL: `CREATE TABLE IF NOT EXISTS %DB%.mv_red_5m_state (
+    service_name       LowCardinality(String),
+    span_name          LowCardinality(String),
+    http_route         LowCardinality(String),
+    minute5            DateTime,
+    total_count        SimpleAggregateFunction(sum, UInt64),
+    error_count        SimpleAggregateFunction(sum, UInt64),
+    duration_quantiles AggregateFunction(quantiles(0.5, 0.95, 0.99), Float64),
+    duration_sum       SimpleAggregateFunction(sum, Float64),
+    dt Date
+) ENGINE = AggregatingMergeTree()
+PARTITION BY dt
+ORDER BY (service_name, minute5, span_name)
+TTL dt + INTERVAL 180 DAY`,
+	},
+	{
+		Version:     7,
+		Description: "create mv_red_5m materialized view aggregating spans into 5-minute buckets",
+		SQL: `CREATE MATERIALIZED VIEW IF NOT EXISTS %DB%.mv_red_5m
+TO %DB%.mv_red_5m_state
+AS SELECT
+    service_name,
+    name                                                             AS span_name,
+    http_route,
+    toStartOfFiveMinute(fromUnixTimestamp64Nano(start_time_nano))  AS minute5,
+    toUInt64(count())                                               AS total_count,
+    toUInt64(countIf(status_code = 2))                             AS error_count,
+    quantilesState(0.5, 0.95, 0.99)(toFloat64(duration_nano))     AS duration_quantiles,
+    toFloat64(sum(duration_nano))                                   AS duration_sum,
+    dt
+FROM %DB%.spans
+WHERE kind IN (2, 5)
+GROUP BY service_name, span_name, http_route, minute5, dt`,
+	},
+	{
+		Version:     8,
+		Description: "create mv_red_1h_state for 1-hour RED rollup (365-day retention)",
+		SQL: `CREATE TABLE IF NOT EXISTS %DB%.mv_red_1h_state (
+    service_name       LowCardinality(String),
+    span_name          LowCardinality(String),
+    http_route         LowCardinality(String),
+    hour               DateTime,
+    total_count        SimpleAggregateFunction(sum, UInt64),
+    error_count        SimpleAggregateFunction(sum, UInt64),
+    duration_quantiles AggregateFunction(quantiles(0.5, 0.95, 0.99), Float64),
+    duration_sum       SimpleAggregateFunction(sum, Float64),
+    dt Date
+) ENGINE = AggregatingMergeTree()
+PARTITION BY dt
+ORDER BY (service_name, hour, span_name)
+TTL dt + INTERVAL 365 DAY`,
+	},
+	{
+		Version:     9,
+		Description: "create mv_red_1h materialized view aggregating spans into 1-hour buckets",
+		SQL: `CREATE MATERIALIZED VIEW IF NOT EXISTS %DB%.mv_red_1h
+TO %DB%.mv_red_1h_state
+AS SELECT
+    service_name,
+    name                                                         AS span_name,
+    http_route,
+    toStartOfHour(fromUnixTimestamp64Nano(start_time_nano))     AS hour,
+    toUInt64(count())                                            AS total_count,
+    toUInt64(countIf(status_code = 2))                          AS error_count,
+    quantilesState(0.5, 0.95, 0.99)(toFloat64(duration_nano))  AS duration_quantiles,
+    toFloat64(sum(duration_nano))                               AS duration_sum,
+    dt
+FROM %DB%.spans
+WHERE kind IN (2, 5)
+GROUP BY service_name, span_name, http_route, hour, dt`,
+	},
 }
 
 // MetricsMigrations는 metrics 테이블에 대한 버전 관리 마이그레이션 목록이다.
-// 버전 범위: 100–199 (SpansMigrations 1–99와 충돌 방지)
+//
+// 버전 범위:
+//   - 100–109: mv_histogram_1m 버킷 집계 재구성 (M-2)
+//   - 110–199: 히스토그램 5분/1시간 롤업 테이블 추가 (M-7)
 var MetricsMigrations = []Migration{
 	{
 		Version:     100,
@@ -227,14 +309,128 @@ AS SELECT
 FROM %DB%.metric_histograms
 GROUP BY service_name, metric_name, minute, dt`,
 	},
+	// M-7: 데이터 티어링 — 5분/1시간 히스토그램 롤업 테이블
+	{
+		Version:     110,
+		Description: "create mv_histogram_5m_state for 5-minute histogram rollup (180-day retention)",
+		SQL: `CREATE TABLE IF NOT EXISTS %DB%.mv_histogram_5m_state (
+    service_name         LowCardinality(String),
+    metric_name          LowCardinality(String),
+    minute5              DateTime,
+    count_state          AggregateFunction(sum, UInt64),
+    sum_state            AggregateFunction(sum, Float64),
+    bucket_counts_state  AggregateFunction(sumForEach, Array(UInt64)),
+    bounds_state         AggregateFunction(any, Array(Float64)),
+    dt Date
+) ENGINE = AggregatingMergeTree()
+PARTITION BY dt
+ORDER BY (service_name, metric_name, minute5)
+TTL dt + INTERVAL 180 DAY`,
+	},
+	{
+		Version:     111,
+		Description: "create mv_histogram_5m materialized view aggregating metric_histograms into 5-minute buckets",
+		SQL: `CREATE MATERIALIZED VIEW IF NOT EXISTS %DB%.mv_histogram_5m
+TO %DB%.mv_histogram_5m_state
+AS SELECT
+    service_name,
+    metric_name,
+    toStartOfFiveMinute(fromUnixTimestamp64Nano(timestamp_nano)) AS minute5,
+    sumState(total_count)          AS count_state,
+    sumState(total_sum)            AS sum_state,
+    sumForEachState(bucket_counts) AS bucket_counts_state,
+    anyState(bounds)               AS bounds_state,
+    dt
+FROM %DB%.metric_histograms
+GROUP BY service_name, metric_name, minute5, dt`,
+	},
+	{
+		Version:     112,
+		Description: "create mv_histogram_1h_state for 1-hour histogram rollup (365-day retention)",
+		SQL: `CREATE TABLE IF NOT EXISTS %DB%.mv_histogram_1h_state (
+    service_name         LowCardinality(String),
+    metric_name          LowCardinality(String),
+    hour                 DateTime,
+    count_state          AggregateFunction(sum, UInt64),
+    sum_state            AggregateFunction(sum, Float64),
+    bucket_counts_state  AggregateFunction(sumForEach, Array(UInt64)),
+    bounds_state         AggregateFunction(any, Array(Float64)),
+    dt Date
+) ENGINE = AggregatingMergeTree()
+PARTITION BY dt
+ORDER BY (service_name, metric_name, hour)
+TTL dt + INTERVAL 365 DAY`,
+	},
+	{
+		Version:     113,
+		Description: "create mv_histogram_1h materialized view aggregating metric_histograms into 1-hour buckets",
+		SQL: `CREATE MATERIALIZED VIEW IF NOT EXISTS %DB%.mv_histogram_1h
+TO %DB%.mv_histogram_1h_state
+AS SELECT
+    service_name,
+    metric_name,
+    toStartOfHour(fromUnixTimestamp64Nano(timestamp_nano)) AS hour,
+    sumState(total_count)          AS count_state,
+    sumState(total_sum)            AS sum_state,
+    sumForEachState(bucket_counts) AS bucket_counts_state,
+    anyState(bounds)               AS bounds_state,
+    dt
+FROM %DB%.metric_histograms
+GROUP BY service_name, metric_name, hour, dt`,
+	},
 }
 
 // LogsMigrations는 logs 테이블에 대한 버전 관리 마이그레이션 목록이다.
-var LogsMigrations = []Migration{}
+//
+// 버전 범위: 200–299 (SpansMigrations 1–99, MetricsMigrations 100–199와 충돌 방지)
+var LogsMigrations = []Migration{
+	// M-7: 데이터 티어링 — 1시간 에러 로그 롤업 테이블
+	{
+		Version:     200,
+		Description: "create mv_error_logs_1h_state for 1-hour error log rollup (365-day retention)",
+		SQL: `CREATE TABLE IF NOT EXISTS %DB%.mv_error_logs_1h_state (
+    service_name   LowCardinality(String),
+    exception_type LowCardinality(String),
+    hour           DateTime,
+    error_count    SimpleAggregateFunction(sum, UInt64),
+    dt Date
+) ENGINE = AggregatingMergeTree()
+PARTITION BY dt
+ORDER BY (service_name, hour, exception_type)
+TTL dt + INTERVAL 365 DAY`,
+	},
+	{
+		Version:     201,
+		Description: "create mv_error_logs_1h materialized view aggregating error logs into 1-hour buckets",
+		SQL: `CREATE MATERIALIZED VIEW IF NOT EXISTS %DB%.mv_error_logs_1h
+TO %DB%.mv_error_logs_1h_state
+AS SELECT
+    service_name,
+    exception_type,
+    toStartOfHour(fromUnixTimestamp64Nano(timestamp_nano)) AS hour,
+    toUInt64(count()) AS error_count,
+    dt
+FROM %DB%.logs
+WHERE severity_number >= 17
+GROUP BY service_name, exception_type, hour, dt`,
+	},
+}
 
-// BuildSpansMigrations는 데이터베이스 이름을 치환한 SpansMigrations를 반환한다.
+// BuildSpansMigrations는 %SPANS_TABLE%을 db.spans으로, %DB%를 db로 치환한 SpansMigrations를 반환한다.
+// v1–5는 %SPANS_TABLE% 플레이스홀더를 사용하고, v6+는 %DB% 플레이스홀더를 사용한다.
 func BuildSpansMigrations(db string) []Migration {
-	return buildMigrations(SpansMigrations, db+".spans")
+	spansTable := db + ".spans"
+	result := make([]Migration, len(SpansMigrations))
+	for i, m := range SpansMigrations {
+		sql := strings.ReplaceAll(m.SQL, "%SPANS_TABLE%", spansTable)
+		sql = strings.ReplaceAll(sql, "%DB%", db)
+		result[i] = Migration{
+			Version:     m.Version,
+			Description: m.Description,
+			SQL:         sql,
+		}
+	}
+	return result
 }
 
 // BuildMetricsMigrations는 %DB% 플레이스홀더를 db로 치환한 MetricsMigrations를 반환한다.
@@ -250,7 +446,21 @@ func BuildMetricsMigrations(db string) []Migration {
 	return result
 }
 
-// buildMigrations는 마이그레이션 SQL에서 %TABLE% 플레이스홀더를 table로 치환한다.
+// BuildLogsMigrations는 %DB% 플레이스홀더를 db로 치환한 LogsMigrations를 반환한다.
+func BuildLogsMigrations(db string) []Migration {
+	result := make([]Migration, len(LogsMigrations))
+	for i, m := range LogsMigrations {
+		result[i] = Migration{
+			Version:     m.Version,
+			Description: m.Description,
+			SQL:         strings.ReplaceAll(m.SQL, "%DB%", db),
+		}
+	}
+	return result
+}
+
+// buildMigrations는 마이그레이션 SQL에서 %SPANS_TABLE% 플레이스홀더를 table로 치환한다.
+// Deprecated: BuildSpansMigrations를 사용하세요 (%DB% 치환도 지원).
 func buildMigrations(migrations []Migration, table string) []Migration {
 	result := make([]Migration, len(migrations))
 	for i, m := range migrations {

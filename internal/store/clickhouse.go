@@ -425,17 +425,45 @@ func (s *ClickHouseTraceStore) QuerySpans(ctx context.Context, q SpanQuery) ([]*
 	return result, rows.Err()
 }
 
-// QueryRED는 mv_red_1m_state에서 서비스별 RED 메트릭을 반환한다.
+// redTableForRange는 쿼리 시간 범위에 따라 적절한 RED 롤업 테이블과 타임스탬프 컬럼명을 반환한다.
+//
+// 티어링 기준:
+//   - < 3h:   1분 집계 (mv_red_1m_state, "minute")
+//   - 3h–24h: 5분 집계 (mv_red_5m_state, "minute5")
+//   - > 24h:  1시간 집계 (mv_red_1h_state, "hour")
+func redTableForRange(fromMs, toMs int64) (table, tsCol string) {
+	if fromMs <= 0 || toMs <= 0 {
+		return "mv_red_1m_state", "minute"
+	}
+	const (
+		threeHoursMs    = int64(3 * 60 * 60 * 1000)
+		twentyFourHrsMs = int64(24 * 60 * 60 * 1000)
+	)
+	rangeMs := toMs - fromMs
+	switch {
+	case rangeMs > twentyFourHrsMs:
+		return "mv_red_1h_state", "hour"
+	case rangeMs > threeHoursMs:
+		return "mv_red_5m_state", "minute5"
+	default:
+		return "mv_red_1m_state", "minute"
+	}
+}
+
+// QueryRED는 서비스별 RED 메트릭을 반환한다.
+// 쿼리 시간 범위에 따라 1분/5분/1시간 롤업 테이블 중 하나를 자동 선택한다 (데이터 티어링).
 func (s *ClickHouseTraceStore) QueryRED(ctx context.Context, service string, fromMs, toMs int64) ([]map[string]any, error) {
+	table, tsCol := redTableForRange(fromMs, toMs)
+
 	var conds []string
 	var args []any
 
 	if fromMs > 0 {
-		conds = append(conds, "minute >= ?")
+		conds = append(conds, tsCol+" >= ?")
 		args = append(args, fromMs/1000)
 	}
 	if toMs > 0 {
-		conds = append(conds, "minute <= ?")
+		conds = append(conds, tsCol+" <= ?")
 		args = append(args, toMs/1000)
 	}
 	if service != "" {
@@ -453,18 +481,18 @@ SELECT
     service_name,
     span_name,
     http_route,
-    minute,
+    %s AS minute,
     sum(total_count)                                                   AS rps,
     sum(error_count)                                                   AS errors,
     sum(error_count) / sum(total_count) * 100                         AS error_rate_pct,
     quantilesMerge(0.5, 0.95, 0.99)(duration_quantiles)[1] / 1e6    AS p50_ms,
     quantilesMerge(0.5, 0.95, 0.99)(duration_quantiles)[2] / 1e6    AS p95_ms,
     quantilesMerge(0.5, 0.95, 0.99)(duration_quantiles)[3] / 1e6    AS p99_ms
-FROM %s.mv_red_1m_state
+FROM %s.%s
 %s
-GROUP BY service_name, span_name, http_route, minute
+GROUP BY service_name, span_name, http_route, %s
 ORDER BY minute DESC
-LIMIT 1000`, s.cfg.Database, where)
+LIMIT 1000`, tsCol, s.cfg.Database, table, where, tsCol)
 
 	rows, err := s.conn.Query(ctx, sql, args...)
 	if err != nil {
@@ -1619,22 +1647,50 @@ func (s *ClickHouseMetricStore) QueryMetrics(ctx context.Context, q MetricQuery)
 	return result, hrows.Err()
 }
 
-// QueryHistogramMV는 mv_histogram_1m_state에서 1분 집계 히스토그램 메트릭을 반환한다.
+// histogramTableForRange는 쿼리 시간 범위에 따라 적절한 히스토그램 롤업 테이블과 타임스탬프 컬럼명을 반환한다.
+//
+// 티어링 기준:
+//   - < 3h:   1분 집계 (mv_histogram_1m_state, "minute")
+//   - 3h–24h: 5분 집계 (mv_histogram_5m_state, "minute5")
+//   - > 24h:  1시간 집계 (mv_histogram_1h_state, "hour")
+func histogramTableForRange(fromMs, toMs int64) (table, tsCol string) {
+	if fromMs <= 0 || toMs <= 0 {
+		return "mv_histogram_1m_state", "minute"
+	}
+	const (
+		threeHoursMs    = int64(3 * 60 * 60 * 1000)
+		twentyFourHrsMs = int64(24 * 60 * 60 * 1000)
+	)
+	rangeMs := toMs - fromMs
+	switch {
+	case rangeMs > twentyFourHrsMs:
+		return "mv_histogram_1h_state", "hour"
+	case rangeMs > threeHoursMs:
+		return "mv_histogram_5m_state", "minute5"
+	default:
+		return "mv_histogram_1m_state", "minute"
+	}
+}
+
+// QueryHistogramMV는 히스토그램 메트릭을 반환한다.
+// 쿼리 시간 범위에 따라 1분/5분/1시간 롤업 테이블 중 하나를 자동 선택한다 (데이터 티어링).
 // 버킷 분포로부터 P50/P95/P99를 선형 보간으로 계산한다.
 // GET /api/collector/histogram?service=svc&name=http.server.duration&from=<ms>&to=<ms>&limit=100
 func (s *ClickHouseMetricStore) QueryHistogramMV(ctx context.Context, service, name string, fromMs, toMs int64, limit int) ([]map[string]any, error) {
 	if limit <= 0 {
 		limit = 100
 	}
+	table, tsCol := histogramTableForRange(fromMs, toMs)
+
 	var conds []string
 	var args []any
 
 	if fromMs > 0 {
-		conds = append(conds, "minute >= ?")
+		conds = append(conds, tsCol+" >= ?")
 		args = append(args, time.UnixMilli(fromMs).UTC())
 	}
 	if toMs > 0 {
-		conds = append(conds, "minute <= ?")
+		conds = append(conds, tsCol+" <= ?")
 		args = append(args, time.UnixMilli(toMs).UTC())
 	}
 	if service != "" {
@@ -1652,16 +1708,16 @@ func (s *ClickHouseMetricStore) QueryHistogramMV(ctx context.Context, service, n
 	}
 
 	q := fmt.Sprintf(`
-SELECT service_name, metric_name, minute,
+SELECT service_name, metric_name, %s AS minute,
        sumMerge(count_state)               AS count,
        sumMerge(sum_state)                 AS sum,
        sumForEachMerge(bucket_counts_state) AS bucket_counts,
        anyMerge(bounds_state)              AS bounds
-FROM %s.mv_histogram_1m_state
+FROM %s.%s
 %s
-GROUP BY service_name, metric_name, minute
+GROUP BY service_name, metric_name, %s
 ORDER BY minute DESC
-LIMIT %d`, s.cfg.Database, where, limit)
+LIMIT %d`, tsCol, s.cfg.Database, table, where, tsCol, limit)
 
 	rows, err := s.conn.Query(ctx, q, args...)
 	if err != nil {
@@ -2020,6 +2076,12 @@ func (s *ClickHouseLogStore) loadDynCfg() storeDynCfg {
 func NewClickHouseLogStore(conn driver.Conn, cfg ClickHouseConfig) (*ClickHouseLogStore, error) {
 	if err := ensureLogsTable(conn, cfg.Database, cfg.RetentionDays); err != nil {
 		return nil, fmt.Errorf("clickhouse log DDL: %w", err)
+	}
+
+	// 로그 MV 스키마 마이그레이션 (1시간 에러 로그 롤업 테이블 추가)
+	migrator := NewMigrator(conn, cfg.Database)
+	if err := migrator.Run(context.Background(), BuildLogsMigrations(cfg.Database)); err != nil {
+		slog.Warn("logs schema migration failed", "err", err)
 	}
 
 	var dlq *FileBackupWriter
@@ -2703,6 +2765,86 @@ GROUP BY service_name, span_name, http_route, minute, dt;
 		return fmt.Errorf("create mv_red_1m: %w", err)
 	}
 
+	// M-7: 데이터 티어링 — 5분 RED 롤업 (180일 보관)
+	if err := conn.Exec(ctx, fmt.Sprintf(`
+CREATE TABLE IF NOT EXISTS %s.mv_red_5m_state (
+    service_name       LowCardinality(String),
+    span_name          LowCardinality(String),
+    http_route         LowCardinality(String),
+    minute5            DateTime,
+    total_count        SimpleAggregateFunction(sum, UInt64),
+    error_count        SimpleAggregateFunction(sum, UInt64),
+    duration_quantiles AggregateFunction(quantiles(0.5, 0.95, 0.99), Float64),
+    duration_sum       SimpleAggregateFunction(sum, Float64),
+    dt Date
+) ENGINE = AggregatingMergeTree()
+PARTITION BY dt
+ORDER BY (service_name, minute5, span_name)
+TTL dt + INTERVAL 180 DAY;
+`, db)); err != nil {
+		return fmt.Errorf("create mv_red_5m_state: %w", err)
+	}
+
+	if err := conn.Exec(ctx, fmt.Sprintf(`
+CREATE MATERIALIZED VIEW IF NOT EXISTS %s.mv_red_5m
+TO %s.mv_red_5m_state
+AS SELECT
+    service_name,
+    name                                                            AS span_name,
+    http_route,
+    toStartOfFiveMinute(fromUnixTimestamp64Nano(start_time_nano)) AS minute5,
+    toUInt64(count())                                              AS total_count,
+    toUInt64(countIf(status_code = 2))                            AS error_count,
+    quantilesState(0.5, 0.95, 0.99)(toFloat64(duration_nano))    AS duration_quantiles,
+    toFloat64(sum(duration_nano))                                  AS duration_sum,
+    dt
+FROM %s.spans
+WHERE kind IN (2, 5)
+GROUP BY service_name, span_name, http_route, minute5, dt;
+`, db, db, db)); err != nil {
+		return fmt.Errorf("create mv_red_5m: %w", err)
+	}
+
+	// M-7: 데이터 티어링 — 1시간 RED 롤업 (365일 보관)
+	if err := conn.Exec(ctx, fmt.Sprintf(`
+CREATE TABLE IF NOT EXISTS %s.mv_red_1h_state (
+    service_name       LowCardinality(String),
+    span_name          LowCardinality(String),
+    http_route         LowCardinality(String),
+    hour               DateTime,
+    total_count        SimpleAggregateFunction(sum, UInt64),
+    error_count        SimpleAggregateFunction(sum, UInt64),
+    duration_quantiles AggregateFunction(quantiles(0.5, 0.95, 0.99), Float64),
+    duration_sum       SimpleAggregateFunction(sum, Float64),
+    dt Date
+) ENGINE = AggregatingMergeTree()
+PARTITION BY dt
+ORDER BY (service_name, hour, span_name)
+TTL dt + INTERVAL 365 DAY;
+`, db)); err != nil {
+		return fmt.Errorf("create mv_red_1h_state: %w", err)
+	}
+
+	if err := conn.Exec(ctx, fmt.Sprintf(`
+CREATE MATERIALIZED VIEW IF NOT EXISTS %s.mv_red_1h
+TO %s.mv_red_1h_state
+AS SELECT
+    service_name,
+    name                                                        AS span_name,
+    http_route,
+    toStartOfHour(fromUnixTimestamp64Nano(start_time_nano))    AS hour,
+    toUInt64(count())                                          AS total_count,
+    toUInt64(countIf(status_code = 2))                        AS error_count,
+    quantilesState(0.5, 0.95, 0.99)(toFloat64(duration_nano)) AS duration_quantiles,
+    toFloat64(sum(duration_nano))                              AS duration_sum,
+    dt
+FROM %s.spans
+WHERE kind IN (2, 5)
+GROUP BY service_name, span_name, http_route, hour, dt;
+`, db, db, db)); err != nil {
+		return fmt.Errorf("create mv_red_1h: %w", err)
+	}
+
 	if err := conn.Exec(ctx, fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s.mv_service_topology_state (
     caller_service LowCardinality(String),
@@ -2726,7 +2868,7 @@ TO %s.mv_service_topology_state
 AS SELECT
     service_name                                                       AS caller_service,
     peer_service                                                       AS callee_service,
-    toStartOfFiveMinutes(fromUnixTimestamp64Nano(start_time_nano))    AS minute5,
+    toStartOfFiveMinute(fromUnixTimestamp64Nano(start_time_nano))     AS minute5,
     toUInt64(count())                                                  AS call_count,
     toUInt64(countIf(status_code = 2))                                AS error_count,
     toFloat64(sum(duration_nano))                                      AS duration_sum,
@@ -3034,6 +3176,80 @@ GROUP BY service_name, metric_name, minute, dt;
 		return fmt.Errorf("create mv_histogram_1m: %w", err)
 	}
 
+	// M-7: 데이터 티어링 — 5분 히스토그램 롤업 (180일 보관)
+	if err := conn.Exec(ctx, fmt.Sprintf(`
+CREATE TABLE IF NOT EXISTS %s.mv_histogram_5m_state (
+    service_name         LowCardinality(String),
+    metric_name          LowCardinality(String),
+    minute5              DateTime,
+    count_state          AggregateFunction(sum, UInt64),
+    sum_state            AggregateFunction(sum, Float64),
+    bucket_counts_state  AggregateFunction(sumForEach, Array(UInt64)),
+    bounds_state         AggregateFunction(any, Array(Float64)),
+    dt Date
+) ENGINE = AggregatingMergeTree()
+PARTITION BY dt
+ORDER BY (service_name, metric_name, minute5)
+TTL dt + INTERVAL 180 DAY;
+`, db)); err != nil {
+		return fmt.Errorf("create mv_histogram_5m_state: %w", err)
+	}
+
+	if err := conn.Exec(ctx, fmt.Sprintf(`
+CREATE MATERIALIZED VIEW IF NOT EXISTS %s.mv_histogram_5m
+TO %s.mv_histogram_5m_state
+AS SELECT
+    service_name,
+    metric_name,
+    toStartOfFiveMinute(fromUnixTimestamp64Nano(timestamp_nano)) AS minute5,
+    sumState(total_count)          AS count_state,
+    sumState(total_sum)            AS sum_state,
+    sumForEachState(bucket_counts) AS bucket_counts_state,
+    anyState(bounds)               AS bounds_state,
+    dt
+FROM %s.metric_histograms
+GROUP BY service_name, metric_name, minute5, dt;
+`, db, db, db)); err != nil {
+		return fmt.Errorf("create mv_histogram_5m: %w", err)
+	}
+
+	// M-7: 데이터 티어링 — 1시간 히스토그램 롤업 (365일 보관)
+	if err := conn.Exec(ctx, fmt.Sprintf(`
+CREATE TABLE IF NOT EXISTS %s.mv_histogram_1h_state (
+    service_name         LowCardinality(String),
+    metric_name          LowCardinality(String),
+    hour                 DateTime,
+    count_state          AggregateFunction(sum, UInt64),
+    sum_state            AggregateFunction(sum, Float64),
+    bucket_counts_state  AggregateFunction(sumForEach, Array(UInt64)),
+    bounds_state         AggregateFunction(any, Array(Float64)),
+    dt Date
+) ENGINE = AggregatingMergeTree()
+PARTITION BY dt
+ORDER BY (service_name, metric_name, hour)
+TTL dt + INTERVAL 365 DAY;
+`, db)); err != nil {
+		return fmt.Errorf("create mv_histogram_1h_state: %w", err)
+	}
+
+	if err := conn.Exec(ctx, fmt.Sprintf(`
+CREATE MATERIALIZED VIEW IF NOT EXISTS %s.mv_histogram_1h
+TO %s.mv_histogram_1h_state
+AS SELECT
+    service_name,
+    metric_name,
+    toStartOfHour(fromUnixTimestamp64Nano(timestamp_nano)) AS hour,
+    sumState(total_count)          AS count_state,
+    sumState(total_sum)            AS sum_state,
+    sumForEachState(bucket_counts) AS bucket_counts_state,
+    anyState(bounds)               AS bounds_state,
+    dt
+FROM %s.metric_histograms
+GROUP BY service_name, metric_name, hour, dt;
+`, db, db, db)); err != nil {
+		return fmt.Errorf("create mv_histogram_1h: %w", err)
+	}
+
 	return nil
 }
 
@@ -3108,6 +3324,38 @@ WHERE severity_number >= 17
 GROUP BY service_name, exception_type, minute, dt;
 `, db, db, db)); err != nil {
 		return fmt.Errorf("create mv_error_logs_1m: %w", err)
+	}
+
+	// M-7: 데이터 티어링 — 1시간 에러 로그 롤업 (365일 보관)
+	if err := conn.Exec(ctx, fmt.Sprintf(`
+CREATE TABLE IF NOT EXISTS %s.mv_error_logs_1h_state (
+    service_name   LowCardinality(String),
+    exception_type LowCardinality(String),
+    hour           DateTime,
+    error_count    SimpleAggregateFunction(sum, UInt64),
+    dt Date
+) ENGINE = AggregatingMergeTree()
+PARTITION BY dt
+ORDER BY (service_name, hour, exception_type)
+TTL dt + INTERVAL 365 DAY;
+`, db)); err != nil {
+		return fmt.Errorf("create mv_error_logs_1h_state: %w", err)
+	}
+
+	if err := conn.Exec(ctx, fmt.Sprintf(`
+CREATE MATERIALIZED VIEW IF NOT EXISTS %s.mv_error_logs_1h
+TO %s.mv_error_logs_1h_state
+AS SELECT
+    service_name,
+    exception_type,
+    toStartOfHour(fromUnixTimestamp64Nano(timestamp_nano)) AS hour,
+    toUInt64(count()) AS error_count,
+    dt
+FROM %s.logs
+WHERE severity_number >= 17
+GROUP BY service_name, exception_type, hour, dt;
+`, db, db, db)); err != nil {
+		return fmt.Errorf("create mv_error_logs_1h: %w", err)
 	}
 
 	if err := conn.Exec(ctx, fmt.Sprintf(`
