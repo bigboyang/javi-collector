@@ -2217,17 +2217,36 @@ func (s *ClickHouseLogStore) QueryLogs(ctx context.Context, q LogQuery) ([]*mode
 	return result, rows.Err()
 }
 
-// QueryErrorLogs는 mv_error_logs_1m_state에서 서비스별 에러 집계를 반환한다.
+// errorLogTableForRange는 쿼리 시간 범위에 따라 적절한 에러 로그 롤업 테이블과 타임스탬프 컬럼명을 반환한다.
+//
+// 티어링 기준:
+//   - < 24h:  1분 집계 (mv_error_logs_1m_state, "minute")
+//   - >= 24h: 1시간 집계 (mv_error_logs_1h_state, "hour")
+func errorLogTableForRange(fromMs, toMs int64) (table, tsCol string) {
+	if fromMs <= 0 || toMs <= 0 {
+		return "mv_error_logs_1m_state", "minute"
+	}
+	const twentyFourHrsMs = int64(24 * 60 * 60 * 1000)
+	if toMs-fromMs >= twentyFourHrsMs {
+		return "mv_error_logs_1h_state", "hour"
+	}
+	return "mv_error_logs_1m_state", "minute"
+}
+
+// QueryErrorLogs는 서비스별 에러 로그 집계를 반환한다.
+// 쿼리 시간 범위에 따라 1분/1시간 롤업 테이블 중 하나를 자동 선택한다 (데이터 티어링).
 func (s *ClickHouseLogStore) QueryErrorLogs(ctx context.Context, service string, fromMs, toMs int64) ([]map[string]any, error) {
+	table, tsCol := errorLogTableForRange(fromMs, toMs)
+
 	var conds []string
 	var args []any
 
 	if fromMs > 0 {
-		conds = append(conds, "minute >= ?")
+		conds = append(conds, tsCol+" >= ?")
 		args = append(args, fromMs/1000)
 	}
 	if toMs > 0 {
-		conds = append(conds, "minute <= ?")
+		conds = append(conds, tsCol+" <= ?")
 		args = append(args, toMs/1000)
 	}
 	if service != "" {
@@ -2244,13 +2263,13 @@ func (s *ClickHouseLogStore) QueryErrorLogs(ctx context.Context, service string,
 SELECT
     service_name,
     exception_type,
-    minute,
+    %s AS minute,
     sum(error_count) AS error_count
-FROM %s.mv_error_logs_1m_state
+FROM %s.%s
 %s
-GROUP BY service_name, exception_type, minute
+GROUP BY service_name, exception_type, %s
 ORDER BY minute DESC, error_count DESC
-LIMIT 500`, s.cfg.Database, where)
+LIMIT 500`, tsCol, s.cfg.Database, table, where, tsCol)
 
 	rows, err := s.conn.Query(ctx, sql, args...)
 	if err != nil {
