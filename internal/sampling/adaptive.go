@@ -36,9 +36,11 @@ type AdaptiveController struct {
 // NewAdaptiveController는 AdaptiveController를 생성한다.
 // 비활성화(cfg.Enabled=false) 시에도 Allow()는 항상 true를 반환한다.
 func NewAdaptiveController(cfg AdaptiveConfig) *AdaptiveController {
+	initialRate := initialAdaptiveRate(cfg)
 	return &AdaptiveController{
 		cfg:         cfg,
-		currentRate: 1.0, // 초기에는 전량 통과
+		currentRate: initialRate,
+		lastRate:    initialRate,
 		lastTick:    time.Now(),
 	}
 }
@@ -123,8 +125,19 @@ func (a *AdaptiveController) Stats() (rate float64, tps float64) {
 func (a *AdaptiveController) UpdateConfig(cfg AdaptiveConfig) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	wasEnabled := a.cfg.Enabled
 	a.cfg = cfg
-	// currentRate 유지: 설정 교체 시 갑작스러운 rate 변동 방지
+	if !wasEnabled && cfg.Enabled {
+		// Adaptive가 런타임에 켜질 때 1.0에서 시작하면 첫 tick 동안 전량 통과한다.
+		// cold start burst를 피하기 위해 새 설정의 MinRate에서 보수적으로 시작한다.
+		a.currentRate = initialAdaptiveRate(cfg)
+		a.ewmaTPS = 0
+		a.passCount = 0
+		a.lastTick = time.Now()
+	}
+	a.currentRate = clamp(a.currentRate, cfg.MinRate, cfg.MaxRate)
+	a.lastRate = a.currentRate
 }
 
 func clamp(v, lo, hi float64) float64 {
@@ -135,4 +148,17 @@ func clamp(v, lo, hi float64) float64 {
 		return hi
 	}
 	return v
+}
+
+func initialAdaptiveRate(cfg AdaptiveConfig) float64 {
+	if !cfg.Enabled {
+		if cfg.MaxRate > 0 {
+			return cfg.MaxRate
+		}
+		return 1.0
+	}
+	if cfg.MinRate > 0 {
+		return cfg.MinRate
+	}
+	return 0.01
 }
