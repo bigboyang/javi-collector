@@ -1997,7 +1997,9 @@ func (s *ClickHouseMetricStore) flushHistogramMetrics(metrics []*model.MetricDat
 	batch, err := s.conn.PrepareBatch(ctx,
 		fmt.Sprintf(`INSERT INTO %s.metric_histograms
 		(service_name, metric_name, timestamp_nano, bounds, bucket_counts,
-		 total_count, total_sum, attributes, received_at_ms)`, s.cfg.Database),
+		 total_count, total_sum, attributes, 
+		 exemplar_trace_ids, exemplar_span_ids, exemplar_values, exemplar_times, exemplar_attributes,
+		 received_at_ms)`, s.cfg.Database),
 	)
 	if err != nil {
 		return 0, fmt.Errorf("prepare histogram batch: %w", err)
@@ -2011,11 +2013,27 @@ func (s *ClickHouseMetricStore) flushHistogramMetrics(metrics []*model.MetricDat
 		for _, dp := range m.DataPoints {
 			buckets := make([]uint64, len(dp.BucketCounts))
 			copy(buckets, dp.BucketCounts)
+
+			var exTraceIDs, exSpanIDs []string
+			var exValues []float64
+			var exTimes []int64
+			var exAttrs []string
+
+			for _, ex := range dp.Exemplars {
+				exTraceIDs = append(exTraceIDs, ex.TraceID)
+				exSpanIDs = append(exSpanIDs, ex.SpanID)
+				exValues = append(exValues, ex.Value)
+				exTimes = append(exTimes, ex.TimeNanos)
+				exAttrs = append(exAttrs, toJSONString(toStringMap(ex.Attributes)))
+			}
+
 			if err := batch.Append(
 				m.ServiceName, m.Name, dp.TimeNanos,
 				dp.ExplicitBounds, buckets,
 				uint64(dp.Count), dp.Sum,
-				toJSONString(toStringMap(dp.Attributes)), m.ReceivedAtMs,
+				toJSONString(toStringMap(dp.Attributes)),
+				exTraceIDs, exSpanIDs, exValues, exTimes, exAttrs,
+				m.ReceivedAtMs,
 			); err != nil {
 				return 0, fmt.Errorf("batch append histogram: %w", err)
 			}
@@ -3149,6 +3167,11 @@ CREATE TABLE IF NOT EXISTS %s.metric_histograms (
     total_count     UInt64,
     total_sum       Float64,
     attributes      Map(String, String),
+    exemplar_trace_ids Array(String),
+    exemplar_span_ids  Array(String),
+    exemplar_values    Array(Float64),
+    exemplar_times     Array(Int64),
+    exemplar_attributes Array(String),
     received_at_ms  Int64,
     dt Date DEFAULT toDate(fromUnixTimestamp64Milli(received_at_ms))
 ) ENGINE = MergeTree()

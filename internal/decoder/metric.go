@@ -1,6 +1,7 @@
 package decoder
 
 import (
+	"encoding/hex"
 	"time"
 
 	collectormetricsv1 "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
@@ -73,6 +74,7 @@ func convertNumberDataPoints(dps []*metricsv1.NumberDataPoint) []model.DataPoint
 			Attributes:     convertAttrs(dp.Attributes),
 			StartTimeNanos: int64(dp.StartTimeUnixNano),
 			TimeNanos:      int64(dp.TimeUnixNano),
+			Exemplars:      convertExemplars(dp.Exemplars),
 		}
 		switch v := dp.Value.(type) {
 		case *metricsv1.NumberDataPoint_AsDouble:
@@ -102,9 +104,33 @@ func convertHistogramDataPoints(dps []*metricsv1.HistogramDataPoint) []model.Dat
 			Sum:            dp.GetSum(),
 			BucketCounts:   buckets,
 			ExplicitBounds: dp.ExplicitBounds,
+			Exemplars:      convertExemplars(dp.Exemplars),
 		})
 	}
 	return points
+}
+
+func convertExemplars(exs []*metricsv1.Exemplar) []model.Exemplar {
+	if len(exs) == 0 {
+		return nil
+	}
+	res := make([]model.Exemplar, 0, len(exs))
+	for _, ex := range exs {
+		e := model.Exemplar{
+			TraceID:    hex.EncodeToString(ex.TraceId),
+			SpanID:     hex.EncodeToString(ex.SpanId),
+			TimeNanos:  int64(ex.TimeUnixNano),
+			Attributes: convertAttrs(ex.FilteredAttributes),
+		}
+		switch v := ex.Value.(type) {
+		case *metricsv1.Exemplar_AsDouble:
+			e.Value = v.AsDouble
+		case *metricsv1.Exemplar_AsInt:
+			e.Value = float64(v.AsInt)
+		}
+		res = append(res, e)
+	}
+	return res
 }
 
 // DecodeMetricsJSON parses OTLP ExportMetricsServiceRequest JSON bytes into MetricData slice.

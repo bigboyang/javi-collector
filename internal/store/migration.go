@@ -309,6 +309,16 @@ AS SELECT
 FROM %DB%.metric_histograms
 GROUP BY service_name, metric_name, minute, dt`,
 	},
+	{
+		Version:     104,
+		Description: "add exemplar columns to metric_histograms for trace drill-down",
+		SQL: `ALTER TABLE %DB%.metric_histograms 
+    ADD COLUMN IF NOT EXISTS exemplar_trace_ids Array(String),
+    ADD COLUMN IF NOT EXISTS exemplar_span_ids  Array(String),
+    ADD COLUMN IF NOT EXISTS exemplar_values    Array(Float64),
+    ADD COLUMN IF NOT EXISTS exemplar_times     Array(Int64),
+    ADD COLUMN IF NOT EXISTS exemplar_attributes Array(String)`,
+	},
 	// M-7: 데이터 티어링 — 5분/1시간 히스토그램 롤업 테이블
 	{
 		Version:     110,
