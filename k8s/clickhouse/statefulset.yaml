@@ -43,15 +43,17 @@ spec:
               subPath: users_override.xml
               readOnly: true
           livenessProbe:
-            exec:
-              command: ["clickhouse-client", "--query", "SELECT 1"]
+            httpGet:
+              path: /ping
+              port: 8123
             initialDelaySeconds: 30
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
           readinessProbe:
-            exec:
-              command: ["clickhouse-client", "--query", "SELECT 1"]
+            httpGet:
+              path: /ping
+              port: 8123
             initialDelaySeconds: 10
             periodSeconds: 5
             timeoutSeconds: 3

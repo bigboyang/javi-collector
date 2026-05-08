@@ -408,18 +408,18 @@ func (s *ClickHouseTraceStore) QuerySpans(ctx context.Context, q SpanQuery) ([]*
 	for rows.Next() {
 		var (
 			sp           model.SpanData
-			attrsStr     string
+			attrsMap     map[string]string
 			durationNano int64
 		)
 		if err := rows.Scan(
 			&sp.TraceID, &sp.SpanID, &sp.ParentSpanID, &sp.Name, &sp.Kind,
 			&sp.StartTimeNano, &sp.EndTimeNano, &durationNano,
-			&attrsStr, &sp.StatusCode, &sp.StatusMessage,
+			&attrsMap, &sp.StatusCode, &sp.StatusMessage,
 			&sp.ServiceName, &sp.ScopeName, &sp.ReceivedAtMs,
 		); err != nil {
 			return nil, err
 		}
-		sp.Attributes = fromJSONString(attrsStr)
+		sp.Attributes = fromStringMap(attrsMap)
 		result = append(result, &sp)
 	}
 	return result, rows.Err()
@@ -1353,7 +1353,7 @@ func (s *ClickHouseTraceStore) flushSpans(spans []*model.SpanData) error {
 		if err := batch.Append(
 			sp.TraceID, sp.SpanID, sp.ParentSpanID, sp.Name, sp.Kind,
 			sp.StartTimeNano, sp.EndTimeNano, sp.DurationNano(),
-			toJSONString(toStringMap(attrs)), sp.StatusCode, sp.StatusMessage,
+			toStringMap(attrs), sp.StatusCode, sp.StatusMessage,
 			sp.ServiceName, sp.ScopeName, sp.ReceivedAtMs,
 			strAttr(attrs, "http.request.method"),
 			strAttr(attrs, "http.route"),
@@ -1553,11 +1553,11 @@ func (s *ClickHouseMetricStore) QueryMetrics(ctx context.Context, q MetricQuery)
 	for rows.Next() {
 		var (
 			name, mtype, serviceName string
-			attrsStr                 string
+			attrsMap                 map[string]string
 			value                    float64
 			timestampNano, receivedAtMs int64
 		)
-		if err := rows.Scan(&name, &mtype, &value, &attrsStr, &serviceName, &timestampNano, &receivedAtMs); err != nil {
+		if err := rows.Scan(&name, &mtype, &value, &attrsMap, &serviceName, &timestampNano, &receivedAtMs); err != nil {
 			return nil, err
 		}
 		result = append(result, &model.MetricData{
@@ -1566,7 +1566,7 @@ func (s *ClickHouseMetricStore) QueryMetrics(ctx context.Context, q MetricQuery)
 			ServiceName:  serviceName,
 			ReceivedAtMs: receivedAtMs,
 			DataPoints: []model.DataPoint{
-				{Attributes: fromJSONString(attrsStr), TimeNanos: timestampNano, Value: value},
+				{Attributes: fromStringMap(attrsMap), TimeNanos: timestampNano, Value: value},
 			},
 		})
 	}
@@ -1621,10 +1621,10 @@ func (s *ClickHouseMetricStore) QueryMetrics(ctx context.Context, q MetricQuery)
 			bucketCounts            []uint64
 			totalCount              uint64
 			totalSum                float64
-			attrsStr                string
+			attrsMap                map[string]string
 			timestampNano, receivedAtMs int64
 		)
-		if err := hrows.Scan(&metricName, &bounds, &bucketCounts, &totalCount, &totalSum, &attrsStr, &serviceName, &timestampNano, &receivedAtMs); err != nil {
+		if err := hrows.Scan(&metricName, &bounds, &bucketCounts, &totalCount, &totalSum, &attrsMap, &serviceName, &timestampNano, &receivedAtMs); err != nil {
 			return nil, err
 		}
 		result = append(result, &model.MetricData{
@@ -1634,7 +1634,7 @@ func (s *ClickHouseMetricStore) QueryMetrics(ctx context.Context, q MetricQuery)
 			ReceivedAtMs: receivedAtMs,
 			DataPoints: []model.DataPoint{
 				{
-					Attributes:     fromJSONString(attrsStr),
+					Attributes:     fromStringMap(attrsMap),
 					TimeNanos:      timestampNano,
 					Count:          int64(totalCount),
 					Sum:            totalSum,
@@ -1957,7 +1957,7 @@ func (s *ClickHouseMetricStore) flushScalarMetrics(metrics []*model.MetricData) 
 			}
 			if err := batch.Append(
 				m.Name, string(m.Type), value,
-				toJSONString(toStringMap(dp.Attributes)), m.ServiceName,
+				toStringMap(dp.Attributes), m.ServiceName,
 				dp.TimeNanos, m.ReceivedAtMs,
 			); err != nil {
 				return 0, fmt.Errorf("batch append scalar metric: %w", err)
@@ -2031,7 +2031,7 @@ func (s *ClickHouseMetricStore) flushHistogramMetrics(metrics []*model.MetricDat
 				m.ServiceName, m.Name, dp.TimeNanos,
 				dp.ExplicitBounds, buckets,
 				uint64(dp.Count), dp.Sum,
-				toJSONString(toStringMap(dp.Attributes)),
+				toStringMap(dp.Attributes),
 				exTraceIDs, exSpanIDs, exValues, exTimes, exAttrs,
 				m.ReceivedAtMs,
 			); err != nil {
@@ -2220,16 +2220,16 @@ func (s *ClickHouseLogStore) QueryLogs(ctx context.Context, q LogQuery) ([]*mode
 	for rows.Next() {
 		var (
 			l        model.LogData
-			attrsStr string
+			attrsMap map[string]string
 		)
 		if err := rows.Scan(
-			&l.SeverityText, &l.SeverityNumber, &l.Body, &attrsStr,
+			&l.SeverityText, &l.SeverityNumber, &l.Body, &attrsMap,
 			&l.ServiceName, &l.TraceID, &l.SpanID,
 			&l.TimestampNanos, &l.ReceivedAtMs,
 		); err != nil {
 			return nil, err
 		}
-		l.Attributes = fromJSONString(attrsStr)
+		l.Attributes = fromStringMap(attrsMap)
 		result = append(result, &l)
 	}
 	return result, rows.Err()
@@ -2438,7 +2438,7 @@ func (s *ClickHouseLogStore) flushLogs(logs []*model.LogData) error {
 		}
 		if err := batch.Append(
 			l.SeverityText, l.SeverityNumber, l.Body,
-			toJSONString(toStringMap(attrs)), l.ServiceName,
+			toStringMap(attrs), l.ServiceName,
 			l.TraceID, l.SpanID, l.TimestampNanos, l.ReceivedAtMs,
 			strAttr(attrs, "exception.type"),
 			strAttr(attrs, "logger.name"),

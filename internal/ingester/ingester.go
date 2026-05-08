@@ -97,6 +97,20 @@ func (d *DirectSpanPublisher) Publish(sp *model.SpanData) {
 	}
 }
 
+// DirectLogPublisher는 ERROR+ 로그를 EmbedPipeline에 직접 제출한다.
+// KAFKA_ENABLED=false(기본)일 때 사용한다.
+type DirectLogPublisher struct {
+	Pipeline *rag.EmbedPipeline
+	Builder  rag.DocumentBuilder
+}
+
+// PublishLog는 ERROR 이상 심각도 로그를 EmbedDocument로 변환해 EmbedPipeline에 제출한다.
+func (d *DirectLogPublisher) PublishLog(l *model.LogData) {
+	if doc := d.Builder.BuildFromLog(l); doc != nil {
+		d.Pipeline.Submit(doc)
+	}
+}
+
 // MultiSpanPublisher는 여러 SpanPublisher에 span 이벤트를 팬아웃한다.
 // RAG + Forecast 같이 복수의 하류가 필요한 경우에 사용한다.
 type MultiSpanPublisher struct {

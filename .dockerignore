@@ -1,0 +1,6 @@
+backup/
+dlq/
+*.log
+*.jsonl
+javi-collector
+javi

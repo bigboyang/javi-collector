@@ -582,6 +582,10 @@ func main() {
 				Pipeline: embedPipeline,
 				Builder:  rag.DocumentBuilder{SlowMs: int64(cfg.RAGSlowThresholdMs)},
 			})
+			logPub = &ingester.DirectLogPublisher{
+				Pipeline: embedPipeline,
+				Builder:  rag.DocumentBuilder{SlowMs: int64(cfg.RAGSlowThresholdMs)},
+			}
 		}
 		if forecaster != nil {
 			pubs = append(pubs, forecaster)

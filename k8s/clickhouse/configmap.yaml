@@ -9,12 +9,11 @@ data:
     <clickhouse>
       <users>
         <default>
-          <!-- 비밀번호는 clickhouse-secret Secret의 password 필드와 동일하게 유지 -->
-          <!-- 운영: SHA256_HEX 해시 방식 권장 (평문 노출 최소화) -->
-          <password>changeme-use-sealed-secrets</password>
-          <!-- 운영환경에서는 내부 서브넷으로 제한하세요 (예: 10.0.0.0/8) -->
+          <!-- password는 CLICKHOUSE_PASSWORD env var로 default-user.xml에서 설정됨 -->
+          <!-- 두 파일에 password가 있으면 XML merge로 이어붙여져 인증 실패함 -->
           <networks>
             <ip>10.0.0.0/8</ip>
+            <ip>127.0.0.1</ip>
           </networks>
           <profile>default</profile>
           <quota>default</quota>
