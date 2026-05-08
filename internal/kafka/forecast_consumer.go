@@ -9,9 +9,18 @@ import (
 	"time"
 
 	kafka "github.com/segmentio/kafka-go"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/kkc/javi-collector/internal/model"
 )
+
+var kafkaConsumerLag = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Namespace: "javi",
+	Subsystem: "kafka",
+	Name:      "consumer_lag",
+	Help:      "Current Kafka consumer lag (messages behind latest offset).",
+}, []string{"topic", "group"})
 
 // maxConcurrentSends는 Forecast 서버로의 최대 동시 전송 goroutine 수다.
 // 서버 지연 시 goroutine 누적을 방지하기 위한 semaphore 크기다.
@@ -77,6 +86,22 @@ type spanEvent struct {
 // Start는 백그라운드 goroutine으로 Kafka 메시지를 소비한다.
 // ctx가 취소되면 reader를 닫고 종료한다.
 func (c *ForecastConsumer) Start(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		topic := c.reader.Config().Topic
+		group := c.reader.Config().GroupID
+		for {
+			select {
+			case <-ticker.C:
+				stats := c.reader.Stats()
+				kafkaConsumerLag.WithLabelValues(topic, group).Set(float64(stats.Lag))
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
 	go func() {
 		slog.Info("kafka forecast consumer started",
 			"topic", c.reader.Config().Topic,

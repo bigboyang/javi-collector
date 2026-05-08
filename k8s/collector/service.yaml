@@ -19,8 +19,8 @@ spec:
       protocol: TCP
   type: ClusterIP
 ---
-# 외부 Agent에서 직접 전송하는 경우: LoadBalancer 또는 NodePort 사용
-# 클러스터 외부 트래픽이 없다면 이 Service는 삭제해도 됩니다.
+# 외부 Agent(host JVM 등)에서 직접 전송하는 경우 NodePort 사용
+# minikube IP(192.168.49.2):30317 gRPC  |  :30318 HTTP
 apiVersion: v1
 kind: Service
 metadata:
@@ -35,9 +35,11 @@ spec:
     - name: grpc-otlp
       port: 4317
       targetPort: 4317
+      nodePort: 30317
       protocol: TCP
     - name: http-otlp
       port: 4318
       targetPort: 4318
+      nodePort: 30318
       protocol: TCP
-  type: LoadBalancer
+  type: NodePort

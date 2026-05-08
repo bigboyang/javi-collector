@@ -13,8 +13,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"io"
 	"fmt"
+	"io"
 	"log/slog"
 	"strings"
 	"sync"
@@ -233,25 +233,21 @@ ORDER BY detected_at ASC`, e.db, int(window.Seconds()))
 
 // fetchCorrelatedSpans는 이상 시간대의 ERROR/WARN spans를 최대 5개 반환한다.
 func (e *Engine) fetchCorrelatedSpans(ctx context.Context, a AnomalyRow) ([]CorrelatedSpan, error) {
+	minuteStr := a.Minute.UTC().Format("2006-01-02 15:04:05")
 	q := fmt.Sprintf(`
 SELECT
     span_id, trace_id, name, status_code, status_message,
     (end_time_nano - start_time_nano) / 1e6 AS duration_ms,
     ifNull(attributes['exception.type'], '')
 FROM %s.spans
-WHERE service_name = '%s'
-  AND start_time_nano >= toUnixTimestamp64Nano(toDateTime64('%s', 9))
-  AND start_time_nano <  toUnixTimestamp64Nano(toDateTime64('%s', 9)) + 120000000000
+WHERE service_name = ?
+  AND start_time_nano >= toUnixTimestamp64Nano(toDateTime64(?, 9))
+  AND start_time_nano <  toUnixTimestamp64Nano(toDateTime64(?, 9)) + 120000000000
   AND status_code >= 2
 ORDER BY duration_ms DESC
-LIMIT 5`,
-		e.db,
-		escapeStr(a.ServiceName),
-		a.Minute.UTC().Format("2006-01-02 15:04:05"),
-		a.Minute.UTC().Format("2006-01-02 15:04:05"),
-	)
+LIMIT 5`, e.db)
 
-	rows, err := e.conn.Query(ctx, q)
+	rows, err := e.conn.Query(ctx, q, a.ServiceName, minuteStr, minuteStr)
 	if err != nil {
 		return nil, err
 	}
@@ -301,15 +297,44 @@ func (e *Engine) searchSimilarIncidents(ctx context.Context, a AnomalyRow) ([]Si
 	return out, nil
 }
 
-// fetchTopologyNeighbors는 mv_service_topology_state에서 이상 발생 서비스의
-// 직접 업스트림/다운스트림 서비스를 조회한다.
+// topologyMaxHops는 RCA 토폴로지 BFS의 최대 탐색 깊이다.
+const topologyMaxHops = 2
+
+// fetchTopologyNeighbors는 BFS로 최대 topologyMaxHops 홉까지 인접 서비스를 수집한다.
+// 동일 서비스를 중복 방문하지 않으며 hop 필드로 거리를 표시한다.
 func (e *Engine) fetchTopologyNeighbors(ctx context.Context, a AnomalyRow) ([]TopologyNeighbor, error) {
-	// 이상 발생 시간 ±30분 윈도우에서 토폴로지 조회
 	fromTime := a.Minute.Add(-30 * time.Minute)
 	toTime := a.Minute.Add(30 * time.Minute)
 
-	// downstream: 이 서비스가 호출한 서비스 (client spans)
-	// upstream: 이 서비스를 호출한 서비스 (this service appears as peer_service)
+	visited := map[string]bool{a.ServiceName: true}
+	frontier := []string{a.ServiceName}
+	var all []TopologyNeighbor
+
+	for hop := 1; hop <= topologyMaxHops && len(frontier) > 0; hop++ {
+		var nextFrontier []string
+		for _, svc := range frontier {
+			neighbors, err := e.fetchDirectNeighbors(ctx, svc, fromTime, toTime)
+			if err != nil {
+				slog.Warn("rca: direct neighbor fetch failed", "service", svc, "err", err)
+				continue
+			}
+			for _, n := range neighbors {
+				if visited[n.ServiceName] {
+					continue
+				}
+				visited[n.ServiceName] = true
+				n.Hop = hop
+				all = append(all, n)
+				nextFrontier = append(nextFrontier, n.ServiceName)
+			}
+		}
+		frontier = nextFrontier
+	}
+	return all, nil
+}
+
+// fetchDirectNeighbors는 serviceName의 직접 업/다운스트림 서비스를 조회한다.
+func (e *Engine) fetchDirectNeighbors(ctx context.Context, serviceName string, fromTime, toTime time.Time) ([]TopologyNeighbor, error) {
 	q := fmt.Sprintf(`
 SELECT
     peer_service,
@@ -317,7 +342,7 @@ SELECT
     sum(call_count) AS total_calls,
     if(sum(call_count) > 0, toFloat64(sum(error_count)) / toFloat64(sum(call_count)), 0) AS error_rate
 FROM %s.mv_service_topology_state
-WHERE caller_service = '%s'
+WHERE caller_service = ?
   AND minute >= ? AND minute <= ?
 GROUP BY peer_service
 UNION ALL
@@ -327,16 +352,15 @@ SELECT
     sum(call_count) AS total_calls,
     if(sum(call_count) > 0, toFloat64(sum(error_count)) / toFloat64(sum(call_count)), 0) AS error_rate
 FROM %s.mv_service_topology_state
-WHERE peer_service = '%s'
+WHERE peer_service = ?
   AND minute >= ? AND minute <= ?
 GROUP BY caller_service
 ORDER BY total_calls DESC
 LIMIT 10`,
-		e.db, escapeStr(a.ServiceName),
-		e.db, escapeStr(a.ServiceName),
+		e.db, e.db,
 	)
 
-	rows, err := e.conn.Query(ctx, q, fromTime, toTime, fromTime, toTime)
+	rows, err := e.conn.Query(ctx, q, serviceName, fromTime, toTime, serviceName, fromTime, toTime)
 	if err != nil {
 		return nil, err
 	}
@@ -479,10 +503,6 @@ func (e *Engine) insertReports(ctx context.Context, reports []RCAReport) error {
 	return batch.Send()
 }
 
-// escapeStr은 SQL 인젝션 방지를 위해 단순 문자열을 이스케이프한다.
-func escapeStr(s string) string {
-	return strings.ReplaceAll(s, "'", "\\'")
-}
 
 // newID generates a cryptographically random 32-character hex ID.
 func newID() string {

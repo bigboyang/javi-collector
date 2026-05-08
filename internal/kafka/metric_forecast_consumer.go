@@ -51,6 +51,22 @@ func NewMetricForecastConsumer(brokers []string, topic, group, endpoint string) 
 // Start는 백그라운드 goroutine으로 Kafka 메시지를 소비한다.
 func (c *MetricForecastConsumer) Start(ctx context.Context) {
 	go func() {
+		topic := c.reader.Config().Topic
+		group := c.reader.Config().GroupID
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				stats := c.reader.Stats()
+				kafkaConsumerLag.WithLabelValues(topic, group).Set(float64(stats.Lag))
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	go func() {
 		slog.Info("kafka metric forecast consumer started",
 			"topic", c.reader.Config().Topic,
 			"group", c.reader.Config().GroupID,

@@ -14,12 +14,13 @@ type NearbyDeployment struct {
 	DeployedAt  time.Time `json:"deployed_at"`
 }
 
-// TopologyNeighbor는 서비스 토폴로지에서 직접 연결된 인접 서비스를 나타낸다.
+// TopologyNeighbor는 서비스 토폴로지에서 연결된 인접 서비스를 나타낸다.
 type TopologyNeighbor struct {
 	ServiceName string  `json:"service_name"`
 	Direction   string  `json:"direction"`   // "upstream" | "downstream"
 	CallCount   uint64  `json:"call_count"`
 	ErrorRate   float64 `json:"error_rate"`
+	Hop         int     `json:"hop"` // 출발 서비스로부터의 홉 수 (1 = 직접 연결)
 }
 
 // AnomalyRow는 anomalies 테이블에서 읽어온 이상 이벤트.

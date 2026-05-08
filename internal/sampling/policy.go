@@ -1,7 +1,9 @@
 package sampling
 
 import (
-	"math/rand/v2"
+	"encoding/binary"
+	"encoding/hex"
+	"math"
 	"path"
 
 	"github.com/kkc/javi-collector/internal/model"
@@ -38,14 +40,46 @@ func (e PolicyEvaluator) Evaluate(spans []*model.SpanData, cfg *SamplingConfig) 
 	}
 
 	if cfg.ProbabilisticSampling.Enabled {
-		if rand.Float64() < cfg.ProbabilisticSampling.Rate {
-			return DecisionKeep
+		if len(spans) > 0 {
+			rate := cfg.ProbabilisticSampling.Rate
+			// 경계값 처리: Rate=1.0 시 float64(math.MaxUint64) > MaxUint64이므로
+			// uint64 변환이 0으로 오버플로 → threshold=0 → hash<0 불가 → 모든 trace DROP.
+			// OTel TraceIdRatioBasedSampler 스펙과 동일하게 경계값을 명시 처리한다.
+			if rate >= 1.0 {
+				return DecisionKeep
+			}
+			if rate <= 0.0 {
+				return DecisionDrop
+			}
+			// TraceID 기반 결정론적 샘플링.
+			// 동일 TraceID를 가진 Span들은 항상 같은 샘플링 결정을 받는다.
+			// SDK의 TraceIdRatioBasedSampler와 호환되는 방식.
+			hash := traceIDHash(spans[0].TraceID)
+			threshold := uint64(rate * math.MaxUint64)
+			if hash < threshold {
+				return DecisionKeep
+			}
+			return DecisionDrop
 		}
-		return DecisionDrop
 	}
 
 	// 모든 정책이 비활성화된 경우 drop (sampling은 enabled이나 정책 없음)
 	return DecisionDrop
+}
+
+// traceIDHash는 16진수 TraceID 스트링(128bit)의 하위 64bit를 uint64 해시로 변환한다.
+// SDK의 TraceIdRatioBasedSampler 알고리즘(하위 8바이트 빅엔디안 정수화)과 일치한다.
+// 표준 OTel TraceID는 32 hex chars(128bit)이며, 그 미만이면 0을 반환한다(→ 항상 KEEP 편향).
+func traceIDHash(traceID string) uint64 {
+	if len(traceID) < 32 {
+		return 0
+	}
+	// 하위 16문자 (8바이트) 사용
+	b, err := hex.DecodeString(traceID[len(traceID)-16:])
+	if err != nil {
+		return 0
+	}
+	return binary.BigEndian.Uint64(b)
 }
 
 // hasError는 StatusCode == 2 (ERROR) span이 하나라도 있는지 검사한다.

@@ -106,11 +106,15 @@ func NewTailSamplingStore(downstream store.TraceStore, cfgProv ConfigProvider) *
 
 // AppendSpans는 store.TraceStore 인터페이스를 구현한다.
 //
-// ExcludeURLPatterns에 매칭되는 spans를 버퍼링 전에 제거한 뒤 나머지를 버퍼에 추가한다.
+// sampling이 비활성화된 경우 buffer 없이 downstream으로 직접 전달한다.
+// 활성화된 경우 ExcludeURLPatterns 필터 → traceBuffer 버퍼링 → onFlush 순으로 처리한다.
 // sampling 결정은 비동기로 발생하므로 항상 nil을 반환한다.
 // (에러 반환 시 OTLP 클라이언트가 재전송을 시도해 중복 수집이 발생한다.)
 func (ts *TailSamplingStore) AppendSpans(ctx context.Context, spans []*model.SpanData) error {
 	cfg := ts.cfgProv.Current()
+	if !cfg.Enabled {
+		return ts.downstream.AppendSpans(ctx, spans)
+	}
 	if len(cfg.ExcludeURLPatterns) > 0 {
 		filtered := make([]*model.SpanData, 0, len(spans))
 		for _, sp := range spans {

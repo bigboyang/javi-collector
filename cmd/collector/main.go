@@ -253,8 +253,21 @@ func main() {
 
 	// Tail Sampling + Adaptive Sampling 설정
 	// SAMPLING_ENABLED=false(기본)이면 TailSamplingStore는 전량 통과(no-op) 모드로 동작한다.
+	// SAMPLING_CONFIG_JSON이 설정되면 해당 JSON을 초기 config로 사용한다.
 	// REMOTE_CONFIG_URL이 설정되면 주기적으로 SamplingConfig를 폴링해 동적으로 반영한다.
 	initSamplingCfg := sampling.NewDefaultConfig(cfg.SamplingEnabled)
+	if cfg.SamplingConfigJSON != "" {
+		if parsed, err := sampling.ParseConfig([]byte(cfg.SamplingConfigJSON)); err != nil {
+			slog.Warn("SAMPLING_CONFIG_JSON parse failed, using default", "err", err)
+		} else {
+			initSamplingCfg = parsed
+			slog.Info("sampling: inline config loaded from SAMPLING_CONFIG_JSON",
+				"error_sampling", parsed.ErrorSampling.Enabled,
+				"latency_ms", parsed.LatencySampling.ThresholdMs,
+				"probabilistic_rate", parsed.ProbabilisticSampling.Rate,
+			)
+		}
+	}
 	poller := sampling.NewRemoteConfigPoller(
 		cfg.RemoteConfigURL,
 		cfg.RemoteConfigPollInterval,

@@ -8,5 +8,5 @@ spec:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 10Gi
+      storage: 3Gi
   # storageClassName: standard  # 클러스터 기본 StorageClass 사용

@@ -285,7 +285,21 @@ func (ing *Ingester) storeSpans(ctx context.Context, spans []*model.SpanData) (i
 	n := int64(len(spans))
 	ing.traceReceived.Add(n)
 	spansIngestedTotal.Add(float64(n))
-	slog.Debug("traces ingested", "spans", n)
+
+	// INFO: service별 span 수 + error 카운트 요약
+	if slog.Default().Enabled(ctx, slog.LevelInfo) {
+		svcCount := make(map[string]int, 4)
+		errCount := 0
+		for _, sp := range spans {
+			svcCount[sp.ServiceName]++
+			if sp.StatusCode == 2 { // ERROR
+				errCount++
+			}
+		}
+		for svc, cnt := range svcCount {
+			slog.Info("traces stored", "service", svc, "spans", cnt, "errors", errCount, "total", ing.traceReceived.Load())
+		}
+	}
 
 	// RAG / Forecast 파이프라인: span 이벤트를 비동기로 발행 (non-blocking)
 	// SpanPublisher 구현에 따라 직접 EmbedPipeline 제출 또는 Kafka 발행.
@@ -330,7 +344,14 @@ func (ing *Ingester) storeMetrics(ctx context.Context, metrics []*model.MetricDa
 	n := int64(len(metrics))
 	ing.metricReceived.Add(n)
 	metricsIngestedTotal.Add(float64(n))
-	slog.Debug("metrics ingested", "count", n)
+
+	if slog.Default().Enabled(ctx, slog.LevelInfo) {
+		svc := ""
+		if len(metrics) > 0 {
+			svc = metrics[0].ServiceName
+		}
+		slog.Info("metrics stored", "service", svc, "count", n, "total", ing.metricReceived.Load())
+	}
 
 	// Forecast 파이프라인: metric 이벤트를 비동기로 발행 (non-blocking)
 	if ing.metricPub != nil {
@@ -374,7 +395,14 @@ func (ing *Ingester) storeLogs(ctx context.Context, logs []*model.LogData) (int,
 	n := int64(len(logs))
 	ing.logReceived.Add(n)
 	logsIngestedTotal.Add(float64(n))
-	slog.Debug("logs ingested", "count", n)
+
+	if slog.Default().Enabled(ctx, slog.LevelInfo) {
+		svc := ""
+		if len(logs) > 0 {
+			svc = logs[0].ServiceName
+		}
+		slog.Info("logs stored", "service", svc, "count", n, "total", ing.logReceived.Load())
+	}
 
 	// RAG 파이프라인: log 이벤트를 비동기로 발행 (non-blocking)
 	if ing.logPub != nil {

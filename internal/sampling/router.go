@@ -106,13 +106,14 @@ func (cb *peerCircuitBreaker) onFailure(peerURL string, threshold int, cooldown 
 //   - 피어 장애 시 해당 spans는 드롭 (fail-open: 불완전 trace로 처리)
 type TraceRouter struct {
 	selfURL    string
-	peers      []string // selfURL 포함한 정렬된 피어 URL 목록
+	mu         sync.RWMutex
+	peers      []string // selfURL 포함한 정렬된 피어 URL 목록 (mu로 보호)
 	httpClient *http.Client
 
 	// per-peer circuit breaker
-	cbThreshold int
-	cbCooldown  time.Duration
-	peerBreakers map[string]*peerCircuitBreaker
+	cbThreshold  int
+	cbCooldown   time.Duration
+	peerBreakers map[string]*peerCircuitBreaker // mu로 보호
 }
 
 // NewTraceRouter는 TraceRouter를 생성한다.
@@ -164,10 +165,52 @@ func NewTraceRouter(selfURL string, peerURLs []string, cbThreshold int, cbCooldo
 // Enabled는 라우팅이 활성화되어 있는지 반환한다.
 // selfURL이 설정되고 피어가 2개 이상(self 포함)일 때 활성화된다.
 func (r *TraceRouter) Enabled() bool {
-	return r.selfURL != "" && len(r.peers) > 1
+	r.mu.RLock()
+	n := len(r.peers)
+	r.mu.RUnlock()
+	return r.selfURL != "" && n > 1
+}
+
+// UpdatePeers는 피어 목록을 동적으로 갱신한다.
+// 스케일 아웃/인 시 호출해 consistent hash 링을 재구성한다.
+// 기존 피어의 Circuit Breaker 상태는 보존된다.
+func (r *TraceRouter) UpdatePeers(peerURLs []string) {
+	seen := make(map[string]struct{})
+	all := make([]string, 0, len(peerURLs)+1)
+	if r.selfURL != "" {
+		all = append(all, r.selfURL)
+		seen[r.selfURL] = struct{}{}
+	}
+	for _, p := range peerURLs {
+		p = strings.TrimRight(p, "/")
+		if p != "" {
+			if _, dup := seen[p]; !dup {
+				all = append(all, p)
+				seen[p] = struct{}{}
+			}
+		}
+	}
+	sort.Strings(all)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	newBreakers := make(map[string]*peerCircuitBreaker, len(all))
+	for _, p := range all {
+		if p == r.selfURL {
+			continue
+		}
+		if existing := r.peerBreakers[p]; existing != nil {
+			newBreakers[p] = existing // 기존 CB 상태 재사용
+		} else {
+			newBreakers[p] = &peerCircuitBreaker{}
+		}
+	}
+	r.peers = all
+	r.peerBreakers = newBreakers
 }
 
 // ownerFor는 traceID를 FNV-1a 해시로 매핑해 담당 피어 URL을 반환한다.
+// 호출자는 r.mu.RLock을 보유한 상태여야 한다.
 func (r *TraceRouter) ownerFor(traceID string) string {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(traceID))
@@ -187,6 +230,9 @@ func (r *TraceRouter) Route(
 	ctx context.Context,
 	req *collectortracev1.ExportTraceServiceRequest,
 ) (localReq *collectortracev1.ExportTraceServiceRequest, remote map[string]*collectortracev1.ExportTraceServiceRequest) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
 	localReq = &collectortracev1.ExportTraceServiceRequest{}
 	remote = make(map[string]*collectortracev1.ExportTraceServiceRequest)
 
@@ -251,8 +297,12 @@ func (r *TraceRouter) Route(
 // 피어 Circuit Breaker가 open 상태이면 전달을 건너뛴다 (fail-open).
 // 실패 시 warn 로그와 메트릭만 기록하고 반환한다.
 func (r *TraceRouter) Forward(ctx context.Context, peerURL string, req *collectortracev1.ExportTraceServiceRequest) {
+	r.mu.RLock()
+	cb := r.peerBreakers[peerURL]
+	r.mu.RUnlock()
+
 	// Circuit Breaker 확인: open 상태이면 전달 스킵
-	if cb := r.peerBreakers[peerURL]; cb != nil && r.cbThreshold > 0 {
+	if cb != nil && r.cbThreshold > 0 {
 		if !cb.allow() {
 			slog.Debug("trace router: circuit open, skipping forward", "peer", peerURL)
 			routingCBDropTotal.Inc()
@@ -301,14 +351,20 @@ func (r *TraceRouter) Forward(ctx context.Context, peerURL string, req *collecto
 
 // recordSuccess는 피어 CB에 성공을 기록한다.
 func (r *TraceRouter) recordSuccess(peerURL string) {
-	if cb := r.peerBreakers[peerURL]; cb != nil && r.cbThreshold > 0 {
+	r.mu.RLock()
+	cb := r.peerBreakers[peerURL]
+	r.mu.RUnlock()
+	if cb != nil && r.cbThreshold > 0 {
 		cb.onSuccess()
 	}
 }
 
 // recordFailure는 피어 CB에 실패를 기록한다.
 func (r *TraceRouter) recordFailure(peerURL string) {
-	if cb := r.peerBreakers[peerURL]; cb != nil && r.cbThreshold > 0 {
+	r.mu.RLock()
+	cb := r.peerBreakers[peerURL]
+	r.mu.RUnlock()
+	if cb != nil && r.cbThreshold > 0 {
 		cb.onFailure(peerURL, r.cbThreshold, r.cbCooldown)
 	}
 }

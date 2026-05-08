@@ -66,25 +66,65 @@ func NewDLQReplayer(dir string, ts TraceStore, ms MetricStore, ls LogStore, inte
 	}
 }
 
+// dlqMaxBackoff는 DLQ 재시도 최대 대기 시간이다.
+const dlqMaxBackoff = 30 * time.Minute
+
 // Start는 백그라운드에서 DLQ 재적재를 시작한다.
 // 즉시 한 번 실행 후, interval > 0 이면 주기적으로 반복한다.
+// ClickHouse 장애 등 지속 실패 시 지수 백오프로 재시도 간격을 늘린다.
 func (r *DLQReplayer) Start(ctx context.Context) {
 	go func() {
 		r.ReplayAll(ctx)
 		if r.interval <= 0 {
 			return
 		}
-		ticker := time.NewTicker(r.interval)
-		defer ticker.Stop()
+		backoff := r.interval
 		for {
+			timer := time.NewTimer(backoff)
 			select {
-			case <-ticker.C:
-				r.ReplayAll(ctx)
+			case <-timer.C:
+				if hadError := r.replayAllTracked(ctx); hadError {
+					backoff *= 2
+					if backoff > dlqMaxBackoff {
+						backoff = dlqMaxBackoff
+					}
+					slog.Warn("dlq replay: backing off due to errors", "next_interval", backoff)
+				} else {
+					backoff = r.interval // 성공 시 기본 간격으로 초기화
+				}
 			case <-ctx.Done():
+				timer.Stop()
 				return
 			}
 		}
 	}()
+}
+
+// replayAllTracked는 ReplayAll과 동일하되 실패 발생 여부를 반환한다.
+func (r *DLQReplayer) replayAllTracked(ctx context.Context) (hadError bool) {
+	today := time.Now().UTC().Format("2006-01-02")
+	entries, err := os.ReadDir(r.dir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Warn("dlq replay: read dir failed", "dir", r.dir, "err", err)
+			return true
+		}
+		return false
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+			continue
+		}
+		if strings.Contains(entry.Name(), today) {
+			continue
+		}
+		path := filepath.Join(r.dir, entry.Name())
+		if err := r.replayFile(ctx, path, entry.Name()); err != nil {
+			hadError = true
+			slog.Warn("dlq replay: file failed", "file", entry.Name(), "err", err)
+		}
+	}
+	return hadError
 }
 
 // ReplayAll은 DLQ 디렉터리의 이전 날짜 JSONL 파일을 모두 재적재한다.

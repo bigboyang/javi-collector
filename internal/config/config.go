@@ -216,6 +216,13 @@ type Config struct {
 	// serviceName="javi-collector", attr "javi.internal"=true 로 필터 가능.
 	SelfTracingEnabled bool
 
+	// ── Sampling 인라인 초기 설정 ─────────────────────────────────────────
+	// SAMPLING_CONFIG_JSON: SamplingConfig JSON 문자열.
+	// RemoteConfigURL보다 우선해 초기 config로 적용된다.
+	// RemoteConfigURL이 함께 설정되면 이후 폴링 결과로 덮어씌워진다.
+	// 예: '{"enabled":true,"error_sampling":{"enabled":true},"probabilistic_sampling":{"enabled":true,"rate":1.0}}'
+	SamplingConfigJSON string
+
 	// ── API Key 인증 ──────────────────────────────────────────────────────
 	// API_KEY가 설정된 경우 /api/* 엔드포인트에 X-Api-Key 헤더 인증을 적용한다.
 	// 빈 문자열이면 인증 비활성화 (개발/테스트 환경).
@@ -314,6 +321,7 @@ func Load() (*Config, error) {
 		KafkaMetricForecastGroup: envStr("KAFKA_METRIC_FORECAST_GROUP", "metric-forecast-feeder"),
 		KafkaLogRAGGroup:         envStr("KAFKA_LOG_RAG_GROUP", "log-rag-embedder"),
 		KafkaForecastEndpoint:    envStr("KAFKA_FORECAST_ENDPOINT", ""),
+		SamplingConfigJSON:       envStr("SAMPLING_CONFIG_JSON", ""),
 		APIKey:                   envStr("API_KEY", ""),
 		WALDir:      envStr("WAL_DIR", "./wal"),
 		WALMaxBytes: int64(envInt("WAL_MAX_BYTES", 64<<20)),

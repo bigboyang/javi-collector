@@ -2,8 +2,6 @@
 //
 // SLOStore는 SLO(Service Level Objective) 정의 관리와 번-레이트 알람을 제공한다.
 //
-// 상용 APM의 "SLO/SLI Management" 기능 (Datadog SLO, New Relic SLIs)에 해당한다.
-//
 // 동작 원리:
 //  1. 운영자가 PUT /api/slo/definition 으로 SLO를 등록한다.
 //     예: 결제 서비스, 에러율 < 0.1%, 30일 윈도우
@@ -343,13 +341,13 @@ WHERE service_name = ?
 			return 0, nil
 		}
 		// p95 > threshold인 분(minute)의 비율 = 불량률
+		// GROUP BY 없이 집계해야 데이터 부재 시 NULL(not ErrNoRows)을 반환한다.
 		row := c.conn.QueryRow(ctx, fmt.Sprintf(`
 SELECT
     countIf(quantilesMerge(0.95)(duration_quantiles)[1] / 1e6 > ?) / nullIf(count(), 0) AS bad_rate
 FROM %s.mv_red_1m_state
 WHERE service_name = ?
-  AND minute >= ?
-GROUP BY service_name`, c.db), def.ThresholdMs, def.ServiceName, fromTime)
+  AND minute >= ?`, c.db), def.ThresholdMs, def.ServiceName, fromTime)
 		var badRate *float64
 		if err := row.Scan(&badRate); err != nil {
 			return 0, err

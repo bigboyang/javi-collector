@@ -120,9 +120,29 @@ func (a *Alerter) Enabled() bool {
 
 // Start launches the background goroutine.
 func (a *Alerter) Start() {
-	a.lastChecked = time.Now()
+	a.lastChecked = a.loadLastChecked()
 	a.wg.Add(1)
 	go a.run()
+}
+
+// loadLastChecked는 alert_events 테이블에서 마지막 알림 시각을 읽어 반환한다.
+// 재시작 시 다운타임 구간의 이상을 빠뜨리지 않기 위해 time.Now() 대신 사용한다.
+// 테이블 접근 실패 시 time.Now()로 폴백한다.
+func (a *Alerter) loadLastChecked() time.Time {
+	fallback := time.Now()
+	if a.routeStore == nil {
+		return fallback
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	row := a.conn.QueryRow(ctx, fmt.Sprintf(
+		`SELECT max(fired_at) FROM %s.alert_events WHERE fired_at >= now() - INTERVAL 24 HOUR`, a.db))
+	var lastFired time.Time
+	if err := row.Scan(&lastFired); err != nil || lastFired.IsZero() {
+		return fallback
+	}
+	slog.Info("alerter: lastChecked recovered from alert_events", "lastChecked", lastFired)
+	return lastFired
 }
 
 // Stop signals the goroutine to stop and waits for completion.

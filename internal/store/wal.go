@@ -28,6 +28,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"github.com/kkc/javi-collector/internal/model"
 )
@@ -66,11 +67,14 @@ func openWALFile(path string, maxBytes int64) (*walFile, error) {
 	}, nil
 }
 
-// write는 v를 JSON 한 줄로 WAL에 기록한다.
+// write는 v를 JSON 한 줄로 WAL에 기록하고 fsync로 내구성을 보장한다.
 func (w *walFile) write(v any) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.enc.Encode(v)
+	if err := w.enc.Encode(v); err != nil {
+		return err
+	}
+	return w.f.Sync()
 }
 
 // needsCompact는 WAL 파일이 maxBytes를 초과했는지 확인한다.
@@ -102,6 +106,12 @@ func (w *walFile) compact(items []any) error {
 			_ = os.Remove(tmp)
 			return fmt.Errorf("wal compact encode: %w", err)
 		}
+	}
+	// fsync before close: rename 후 크래시해도 tmp 내용이 디스크에 보존됨
+	if err := tf.Sync(); err != nil {
+		_ = tf.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("wal compact sync tmp: %w", err)
 	}
 	if err := tf.Close(); err != nil {
 		_ = os.Remove(tmp)
@@ -224,8 +234,12 @@ func recoverLogs(path string) ([]*model.LogData, error) {
 
 // WALTraceStore는 MemoryTraceStore를 감싸 WAL 쓰기와 시작 시 복구를 제공한다.
 type WALTraceStore struct {
-	inner *MemoryTraceStore
-	wal   *walFile
+	inner      *MemoryTraceStore
+	wal        *walFile
+	compacting atomic.Bool
+	// compactMu는 compact 동안 새 write가 끼어드는 race를 막는다.
+	// AppendSpans: RLock, compactAsync: Lock(Snapshot~compact 원자 실행).
+	compactMu sync.RWMutex
 }
 
 // NewWALTraceStore는 WAL을 열고, 기존 데이터를 inner에 복구한 뒤 데코레이터를 반환한다.
@@ -271,6 +285,11 @@ func NewWALTraceStore(inner *MemoryTraceStore, cfg WALConfig) (*WALTraceStore, e
 }
 
 func (s *WALTraceStore) AppendSpans(ctx context.Context, spans []*model.SpanData) error {
+	// compactMu.RLock: compact goroutine이 Snapshot→compact를 원자적으로 실행하는 동안
+	// 새 write가 WAL/ring buffer에 interleave되지 않도록 한다.
+	s.compactMu.RLock()
+	defer s.compactMu.RUnlock()
+
 	// WAL 먼저 기록 (write-ahead): 크래시 후 복구 가능성 확보
 	for _, sp := range spans {
 		if err := s.wal.write(sp); err != nil {
@@ -291,12 +310,23 @@ func (s *WALTraceStore) AppendSpans(ctx context.Context, spans []*model.SpanData
 }
 
 func (s *WALTraceStore) compactAsync() {
+	if !s.compacting.CompareAndSwap(false, true) {
+		return // 이미 compact 진행 중
+	}
+	defer s.compacting.Store(false)
+
+	// compactMu.Lock: Snapshot과 compact를 원자적으로 실행한다.
+	// 이 구간 동안 AppendSpans는 RLock 획득을 대기해 WAL에 새 write가 끼어들지 않는다.
+	s.compactMu.Lock()
 	snapshot := s.inner.Snapshot()
 	items := make([]any, len(snapshot))
 	for i, sp := range snapshot {
 		items[i] = sp
 	}
-	if err := s.wal.compact(items); err != nil {
+	err := s.wal.compact(items)
+	s.compactMu.Unlock()
+
+	if err != nil {
 		slog.Warn("wal trace compact failed", "err", err)
 	} else {
 		slog.Debug("wal trace compacted", "items", len(items))
@@ -317,8 +347,10 @@ func (s *WALTraceStore) Size() int { return s.inner.Size() }
 
 // WALMetricStore는 MemoryMetricStore를 감싸 WAL 쓰기와 시작 시 복구를 제공한다.
 type WALMetricStore struct {
-	inner *MemoryMetricStore
-	wal   *walFile
+	inner      *MemoryMetricStore
+	wal        *walFile
+	compacting atomic.Bool
+	compactMu  sync.RWMutex
 }
 
 // NewWALMetricStore는 WAL을 열고, 기존 데이터를 inner에 복구한 뒤 데코레이터를 반환한다.
@@ -361,6 +393,9 @@ func NewWALMetricStore(inner *MemoryMetricStore, cfg WALConfig) (*WALMetricStore
 }
 
 func (s *WALMetricStore) AppendMetrics(ctx context.Context, metrics []*model.MetricData) error {
+	s.compactMu.RLock()
+	defer s.compactMu.RUnlock()
+
 	for _, m := range metrics {
 		if err := s.wal.write(m); err != nil {
 			slog.Warn("wal metric write failed", "err", err)
@@ -379,12 +414,21 @@ func (s *WALMetricStore) AppendMetrics(ctx context.Context, metrics []*model.Met
 }
 
 func (s *WALMetricStore) compactAsync() {
+	if !s.compacting.CompareAndSwap(false, true) {
+		return
+	}
+	defer s.compacting.Store(false)
+
+	s.compactMu.Lock()
 	snapshot := s.inner.Snapshot()
 	items := make([]any, len(snapshot))
 	for i, m := range snapshot {
 		items[i] = m
 	}
-	if err := s.wal.compact(items); err != nil {
+	err := s.wal.compact(items)
+	s.compactMu.Unlock()
+
+	if err != nil {
 		slog.Warn("wal metric compact failed", "err", err)
 	} else {
 		slog.Debug("wal metric compacted", "items", len(items))
@@ -405,8 +449,10 @@ func (s *WALMetricStore) Size() int { return s.inner.Size() }
 
 // WALLogStore는 MemoryLogStore를 감싸 WAL 쓰기와 시작 시 복구를 제공한다.
 type WALLogStore struct {
-	inner *MemoryLogStore
-	wal   *walFile
+	inner      *MemoryLogStore
+	wal        *walFile
+	compacting atomic.Bool
+	compactMu  sync.RWMutex
 }
 
 // NewWALLogStore는 WAL을 열고, 기존 데이터를 inner에 복구한 뒤 데코레이터를 반환한다.
@@ -449,6 +495,9 @@ func NewWALLogStore(inner *MemoryLogStore, cfg WALConfig) (*WALLogStore, error) 
 }
 
 func (s *WALLogStore) AppendLogs(ctx context.Context, logs []*model.LogData) error {
+	s.compactMu.RLock()
+	defer s.compactMu.RUnlock()
+
 	for _, l := range logs {
 		if err := s.wal.write(l); err != nil {
 			slog.Warn("wal log write failed", "err", err)
@@ -467,12 +516,21 @@ func (s *WALLogStore) AppendLogs(ctx context.Context, logs []*model.LogData) err
 }
 
 func (s *WALLogStore) compactAsync() {
+	if !s.compacting.CompareAndSwap(false, true) {
+		return
+	}
+	defer s.compacting.Store(false)
+
+	s.compactMu.Lock()
 	snapshot := s.inner.Snapshot()
 	items := make([]any, len(snapshot))
 	for i, l := range snapshot {
 		items[i] = l
 	}
-	if err := s.wal.compact(items); err != nil {
+	err := s.wal.compact(items)
+	s.compactMu.Unlock()
+
+	if err != nil {
 		slog.Warn("wal log compact failed", "err", err)
 	} else {
 		slog.Debug("wal log compacted", "items", len(items))

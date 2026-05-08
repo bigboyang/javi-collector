@@ -386,20 +386,39 @@ func (f *ForecastForwarder) post(ctx context.Context, path string, payload any) 
 		slog.Warn("forecast forwarder: marshal failed", "path", path, "err", err)
 		return
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		f.endpoint+path, bytes.NewReader(data))
-	if err != nil {
-		slog.Debug("forecast forwarder: request build failed", "path", path, "err", err)
+
+	const maxRetries = 3
+	delay := 200 * time.Millisecond
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
+				delay *= 2
+			}
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+			f.endpoint+path, bytes.NewReader(data))
+		if err != nil {
+			slog.Debug("forecast forwarder: request build failed", "path", path, "err", err)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := f.client.Do(req)
+		if err != nil {
+			slog.Debug("forecast forwarder: send failed", "path", path, "attempt", attempt+1, "err", err)
+			continue
+		}
+		resp.Body.Close()
+		if resp.StatusCode >= 500 {
+			slog.Warn("forecast forwarder: server error", "path", path, "status", resp.StatusCode, "attempt", attempt+1)
+			continue // 5xx만 재시도
+		}
+		if resp.StatusCode >= 400 {
+			slog.Warn("forecast forwarder: client error", "path", path, "status", resp.StatusCode)
+		}
 		return
 	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := f.client.Do(req)
-	if err != nil {
-		slog.Debug("forecast forwarder: send failed", "path", path, "err", err)
-		return
-	}
-	resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		slog.Warn("forecast forwarder: server error", "path", path, "status", resp.StatusCode)
-	}
+	slog.Warn("forecast forwarder: send failed after retries", "path", path)
 }
