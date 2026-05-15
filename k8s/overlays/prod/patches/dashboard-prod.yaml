@@ -1,0 +1,18 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: javi-dashboard
+  namespace: apm
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: javi-dashboard
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"

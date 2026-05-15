@@ -1,0 +1,54 @@
+# Strimzi KRaft-mode Kafka cluster
+# Requires Strimzi operator: kubectl create -f 'https://strimzi.io/install/latest?namespace=apm'
+# Bootstrap service (auto-created): apm-kafka-kafka-bootstrap:9092
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaNodePool
+metadata:
+  name: combined
+  namespace: apm
+  labels:
+    strimzi.io/cluster: apm-kafka
+spec:
+  replicas: 1
+  roles:
+    - controller
+    - broker
+  storage:
+    type: ephemeral
+  resources:
+    requests:
+      memory: 512Mi
+      cpu: "250m"
+    limits:
+      memory: 1Gi
+      cpu: "1"
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: Kafka
+metadata:
+  name: apm-kafka
+  namespace: apm
+  annotations:
+    strimzi.io/node-pools: enabled
+    strimzi.io/kraft: enabled
+spec:
+  kafka:
+    version: 3.8.0
+    metadataVersion: 3.8-IV0
+    listeners:
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
+    config:
+      offsets.topic.replication.factor: 1
+      transaction.state.log.replication.factor: 1
+      transaction.state.log.min.isr: 1
+      default.replication.factor: 1
+      min.insync.replicas: 1
+      log.retention.hours: 168
+      log.segment.bytes: 1073741824
+  entityOperator:
+    topicOperator: {}
+    userOperator: {}

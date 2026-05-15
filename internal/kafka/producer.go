@@ -35,27 +35,20 @@ import (
 )
 
 // SpanEvent는 Kafka 메시지로 발행되는 경량 span 이벤트다.
-// RAGConsumer와 ForecastConsumer에 필요한 필드만 포함한다.
-//
-// 제외 필드:
-//   - ReceivedAtMs: 수신 타임스탬프는 ingestion 내부 계측용이며 하류 컨슈머에 불필요.
-//   - TraceState: W3C Trace Context 전파 메타데이터; 벡터 임베딩·예측 불필요.
-//   - Links: 크로스-트레이스 연결; RAG/Forecast 로직에서 미사용.
-//
-// JSON 태그는 model.SpanData와 동일하므로 기존 컨슈머(SpanData 역직렬화)와 호환된다.
+// JSON 필드명은 javi-forecast의 SpanEvent Pydantic 모델과 일치한다 (snake_case).
 type SpanEvent struct {
-	TraceID       string         `json:"traceId"`
-	SpanID        string         `json:"spanId"`
-	ParentSpanID  string         `json:"parentSpanId,omitempty"`
+	TraceID       string         `json:"trace_id"`
+	SpanID        string         `json:"span_id"`
+	ParentSpanID  string         `json:"parent_span_id,omitempty"`
 	Name          string         `json:"name"`
 	Kind          int32          `json:"kind"`
-	StartTimeNano int64          `json:"startTimeNanos"`
-	EndTimeNano   int64          `json:"endTimeNanos"`
+	StartTimeNano int64          `json:"start_time_nano"`
+	EndTimeNano   int64          `json:"end_time_nano"`
 	Attributes    map[string]any `json:"attributes,omitempty"`
-	StatusCode    int32          `json:"statusCode"`
-	StatusMessage string         `json:"statusMessage,omitempty"`
-	ServiceName   string         `json:"serviceName"`
-	ScopeName     string         `json:"scopeName,omitempty"`
+	StatusCode    int32          `json:"status_code"`
+	StatusMessage string         `json:"status_message,omitempty"`
+	ServiceName   string         `json:"service_name"`
+	ScopeName     string         `json:"scope_name,omitempty"`
 }
 
 // SpanProducer는 span 이벤트를 Kafka 토픽에 비동기로 발행한다.
@@ -197,18 +190,15 @@ func (p *MetricProducer) Close() error {
 // ---- LogProducer ----
 
 // LogEvent는 Kafka logs 토픽에 발행되는 log record다.
-// JSON 태그는 model.LogData와 동일해 컨슈머가 LogData로 역직렬화할 수 있다.
+// JSON 필드명은 javi-forecast의 LogEvent Pydantic 모델과 일치한다 (snake_case).
 type LogEvent struct {
-	TimestampNanos int64          `json:"timestampNanos"`
-	SeverityNumber int32          `json:"severityNumber"`
-	SeverityText   string         `json:"severityText"`
-	Body           string         `json:"body"`
-	Attributes     map[string]any `json:"attributes,omitempty"`
-	TraceID        string         `json:"traceId,omitempty"`
-	SpanID         string         `json:"spanId,omitempty"`
-	ServiceName    string         `json:"serviceName"`
-	ScopeName      string         `json:"scopeName,omitempty"`
-	ReceivedAtMs   int64          `json:"receivedAtMs"`
+	ServiceName  string         `json:"service_name"`
+	Severity     string         `json:"severity"`
+	Body         string         `json:"body"`
+	TimestampMs  int64          `json:"timestamp_ms"`
+	TraceID      string         `json:"trace_id,omitempty"`
+	SpanID       string         `json:"span_id,omitempty"`
+	Attributes   map[string]any `json:"attributes,omitempty"`
 }
 
 // LogProducer는 log 이벤트를 Kafka logs 토픽에 비동기로 발행한다.
@@ -237,16 +227,13 @@ func NewLogProducer(brokers []string, topic string) *LogProducer {
 // PublishLog는 log 이벤트를 Kafka에 비동기로 발행한다.
 func (p *LogProducer) PublishLog(l *model.LogData) {
 	ev := LogEvent{
-		TimestampNanos: l.TimestampNanos,
-		SeverityNumber: l.SeverityNumber,
-		SeverityText:   l.SeverityText,
-		Body:           l.Body,
-		Attributes:     l.Attributes,
-		TraceID:        l.TraceID,
-		SpanID:         l.SpanID,
-		ServiceName:    l.ServiceName,
-		ScopeName:      l.ScopeName,
-		ReceivedAtMs:   l.ReceivedAtMs,
+		ServiceName: l.ServiceName,
+		Severity:    l.SeverityText,
+		Body:        l.Body,
+		TimestampMs: l.TimestampNanos / 1_000_000,
+		TraceID:     l.TraceID,
+		SpanID:      l.SpanID,
+		Attributes:  l.Attributes,
 	}
 	data, err := json.Marshal(ev)
 	if err != nil {

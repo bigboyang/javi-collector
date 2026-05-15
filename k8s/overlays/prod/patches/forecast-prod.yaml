@@ -1,0 +1,20 @@
+# Prod: 2 replicas, higher resource limits for ML workloads
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: javi-forecast
+  namespace: apm
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: javi-forecast
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"

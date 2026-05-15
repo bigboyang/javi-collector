@@ -1,0 +1,239 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: javi-forecast
+  namespace: apm
+  labels:
+    app: javi-forecast
+    component: forecast
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: javi-forecast
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: javi-forecast
+        component: forecast
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: default
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - javi-forecast
+                topologyKey: kubernetes.io/hostname
+      initContainers:
+        - name: wait-for-clickhouse
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z clickhouse-svc 8123; do
+                echo "Waiting for ClickHouse..."; sleep 3
+              done
+              echo "ClickHouse is up"
+      containers:
+        - name: javi-forecast
+          image: javi-forecast:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: HTTP_PORT
+              value: "8080"
+            - name: LOG_LEVEL
+              value: "info"
+            - name: INSTANCE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+
+            # ClickHouse — clickhouse-connect는 HTTP(8123) 사용
+            - name: CLICKHOUSE_HOST
+              value: "clickhouse-svc"
+            - name: CLICKHOUSE_PORT
+              value: "8123"
+            - name: CLICKHOUSE_DB
+              value: "apm"
+            - name: CLICKHOUSE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: clickhouse-secret
+                  key: username
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: clickhouse-secret
+                  key: password
+
+            # Redis (HA 멀티 레플리카 FeatureStore 공유)
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: forecast-secret
+                  key: redis_url
+                  optional: true
+
+            # Kafka
+            - name: KAFKA_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: forecast-config
+                  key: kafka_enabled
+            - name: KAFKA_BROKERS
+              valueFrom:
+                configMapKeyRef:
+                  name: forecast-config
+                  key: kafka_brokers
+            - name: KAFKA_TOPICS
+              valueFrom:
+                configMapKeyRef:
+                  name: forecast-config
+                  key: kafka_topics
+            - name: KAFKA_METRICS_TOPICS
+              valueFrom:
+                configMapKeyRef:
+                  name: forecast-config
+                  key: kafka_metrics_topics
+            - name: KAFKA_LOG_TOPICS
+              valueFrom:
+                configMapKeyRef:
+                  name: forecast-config
+                  key: kafka_log_topics
+            - name: KAFKA_DEPLOY_TOPICS
+              valueFrom:
+                configMapKeyRef:
+                  name: forecast-config
+                  key: kafka_deploy_topics
+            - name: KAFKA_GROUP_ID
+              value: "javi-forecast"
+
+            # Forecasting
+            - name: FORECAST_HORIZON_MINUTES
+              value: "30"
+            - name: FORECAST_INTERVAL_SECONDS
+              value: "60"
+            - name: FEATURE_WINDOW_MINUTES
+              value: "1440"
+            - name: MIN_DATA_POINTS
+              value: "10"
+            - name: DEFAULT_MODEL
+              value: "auto"
+
+            # Backfill
+            - name: BACKFILL_ENABLED
+              value: "true"
+            - name: BACKFILL_HOURS
+              value: "24"
+
+            # Alerting
+            - name: ALERT_FORECAST_THRESHOLD
+              value: "2.0"
+            - name: ALERT_WEBHOOK_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: forecast-config
+                  key: alert_webhook_url
+                  optional: true
+            - name: ALERT_SLACK_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: forecast-secret
+                  key: slack_webhook_url
+                  optional: true
+
+            # BaselineComputer (collector에서 이식)
+            - name: BASELINE_ENABLED
+              value: "true"
+            - name: BASELINE_INTERVAL_HOURS
+              value: "1"
+
+            # AnomalyDetector (collector에서 이식)
+            - name: ANOMALY_ENABLED
+              value: "true"
+            - name: ANOMALY_INTERVAL_SECONDS
+              value: "60"
+            - name: ANOMALY_TRAIN_INTERVAL_HOURS
+              value: "6"
+            - name: ANOMALY_Z_WARN
+              value: "2.0"
+            - name: ANOMALY_Z_CRITICAL
+              value: "3.0"
+            - name: ANOMALY_IF_THRESHOLD
+              value: "0.65"
+            - name: ANOMALY_SUPPRESSION_MINUTES
+              value: "10"
+
+            # RCAEngine (collector에서 이식)
+            - name: RCA_ENABLED
+              value: "true"
+            - name: RCA_INTERVAL_SECONDS
+              value: "120"
+
+            # LLM / RAG (선택)
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: forecast-secret
+                  key: anthropic_api_key
+                  optional: true
+
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 3
+
+          resources:
+            requests:
+              cpu: "300m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: forecast-config
+  namespace: apm
+data:
+  kafka_enabled: "true"
+  kafka_brokers: "apm-kafka-kafka-bootstrap:9092"
+  kafka_topics: "spans.all"
+  kafka_metrics_topics: "metrics"
+  kafka_log_topics: "logs"
+  kafka_deploy_topics: "deploys"
+  alert_webhook_url: ""

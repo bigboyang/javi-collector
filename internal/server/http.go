@@ -57,7 +57,6 @@ import (
 
 	"github.com/kkc/javi-collector/internal/ingester"
 	jkafka "github.com/kkc/javi-collector/internal/kafka"
-	"github.com/kkc/javi-collector/internal/rag"
 	"github.com/kkc/javi-collector/internal/sampling"
 	"github.com/kkc/javi-collector/internal/store"
 )
@@ -253,10 +252,6 @@ type HTTPServer struct {
 	// nil이면 라우팅 비활성화 (단일 인스턴스 또는 Sampling 미사용 배포).
 	traceRouter *sampling.TraceRouter
 
-	// searcher는 RAG 벡터 검색을 담당한다.
-	// nil이면 검색 비활성화 (EMBED_ENABLED=false 배포).
-	searcher *rag.RAGSearcher
-
 	// catalog는 서비스 카탈로그 CRUD를 담당한다.
 	// nil이면 서비스 카탈로그 비활성화 (ClickHouse 미사용 배포).
 	catalog ServiceCatalogManager
@@ -372,7 +367,6 @@ func NewHTTPServer(addr string, ing *ingester.Ingester,
 	// ClickHouse 직접 쿼리 (화이트리스트 SELECT)
 	apiHandle("/api/query", s.queryRaw)
 	// RAG 벡터 검색 (EMBED_ENABLED=true 시 활성)
-	apiHandle("/api/collector/search", s.handleSearch)
 	// 브로큰 트레이스 탐지 (root span 없는 트레이스)
 	apiHandle("/api/collector/broken-traces", s.queryBrokenTraces)
 	// 에러 그룹 집계 (Error Tracking)
@@ -435,12 +429,6 @@ func NewHTTPServer(addr string, ing *ingester.Ingester,
 // Start() 전에 호출해야 한다.
 func (s *HTTPServer) SetTraceRouter(r *sampling.TraceRouter) {
 	s.traceRouter = r
-}
-
-// SetSearcher는 RAG 벡터 검색기를 등록한다.
-// Start() 전에 호출해야 한다. nil이면 /api/collector/search가 503을 반환한다.
-func (s *HTTPServer) SetSearcher(r *rag.RAGSearcher) {
-	s.searcher = r
 }
 
 // SetServiceCatalog는 서비스 카탈로그 관리자를 등록한다.
@@ -1087,87 +1075,6 @@ func deploymentEventID() string {
 		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b[:])
-}
-
-// handleSearch는 자연어 질의를 RAG 벡터 검색으로 처리한다.
-//
-//	POST /api/collector/search
-//	body: {"query":"...","service":"...","from_ms":0,"limit":10}
-func (s *HTTPServer) handleSearch(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if s.searcher == nil {
-		w.Header().Set("Content-Type", jsonContentType)
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": "RAG search unavailable (EMBED_ENABLED=false)"})
-		return
-	}
-
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-	if err != nil {
-		http.Error(w, "read body", http.StatusBadRequest)
-		return
-	}
-
-	var req struct {
-		Query   string `json:"query"`
-		Service string `json:"service"`
-		FromMs  int64  `json:"from_ms"`
-		Limit   int    `json:"limit"`
-	}
-	if err := json.Unmarshal(body, &req); err != nil || req.Query == "" {
-		w.Header().Set("Content-Type", jsonContentType)
-		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": "query field required"})
-		return
-	}
-	if req.Limit <= 0 || req.Limit > 50 {
-		req.Limit = 10
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer cancel()
-
-	results, err := s.searcher.Search(ctx, rag.SearchRequest{
-		Query:       req.Query,
-		ServiceName: req.Service,
-		FromMs:      req.FromMs,
-		Limit:       req.Limit,
-	})
-	if err != nil {
-		slog.Warn("rag search failed", "err", err)
-		w.Header().Set("Content-Type", jsonContentType)
-		w.WriteHeader(http.StatusInternalServerError)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-
-	type resultItem struct {
-		TraceID     string  `json:"trace_id"`
-		ServiceName string  `json:"service_name"`
-		Score       float32 `json:"score"`
-		Text        string  `json:"text"`
-		TimestampMs int64   `json:"timestamp_ms"`
-	}
-	items := make([]resultItem, len(results))
-	for i, res := range results {
-		items[i] = resultItem{
-			TraceID:     res.TraceID,
-			ServiceName: res.ServiceName,
-			Score:       res.Score,
-			Text:        res.Text,
-			TimestampMs: res.TimestampMs,
-		}
-	}
-
-	w.Header().Set("Content-Type", jsonContentType)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"query":   req.Query,
-		"results": items,
-		"total":   len(items),
-	})
 }
 
 // queryRCAReports는 RCA 분석 결과를 반환한다.

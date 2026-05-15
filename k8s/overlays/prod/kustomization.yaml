@@ -1,0 +1,74 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Prod: 3-replica Kafka with persistent storage, scaled app replicas
+# Deploy: kubectl apply -k k8s/overlays/prod
+
+namespace: apm
+
+resources:
+  - ../../base
+
+patches:
+  # --- Kafka: scale to 3 replicas with persistent storage ---
+  - target:
+      group: kafka.strimzi.io
+      version: v1beta2
+      kind: KafkaNodePool
+      name: combined
+    patch: |
+      - op: replace
+        path: /spec/replicas
+        value: 3
+      - op: replace
+        path: /spec/storage
+        value:
+          type: persistent-claim
+          size: 20Gi
+          deleteClaim: false
+      - op: replace
+        path: /spec/resources
+        value:
+          requests:
+            memory: 2Gi
+            cpu: "500m"
+          limits:
+            memory: 4Gi
+            cpu: "2"
+
+  # --- Kafka cluster: update replication factors for 3 brokers ---
+  - target:
+      group: kafka.strimzi.io
+      version: v1beta2
+      kind: Kafka
+      name: apm-kafka
+    patch: |
+      - op: replace
+        path: /spec/kafka/config
+        value:
+          offsets.topic.replication.factor: 3
+          transaction.state.log.replication.factor: 3
+          transaction.state.log.min.isr: 2
+          default.replication.factor: 3
+          min.insync.replicas: 2
+          log.retention.hours: 168
+          log.segment.bytes: 1073741824
+
+  # --- Topics: replicas = 3 ---
+  - target:
+      group: kafka.strimzi.io
+      version: v1beta2
+      kind: KafkaTopic
+    patch: |
+      - op: replace
+        path: /spec/replicas
+        value: 3
+
+  # --- Collector: 2 replicas, prod resources ---
+  - path: patches/collector-prod.yaml
+
+  # --- Forecast: 2 replicas, prod resources ---
+  - path: patches/forecast-prod.yaml
+
+  # --- Dashboard: 2 replicas, prod resources ---
+  - path: patches/dashboard-prod.yaml

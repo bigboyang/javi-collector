@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: javi-forecast
+  namespace: apm
+  labels:
+    app: javi-forecast
+    component: forecast
+spec:
+  type: ClusterIP
+  selector:
+    app: javi-forecast
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP

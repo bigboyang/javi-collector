@@ -1,0 +1,20 @@
+# Prod: 2 replicas, higher resource limits
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: javi-collector
+  namespace: apm
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: collector
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"

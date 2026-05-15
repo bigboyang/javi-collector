@@ -1,0 +1,61 @@
+# Topics managed by Strimzi TopicOperator
+# Topic name in Kafka matches metadata.name (hyphens ok)
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: spans.all
+  namespace: apm
+  labels:
+    strimzi.io/cluster: apm-kafka
+spec:
+  partitions: 6
+  replicas: 1
+  config:
+    retention.ms: "604800000"    # 7 days
+    cleanup.policy: delete
+    compression.type: lz4
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: metrics
+  namespace: apm
+  labels:
+    strimzi.io/cluster: apm-kafka
+spec:
+  partitions: 6
+  replicas: 1
+  config:
+    retention.ms: "604800000"
+    cleanup.policy: delete
+    compression.type: lz4
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: logs
+  namespace: apm
+  labels:
+    strimzi.io/cluster: apm-kafka
+spec:
+  partitions: 6
+  replicas: 1
+  config:
+    retention.ms: "259200000"    # 3 days (high volume)
+    cleanup.policy: delete
+    compression.type: lz4
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: deploys
+  namespace: apm
+  labels:
+    strimzi.io/cluster: apm-kafka
+spec:
+  partitions: 1
+  replicas: 1
+  config:
+    retention.ms: "2592000000"   # 30 days (deploy history)
+    cleanup.policy: delete

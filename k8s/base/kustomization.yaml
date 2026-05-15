@@ -1,0 +1,47 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: apm
+
+resources:
+  - namespace.yaml
+  # Infra — stateful services
+  - clickhouse/configmap.yaml
+  - clickhouse/secret.yaml
+  - clickhouse/service.yaml
+  - clickhouse/statefulset.yaml
+  - ollama/pvc.yaml
+  - ollama/deployment.yaml
+  - ollama/service.yaml
+  - qdrant/statefulset.yaml
+  - qdrant/service.yaml
+  # Kafka — Strimzi CRDs (requires Strimzi operator pre-installed)
+  # Install operator: kubectl create -f 'https://strimzi.io/install/latest?namespace=apm'
+  - kafka/cluster.yaml
+  - kafka/topics.yaml
+  # Apps
+  - collector/pvc.yaml
+  - collector/configmap.yaml
+  - collector/secret.yaml
+  - collector/deployment.yaml
+  - collector/service.yaml
+  - collector/hpa.yaml
+  - collector/pdb.yaml
+  - forecast/secret.yaml
+  - forecast/deployment.yaml
+  - forecast/service.yaml
+  - forecast/hpa.yaml
+  - forecast/pdb.yaml
+  # Config Server — agent remote config polling
+  - config-server/pvc.yaml
+  - config-server/deployment.yaml
+  - config-server/service.yaml
+  # Redis — FeatureStore sharing across forecast replicas
+  - redis/pvc.yaml
+  - redis/deployment.yaml
+  - redis/service.yaml
+  # Dashboard — UI + API backend
+  - dashboard/deployment.yaml
+  - dashboard/service.yaml
+  # Ingress — external access (requires nginx ingress controller)
+  - ingress.yaml

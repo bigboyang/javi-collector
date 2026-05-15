@@ -7,21 +7,16 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
-	"github.com/kkc/javi-collector/internal/alerter"
-	"github.com/kkc/javi-collector/internal/anomaly"
 	"github.com/kkc/javi-collector/internal/config"
 	"github.com/kkc/javi-collector/internal/forecast"
 	"github.com/kkc/javi-collector/internal/ingester"
 	jkafka "github.com/kkc/javi-collector/internal/kafka"
 	"github.com/kkc/javi-collector/internal/processor"
-	"github.com/kkc/javi-collector/internal/rag"
-	"github.com/kkc/javi-collector/internal/rca"
 	"github.com/kkc/javi-collector/internal/sampling"
 	"github.com/kkc/javi-collector/internal/selftracing"
 	"github.com/kkc/javi-collector/internal/server"
@@ -207,44 +202,6 @@ func main() {
 			"flush_workers", cfg.FlushWorkers,
 		)
 
-		// AIOps Phase 1: RED Baseline 자동 집계
-		// BaselineComputer는 공유 커넥션으로 매 BaselineInterval마다
-		// red_baseline 테이블을 갱신한다.
-		if cfg.BaselineEnabled {
-			bc := store.NewBaselineComputer(chConn, cfg.ClickHouseDB, cfg.BaselineInterval)
-			bc.Start()
-			defer bc.Stop()
-			slog.Info("baseline computer started",
-				"interval", cfg.BaselineInterval,
-				"db", cfg.ClickHouseDB,
-			)
-		}
-
-		// AIOps Phase 2: Z-score + IsolationForest 이상 탐지
-		// Detector는 AnomalyInterval마다 mv_red_1m_state와 red_baseline을 비교해
-		// latency_p95_spike / error_rate_spike / traffic_drop / multivariate_anomaly를
-		// anomalies 테이블에 기록한다.
-		if cfg.AnomalyEnabled {
-			anomalyCfg := anomaly.Config{
-				Interval:      cfg.AnomalyInterval,
-				TrainInterval: cfg.AnomalyTrainInterval,
-				NTrees:        cfg.AnomalyNTrees,
-				MaxSamples:    cfg.AnomalyMaxSamples,
-				ZWarn:         cfg.AnomalyZWarn,
-				ZCritical:     cfg.AnomalyZCritical,
-				IFThreshold:   cfg.AnomalyIFThreshold,
-			}
-			det := anomaly.NewDetector(chConn, cfg.ClickHouseDB, anomalyCfg)
-			det.Start()
-			defer det.Stop()
-			slog.Info("anomaly detector started",
-				"interval", anomalyCfg.Interval,
-				"train_interval", anomalyCfg.TrainInterval,
-				"z_warn", anomalyCfg.ZWarn,
-				"z_critical", anomalyCfg.ZCritical,
-				"if_threshold", anomalyCfg.IFThreshold,
-			)
-		}
 	}
 
 	// Signal context: SIGINT/SIGTERM 수신 시 취소된다.
@@ -299,69 +256,6 @@ func main() {
 		)
 	}
 
-	// RAG 파이프라인 초기화 (EMBED_ENABLED=true 시)
-	// Ollama(nomic-embed-text) → Qdrant 벡터 저장 → 자연어 장애 검색
-	var embedPipeline *rag.EmbedPipeline
-	var ragSearcher *rag.RAGSearcher
-	var ragGenerator *rag.RAGGenerator
-	if cfg.EmbedEnabled {
-		embedClient := rag.NewOllamaEmbedClient(cfg.EmbedEndpoint, cfg.EmbedModel)
-		qdrantClient := rag.NewQdrantClient(cfg.QdrantEndpoint, cfg.QdrantCollection)
-		if err := qdrantClient.EnsureCollection(ctx, 768); err != nil {
-			slog.Warn("qdrant collection init failed (RAG disabled)", "err", err)
-		} else {
-			embedPipeline = rag.NewEmbedPipeline(embedClient, qdrantClient, 1024, 32, 10*time.Second)
-			embedPipeline.Start(ctx)
-			ragSearcher = rag.NewRAGSearcher(embedClient, qdrantClient, cfg.RAGScoreThreshold)
-
-			// RAG Generation: LLM 기반 RCA 분석 (LLM_ENABLED=true 시)
-			if cfg.LLMEnabled {
-				llmClient := rag.NewOllamaLLMClient(cfg.EmbedEndpoint, cfg.LLMModel)
-				ragGenerator = rag.NewRAGGenerator(ragSearcher, llmClient)
-				slog.Info("RAG LLM generation enabled",
-					"model", cfg.LLMModel,
-					"endpoint", cfg.EmbedEndpoint,
-				)
-			}
-
-			slog.Info("RAG embed pipeline started",
-				"endpoint", cfg.EmbedEndpoint,
-				"model", cfg.EmbedModel,
-				"qdrant", cfg.QdrantEndpoint,
-			)
-
-			// RAG Janitor: 오래된 Qdrant 포인트를 주기적으로 삭제해 컬렉션 크기를 제한한다.
-			// RAG_RETENTION_DAYS=0 이면 비활성화.
-			if cfg.RAGRetentionDays > 0 {
-				janitor := rag.NewQdrantJanitor(qdrantClient, cfg.RAGRetentionDays, cfg.RAGJanitorInterval)
-				janitor.Start(ctx)
-				slog.Info("qdrant janitor started",
-					"retention_days", cfg.RAGRetentionDays,
-					"interval", cfg.RAGJanitorInterval,
-				)
-			}
-
-			// RAG Historical Backfill: ClickHouse 과거 ERROR spans → Qdrant 적재
-			// 기동 직후 Qdrant가 비어 있어 유사 사례 검색이 안 되는 문제를 해결한다.
-			if cfg.RAGBackfillEnabled {
-				checkpointFile := cfg.RAGBackfillCheckpointFile
-				if checkpointFile == "" {
-					checkpointFile = filepath.Join(cfg.BackupDir, "rag_backfill_checkpoint.json")
-				}
-				backfiller := rag.NewHistoricalBackfiller(
-					traceStore, embedPipeline,
-					cfg.RAGBackfillDays, cfg.RAGBackfillBatchSize,
-					checkpointFile, int64(cfg.RAGSlowThresholdMs),
-				)
-				backfiller.Run(ctx)
-				slog.Info("RAG historical backfill scheduled",
-					"days", cfg.RAGBackfillDays,
-					"batch_size", cfg.RAGBackfillBatchSize,
-				)
-			}
-		}
-	}
-
 	// GAP-05: Alert Routing & Escalation
 	// alert_routes / alert_events 테이블을 관리하는 저장소를 초기화한다.
 	var alertRouteStore *store.AlertRouteStore
@@ -383,51 +277,6 @@ func main() {
 			logAnalyticsStore = las
 			slog.Info("log analytics store initialized")
 		}
-	}
-
-	// AIOps Alert: Webhook / Slack Push Alerter
-	// anomalies 테이블을 폴링해 신규 이상 이벤트를 외부로 Push한다.
-	// ALERT_WEBHOOK_URL 또는 ALERT_SLACK_WEBHOOK_URL 중 하나라도 설정하거나
-	// alertRouteStore가 초기화되면 활성화된다.
-	if !cfg.DisableClickHouse {
-		alertCfg := alerter.Config{
-			WebhookURL:      cfg.AlertWebhookURL,
-			SlackWebhookURL: cfg.AlertSlackWebhookURL,
-			Interval:        cfg.AlertInterval,
-			MinSeverity:     cfg.AlertMinSeverity,
-		}
-		al := alerter.New(chConn, cfg.ClickHouseDB, alertCfg)
-		if alertRouteStore != nil {
-			al.SetRouteStore(alertRouteStore)
-		}
-		if al.Enabled() {
-			al.Start()
-			defer al.Stop()
-			slog.Info("alerter started",
-				"interval", cfg.AlertInterval,
-				"min_severity", cfg.AlertMinSeverity,
-				"slack", cfg.AlertSlackWebhookURL != "",
-				"webhook", cfg.AlertWebhookURL != "",
-				"routing", alertRouteStore != nil,
-			)
-		}
-	}
-
-	// AIOps Phase 3: RCA Engine
-	// anomalies 테이블을 폴링해 연관 spans + RAG 유사 사례를 결합한 rca_reports를 생성한다.
-	if !cfg.DisableClickHouse && cfg.RCAEnabled {
-		rcaCfg := rca.Config{Interval: cfg.RCAInterval}
-		rcaEngine := rca.NewEngine(chConn, cfg.ClickHouseDB, rcaCfg, ragSearcher)
-		if ragGenerator != nil {
-			rcaEngine.SetGenerator(ragGenerator)
-		}
-		rcaEngine.Start()
-		defer rcaEngine.Stop()
-		slog.Info("rca engine started",
-			"interval", cfg.RCAInterval,
-			"rag_enabled", ragSearcher != nil,
-			"llm_enabled", ragGenerator != nil,
-		)
 	}
 
 	// 파일 백업: BACKUP_ENABLED=true이면 ingester에 전달되는 store를
@@ -537,64 +386,13 @@ func main() {
 		defer deployPub.Close() //nolint:errcheck
 		slog.Info("kafka deployment producer started", "topic", cfg.KafkaDeployTopic)
 
-		// Span RAG Consumer: Kafka → EmbedPipeline → Qdrant
-		if embedPipeline != nil {
-			ragConsumer := jkafka.NewRAGConsumer(
-				cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaRAGGroup,
-				embedPipeline, logStore, int64(cfg.RAGSlowThresholdMs),
-			)
-			ragConsumer.Start(ctx)
-			defer ragConsumer.Close() //nolint:errcheck
-
-			// Log RAG Consumer: Kafka → EmbedPipeline → Qdrant (ERROR+ 로그만)
-			logRAGConsumer := jkafka.NewLogRAGConsumer(
-				cfg.KafkaBrokers, cfg.KafkaLogsTopic, cfg.KafkaLogRAGGroup,
-				embedPipeline,
-			)
-			logRAGConsumer.Start(ctx)
-			defer logRAGConsumer.Close() //nolint:errcheck
-		}
-
-		// Span Forecast Consumer: Kafka → Forecast Server
-		forecastConsumer := jkafka.NewForecastConsumer(
-			cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaForecastGroup,
-			cfg.KafkaForecastEndpoint,
-		)
-		forecastConsumer.Start(ctx)
-		defer forecastConsumer.Close() //nolint:errcheck
-
-		// Metric Forecast Consumer: Kafka → Forecast Server
-		metricForecastConsumer := jkafka.NewMetricForecastConsumer(
-			cfg.KafkaBrokers, cfg.KafkaMetricsTopic, cfg.KafkaMetricForecastGroup,
-			cfg.KafkaForecastEndpoint,
-		)
-		metricForecastConsumer.Start(ctx)
-		defer metricForecastConsumer.Close() //nolint:errcheck
-
 		defer spanProducer.Close()   //nolint:errcheck
 		defer metricProducer.Close() //nolint:errcheck
 		defer logProducer.Close()    //nolint:errcheck
 	} else {
-		// 직접 모드 (Kafka 미사용): RAG + Forecast 팬아웃
-		var pubs []ingester.SpanPublisher
-		if embedPipeline != nil {
-			pubs = append(pubs, &ingester.DirectSpanPublisher{
-				Pipeline: embedPipeline,
-				Builder:  rag.DocumentBuilder{SlowMs: int64(cfg.RAGSlowThresholdMs)},
-			})
-			logPub = &ingester.DirectLogPublisher{
-				Pipeline: embedPipeline,
-				Builder:  rag.DocumentBuilder{SlowMs: int64(cfg.RAGSlowThresholdMs)},
-			}
-		}
+		// 직접 모드 (Kafka 미사용): Forecast 팬아웃
 		if forecaster != nil {
-			pubs = append(pubs, forecaster)
-		}
-		switch len(pubs) {
-		case 1:
-			spanPub = pubs[0]
-		case 2:
-			spanPub = ingester.NewMultiSpanPublisher(pubs...)
+			spanPub = forecaster
 		}
 	}
 
@@ -659,9 +457,6 @@ func main() {
 	}
 
 	defer func() {
-		if embedPipeline != nil {
-			embedPipeline.Close()
-		}
 		poller.Stop()
 		// tailStore.Close()가 내부적으로 downstream(traceStore)을 닫는다.
 		if err := tailStore.Close(); err != nil {
@@ -687,11 +482,6 @@ func main() {
 	if traceRouter != nil && traceRouter.Enabled() {
 		httpSrv.SetTraceRouter(traceRouter)
 		grpcSrv.SetTraceRouter(traceRouter)
-	}
-
-	// RAG Searcher 주입 (EMBED_ENABLED=true 시에만 non-nil)
-	if ragSearcher != nil {
-		httpSrv.SetSearcher(ragSearcher)
 	}
 
 	// Gap 4: 서비스 카탈로그 주입

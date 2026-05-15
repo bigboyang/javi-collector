@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: javi-config-server
+  namespace: apm
+  labels:
+    app: javi-config-server
+    component: config
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: javi-config-server
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: javi-config-server
+        component: config
+    spec:
+      containers:
+        - name: config-server
+          image: javi-config-server:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 18888
+              protocol: TCP
+          env:
+            - name: STATE_FILE
+              value: /data/config-state.json
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /api/config/remote
+              port: 18888
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /api/config/remote
+              port: 18888
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: config-server-data
+      terminationGracePeriodSeconds: 15

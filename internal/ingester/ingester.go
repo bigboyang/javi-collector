@@ -27,7 +27,6 @@ import (
 	"github.com/kkc/javi-collector/internal/decoder"
 	"github.com/kkc/javi-collector/internal/model"
 	"github.com/kkc/javi-collector/internal/processor"
-	"github.com/kkc/javi-collector/internal/rag"
 	"github.com/kkc/javi-collector/internal/selftracing"
 	"github.com/kkc/javi-collector/internal/store"
 )
@@ -81,34 +80,6 @@ type MetricPublisher interface {
 //   - kafka.LogProducer: Kafka logs 토픽에 발행
 type LogPublisher interface {
 	PublishLog(l *model.LogData)
-}
-
-// DirectSpanPublisher는 span을 DocumentBuilder로 변환해 EmbedPipeline에 직접 제출한다.
-// KAFKA_ENABLED=false(기본)일 때 사용한다.
-type DirectSpanPublisher struct {
-	Pipeline *rag.EmbedPipeline
-	Builder  rag.DocumentBuilder
-}
-
-// Publish는 span을 EmbedDocument로 변환해 EmbedPipeline에 제출한다.
-func (d *DirectSpanPublisher) Publish(sp *model.SpanData) {
-	if doc := d.Builder.BuildFromSpan(sp, nil); doc != nil {
-		d.Pipeline.Submit(doc)
-	}
-}
-
-// DirectLogPublisher는 ERROR+ 로그를 EmbedPipeline에 직접 제출한다.
-// KAFKA_ENABLED=false(기본)일 때 사용한다.
-type DirectLogPublisher struct {
-	Pipeline *rag.EmbedPipeline
-	Builder  rag.DocumentBuilder
-}
-
-// PublishLog는 ERROR 이상 심각도 로그를 EmbedDocument로 변환해 EmbedPipeline에 제출한다.
-func (d *DirectLogPublisher) PublishLog(l *model.LogData) {
-	if doc := d.Builder.BuildFromLog(l); doc != nil {
-		d.Pipeline.Submit(doc)
-	}
 }
 
 // MultiSpanPublisher는 여러 SpanPublisher에 span 이벤트를 팬아웃한다.

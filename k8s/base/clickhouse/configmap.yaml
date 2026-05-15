@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-users-config
+  namespace: apm
+data:
+  users_override.xml: |
+    <?xml version="1.0"?>
+    <clickhouse>
+      <users>
+        <default>
+          <!-- password는 CLICKHOUSE_PASSWORD env var로 default-user.xml에서 설정됨 -->
+          <!-- 두 파일에 password가 있으면 XML merge로 이어붙여져 인증 실패함 -->
+          <networks>
+            <ip>10.0.0.0/8</ip>
+            <ip>127.0.0.1</ip>
+          </networks>
+          <profile>default</profile>
+          <quota>default</quota>
+        </default>
+      </users>
+    </clickhouse>

@@ -1,0 +1,48 @@
+# Requires nginx ingress controller: kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/cloud/deploy.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: apm-ingress
+  namespace: apm
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+spec:
+  ingressClassName: nginx
+  rules:
+    # Dashboard UI + API
+    - host: dashboard.apm.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: javi-dashboard
+                port:
+                  number: 8080
+
+    # Config server (agent polling)
+    - host: config.apm.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: javi-config-server
+                port:
+                  number: 18888
+
+    # Collector OTLP/HTTP (agent telemetry ingest)
+    - host: collector.apm.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: javi-collector
+                port:
+                  number: 4318
