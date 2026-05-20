@@ -34,9 +34,12 @@ import (
 	"github.com/kkc/javi-collector/internal/model"
 )
 
+const schemaVersion = "1"
+
 // SpanEvent는 Kafka 메시지로 발행되는 경량 span 이벤트다.
 // JSON 필드명은 javi-forecast의 SpanEvent Pydantic 모델과 일치한다 (snake_case).
 type SpanEvent struct {
+	SchemaVersion string         `json:"schema_version"`
 	TraceID       string         `json:"trace_id"`
 	SpanID        string         `json:"span_id"`
 	ParentSpanID  string         `json:"parent_span_id,omitempty"`
@@ -81,6 +84,7 @@ func NewSpanProducer(brokers []string, topic string) *SpanProducer {
 // JSON 직렬화 실패 시 즉시 드롭 (발생하지 않는 케이스).
 func (p *SpanProducer) Publish(sp *model.SpanData) {
 	ev := SpanEvent{
+		SchemaVersion: schemaVersion,
 		TraceID:       sp.TraceID,
 		SpanID:        sp.SpanID,
 		ParentSpanID:  sp.ParentSpanID,
@@ -118,13 +122,14 @@ func (p *SpanProducer) Close() error {
 //
 // HISTOGRAM은 Count > 0이면 Sum/Count 평균값을, 아니면 Sum을 Value로 사용한다.
 type MetricEvent struct {
-	ServiceName string         `json:"service_name"`
-	MetricName  string         `json:"metric_name"`
-	MetricType  string         `json:"metric_type"`
-	Unit        string         `json:"unit,omitempty"`
-	Value       float64        `json:"value"`
-	TimestampMs int64          `json:"timestamp_ms"`
-	Attributes  map[string]any `json:"attributes,omitempty"`
+	SchemaVersion string         `json:"schema_version"`
+	ServiceName   string         `json:"service_name"`
+	MetricName    string         `json:"metric_name"`
+	MetricType    string         `json:"metric_type"`
+	Unit          string         `json:"unit,omitempty"`
+	Value         float64        `json:"value"`
+	TimestampMs   int64          `json:"timestamp_ms"`
+	Attributes    map[string]any `json:"attributes,omitempty"`
 }
 
 // MetricProducer는 metric 이벤트를 Kafka metrics 토픽에 비동기로 발행한다.
@@ -161,13 +166,14 @@ func (p *MetricProducer) PublishMetric(m *model.MetricData) {
 		}
 
 		ev := MetricEvent{
-			ServiceName: m.ServiceName,
-			MetricName:  m.Name,
-			MetricType:  string(m.Type),
-			Unit:        m.Unit,
-			Value:       value,
-			TimestampMs: dp.TimeNanos / 1_000_000,
-			Attributes:  dp.Attributes,
+			SchemaVersion: schemaVersion,
+			ServiceName:   m.ServiceName,
+			MetricName:    m.Name,
+			MetricType:    string(m.Type),
+			Unit:          m.Unit,
+			Value:         value,
+			TimestampMs:   dp.TimeNanos / 1_000_000,
+			Attributes:    dp.Attributes,
 		}
 		data, err := json.Marshal(ev)
 		if err != nil {
@@ -192,13 +198,14 @@ func (p *MetricProducer) Close() error {
 // LogEvent는 Kafka logs 토픽에 발행되는 log record다.
 // JSON 필드명은 javi-forecast의 LogEvent Pydantic 모델과 일치한다 (snake_case).
 type LogEvent struct {
-	ServiceName  string         `json:"service_name"`
-	Severity     string         `json:"severity"`
-	Body         string         `json:"body"`
-	TimestampMs  int64          `json:"timestamp_ms"`
-	TraceID      string         `json:"trace_id,omitempty"`
-	SpanID       string         `json:"span_id,omitempty"`
-	Attributes   map[string]any `json:"attributes,omitempty"`
+	SchemaVersion string         `json:"schema_version"`
+	ServiceName   string         `json:"service_name"`
+	Severity      string         `json:"severity"`
+	Body          string         `json:"body"`
+	TimestampMs   int64          `json:"timestamp_ms"`
+	TraceID       string         `json:"trace_id,omitempty"`
+	SpanID        string         `json:"span_id,omitempty"`
+	Attributes    map[string]any `json:"attributes,omitempty"`
 }
 
 // LogProducer는 log 이벤트를 Kafka logs 토픽에 비동기로 발행한다.
@@ -227,13 +234,14 @@ func NewLogProducer(brokers []string, topic string) *LogProducer {
 // PublishLog는 log 이벤트를 Kafka에 비동기로 발행한다.
 func (p *LogProducer) PublishLog(l *model.LogData) {
 	ev := LogEvent{
-		ServiceName: l.ServiceName,
-		Severity:    l.SeverityText,
-		Body:        l.Body,
-		TimestampMs: l.TimestampNanos / 1_000_000,
-		TraceID:     l.TraceID,
-		SpanID:      l.SpanID,
-		Attributes:  l.Attributes,
+		SchemaVersion: schemaVersion,
+		ServiceName:   l.ServiceName,
+		Severity:      l.SeverityText,
+		Body:          l.Body,
+		TimestampMs:   l.TimestampNanos / 1_000_000,
+		TraceID:       l.TraceID,
+		SpanID:        l.SpanID,
+		Attributes:    l.Attributes,
 	}
 	data, err := json.Marshal(ev)
 	if err != nil {
@@ -257,12 +265,13 @@ func (p *LogProducer) Close() error {
 // Kafka "deploys" 토픽을 통해 javi-forecast로 전달되어
 // 이상 감지 베이스라인 리셋 및 배포 상관 분석에 사용된다.
 type DeploymentEvent struct {
-	ServiceName string         `json:"service_name"`
-	Version     string         `json:"version"`
-	Environment string         `json:"environment"`
-	DeployedBy  string         `json:"deployed_by,omitempty"`
-	TimestampMs int64          `json:"timestamp_ms"`
-	Metadata    map[string]any `json:"metadata,omitempty"`
+	SchemaVersion string         `json:"schema_version"`
+	ServiceName   string         `json:"service_name"`
+	Version       string         `json:"version"`
+	Environment   string         `json:"environment"`
+	DeployedBy    string         `json:"deployed_by,omitempty"`
+	TimestampMs   int64          `json:"timestamp_ms"`
+	Metadata      map[string]any `json:"metadata,omitempty"`
 }
 
 // DeploymentProducer는 배포 이벤트를 Kafka deploys 토픽에 비동기로 발행한다.
@@ -289,7 +298,11 @@ func NewDeploymentProducer(brokers []string, topic string) *DeploymentProducer {
 }
 
 // Publish는 배포 이벤트를 Kafka에 비동기로 발행한다.
+// SchemaVersion이 비어 있으면 현재 버전으로 채운다.
 func (p *DeploymentProducer) Publish(ev DeploymentEvent) {
+	if ev.SchemaVersion == "" {
+		ev.SchemaVersion = schemaVersion
+	}
 	data, err := json.Marshal(ev)
 	if err != nil {
 		slog.Warn("kafka deployment producer marshal failed", "service", ev.ServiceName, "err", err)
