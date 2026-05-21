@@ -239,12 +239,19 @@ func (f *ForecastForwarder) updateJVMSnap(m *model.MetricData) {
 			snap.ev.TimestampNano = dp.TimeNanos
 		}
 		switch m.Name {
-		case "jvm.memory.heap.used":
-			snap.ev.HeapUsedBytes = dp.Value
-		case "jvm.memory.heap.committed":
-			snap.ev.HeapCommittedBytes = dp.Value
-		case "jvm.memory.heap.max":
-			snap.ev.HeapMaxBytes = dp.Value
+		// OTel Java Agent 실제 메트릭명: jvm.memory.{used|committed|limit} + area 속성
+		case "jvm.memory.used", "jvm.memory.heap.used":
+			if isHeap(dp.Attributes) {
+				snap.ev.HeapUsedBytes = dp.Value
+			}
+		case "jvm.memory.committed", "jvm.memory.heap.committed":
+			if isHeap(dp.Attributes) {
+				snap.ev.HeapCommittedBytes = dp.Value
+			}
+		case "jvm.memory.limit", "jvm.memory.heap.max":
+			if isHeap(dp.Attributes) {
+				snap.ev.HeapMaxBytes = dp.Value
+			}
 		case "jvm.gc.duration":
 			// HISTOGRAM: sum=총 GC 시간(초), count=GC 횟수
 			snap.ev.GCPauseMsTotalDelta = dp.Sum * 1000 // 초 → ms
@@ -257,9 +264,9 @@ func (f *ForecastForwarder) updateJVMSnap(m *model.MetricData) {
 		case "jvm.thread.count", "jvm.threads.count",
 			"process.runtime.jvm.threads.count":
 			snap.ev.ThreadCount = dp.Value
-		case "jvm.thread.peak":
+		case "jvm.thread.peak", "jvm.threads.peak":
 			snap.ev.ThreadPeak = dp.Value
-		case "jvm.thread.daemon.count":
+		case "jvm.thread.daemon.count", "jvm.threads.daemon":
 			snap.ev.ThreadDaemon = dp.Value
 		case "jvm.process.cpu.utilization",
 			"process.runtime.jvm.cpu.utilization",
@@ -269,6 +276,17 @@ func (f *ForecastForwarder) updateJVMSnap(m *model.MetricData) {
 			snap.ev.SystemCPUUtilization = dp.Value
 		}
 	}
+}
+
+// isHeap returns true if the data point attributes indicate heap memory area.
+func isHeap(attrs map[string]any) bool {
+	if v, ok := attrs["area"]; ok {
+		if s, ok := v.(string); ok {
+			return strings.EqualFold(s, "heap")
+		}
+	}
+	// no area attribute → treat as heap (old OTel naming like jvm.memory.heap.*)
+	return true
 }
 
 // ── 백그라운드 flush 루프 ─────────────────────────────────────────────────────
