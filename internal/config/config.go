@@ -198,17 +198,17 @@ type Config struct {
 	//   logs        → [log-rag-embedder]        → EmbedPipeline → Qdrant (ERROR+만)
 	//
 	// false이면 기존 채널 기반 직접 적재(DirectSpanPublisher)로 동작한다.
-	KafkaEnabled              bool
-	KafkaBrokers              []string // 콤마 구분 브로커 목록 (KAFKA_BROKERS, 기본 "localhost:9092")
-	KafkaTopic                string   // span 이벤트 토픽 (KAFKA_TOPIC, 기본 "spans.error")
-	KafkaMetricsTopic         string   // metric 이벤트 토픽 (KAFKA_METRICS_TOPIC, 기본 "metrics")
-	KafkaLogsTopic            string   // log 이벤트 토픽 (KAFKA_LOGS_TOPIC, 기본 "logs")
-	KafkaDeployTopic          string   // 배포 이벤트 토픽 (KAFKA_DEPLOY_TOPIC, 기본 "deploys")
-	KafkaRAGGroup             string   // span RAG consumer group (KAFKA_RAG_GROUP, 기본 "rag-embedder")
-	KafkaForecastGroup        string   // span Forecast consumer group (KAFKA_FORECAST_GROUP, 기본 "forecast-feeder")
-	KafkaMetricForecastGroup  string   // metric Forecast consumer group (KAFKA_METRIC_FORECAST_GROUP, 기본 "metric-forecast-feeder")
-	KafkaLogRAGGroup          string   // log RAG consumer group (KAFKA_LOG_RAG_GROUP, 기본 "log-rag-embedder")
-	KafkaForecastEndpoint     string   // Forecast 서버 URL (KAFKA_FORECAST_ENDPOINT, 빈 문자열이면 stub)
+	KafkaEnabled             bool
+	KafkaBrokers             []string // 콤마 구분 브로커 목록 (KAFKA_BROKERS, 기본 "localhost:9092")
+	KafkaTopic               string   // span 이벤트 토픽 (KAFKA_TOPIC, 기본 "spans.error")
+	KafkaMetricsTopic        string   // metric 이벤트 토픽 (KAFKA_METRICS_TOPIC, 기본 "metrics")
+	KafkaLogsTopic           string   // log 이벤트 토픽 (KAFKA_LOGS_TOPIC, 기본 "logs")
+	KafkaDeployTopic         string   // 배포 이벤트 토픽 (KAFKA_DEPLOY_TOPIC, 기본 "deploys")
+	KafkaRAGGroup            string   // span RAG consumer group (KAFKA_RAG_GROUP, 기본 "rag-embedder")
+	KafkaForecastGroup       string   // span Forecast consumer group (KAFKA_FORECAST_GROUP, 기본 "forecast-feeder")
+	KafkaMetricForecastGroup string   // metric Forecast consumer group (KAFKA_METRIC_FORECAST_GROUP, 기본 "metric-forecast-feeder")
+	KafkaLogRAGGroup         string   // log RAG consumer group (KAFKA_LOG_RAG_GROUP, 기본 "log-rag-embedder")
+	KafkaForecastEndpoint    string   // Forecast 서버 URL (KAFKA_FORECAST_ENDPOINT, 빈 문자열이면 stub)
 
 	// ── Collector Self-Tracing ────────────────────────────────────────────
 	// SELF_TRACING_ENABLED=true이면 컬렉터 내부 파이프라인(decode/process/store)을
@@ -242,26 +242,26 @@ type Config struct {
 // 필수 항목이 없으면 기본값을 사용하므로 항상 유효한 설정이 반환된다.
 func Load() (*Config, error) {
 	cfg := &Config{
-		GRPCPort:          envInt("GRPC_PORT", 4317),
-		HTTPPort:          envInt("HTTP_PORT", 4318),
-		ClickHouseAddr:    envStr("CLICKHOUSE_ADDR", "localhost:9000"),
-		ClickHouseDB:      envStr("CLICKHOUSE_DB", "apm"),
-		ClickHouseUser:    envStr("CLICKHOUSE_USER", "default"),
-		ClickHousePassword: envStr("CLICKHOUSE_PASSWORD", ""),
-		BatchSize:         envInt("BATCH_SIZE", 1000),
-		FlushInterval:     envDuration("FLUSH_INTERVAL", 2*time.Second),
-		ChannelBufferSize: envInt("CHANNEL_BUFFER_SIZE", 8192),
-		MemoryBufferSize:  envInt("MEMORY_BUFFER_SIZE", 10000),
-		DisableClickHouse:        envBool("DISABLE_CLICKHOUSE", false),
-		SamplingEnabled:          envBool("SAMPLING_ENABLED", false),
-		RemoteConfigURL:          envStr("REMOTE_CONFIG_URL", ""),
-		RemoteConfigPollInterval: envDuration("REMOTE_CONFIG_POLL_INTERVAL", 30*time.Second),
-		RetentionDays:            envInt("RETENTION_DAYS", 30),
-		EmbedEnabled:             envBool("EMBED_ENABLED", true),
-		EmbedEndpoint:            envStr("EMBED_ENDPOINT", "http://localhost:11434"),
-		EmbedModel:               envStr("EMBED_MODEL", "nomic-embed-text"),
-		QdrantEndpoint:           envStr("QDRANT_ENDPOINT", "http://localhost:6333"),
-		QdrantCollection:         envStr("QDRANT_COLLECTION", "apm_errors"),
+		GRPCPort:                  envInt("GRPC_PORT", 4317),
+		HTTPPort:                  envInt("HTTP_PORT", 4318),
+		ClickHouseAddr:            envStr("CLICKHOUSE_ADDR", "localhost:9000"),
+		ClickHouseDB:              envStr("CLICKHOUSE_DB", "apm"),
+		ClickHouseUser:            envStr("CLICKHOUSE_USER", "default"),
+		ClickHousePassword:        envStr("CLICKHOUSE_PASSWORD", ""),
+		BatchSize:                 envInt("BATCH_SIZE", 1000),
+		FlushInterval:             envDuration("FLUSH_INTERVAL", 2*time.Second),
+		ChannelBufferSize:         envInt("CHANNEL_BUFFER_SIZE", 8192),
+		MemoryBufferSize:          envInt("MEMORY_BUFFER_SIZE", 10000),
+		DisableClickHouse:         envBool("DISABLE_CLICKHOUSE", false),
+		SamplingEnabled:           envBool("SAMPLING_ENABLED", false),
+		RemoteConfigURL:           envStr("REMOTE_CONFIG_URL", ""),
+		RemoteConfigPollInterval:  envDuration("REMOTE_CONFIG_POLL_INTERVAL", 30*time.Second),
+		RetentionDays:             envInt("RETENTION_DAYS", 30),
+		EmbedEnabled:              envBool("EMBED_ENABLED", true),
+		EmbedEndpoint:             envStr("EMBED_ENDPOINT", "http://localhost:11434"),
+		EmbedModel:                envStr("EMBED_MODEL", "nomic-embed-text"),
+		QdrantEndpoint:            envStr("QDRANT_ENDPOINT", "http://localhost:6333"),
+		QdrantCollection:          envStr("QDRANT_COLLECTION", "apm_errors"),
 		RAGScoreThreshold:         envFloat64("RAG_SCORE_THRESHOLD", 0.65),
 		RAGSlowThresholdMs:        envInt("RAG_SLOW_THRESHOLD_MS", 1000),
 		RAGBackfillEnabled:        envBool("RAG_BACKFILL_ENABLED", true),
@@ -274,57 +274,57 @@ func Load() (*Config, error) {
 		LLMModel:                  envStr("LLM_MODEL", "qwen2.5:3b"),
 		BackupEnabled:             envBool("BACKUP_ENABLED", true),
 		BackupDir:                 envStr("BACKUP_DIR", "./backup"),
-		DLQDir:                   envStr("DLQ_DIR", "./dlq"),
-		DLQRetentionDays:         envInt("DLQ_RETENTION_DAYS", 7),
-		DLQReplayInterval:        envDuration("DLQ_REPLAY_INTERVAL", 5*time.Minute),
-		CBFailureThreshold:       envInt("CB_FAILURE_THRESHOLD", 5),
-		CBCooldown:               envDuration("CB_COOLDOWN", 60*time.Second),
-		FlushWorkers:             envInt("FLUSH_WORKERS", 2),
-		SelfURL:                  envStr("SELF_URL", ""),
-		PeerURLs:                 envStringSlice("PEER_URLS", nil),
-		PeerCBFailureThreshold:   envInt("PEER_CB_FAILURE_THRESHOLD", 5),
-		PeerCBCooldown:           envDuration("PEER_CB_COOLDOWN", 30*time.Second),
-		BaselineEnabled:          envBool("BASELINE_ENABLED", true),
-		BaselineInterval:         envDuration("BASELINE_INTERVAL", time.Hour),
-		AnomalyEnabled:           envBool("ANOMALY_ENABLED", true),
-		AnomalyInterval:          envDuration("ANOMALY_INTERVAL", time.Minute),
-		AnomalyTrainInterval:     envDuration("ANOMALY_TRAIN_INTERVAL", 6*time.Hour),
-		AnomalyNTrees:            envInt("ANOMALY_N_TREES", 100),
-		AnomalyMaxSamples:        envInt("ANOMALY_MAX_SAMPLES", 256),
-		AnomalyZWarn:             envFloat64("ANOMALY_Z_WARN", 2.0),
-		AnomalyZCritical:         envFloat64("ANOMALY_Z_CRITICAL", 3.0),
-		AnomalyIFThreshold:       envFloat64("ANOMALY_IF_THRESHOLD", 0.65),
-		RCAEnabled:               envBool("RCA_ENABLED", true),
-		RCAInterval:              envDuration("RCA_INTERVAL", 2*time.Minute),
-		AlertWebhookURL:          envStr("ALERT_WEBHOOK_URL", ""),
-		AlertSlackWebhookURL:     envStr("ALERT_SLACK_WEBHOOK_URL", ""),
-		AlertInterval:            envDuration("ALERT_INTERVAL", time.Minute),
-		AlertMinSeverity:         envStr("ALERT_MIN_SEVERITY", "warning"),
-		HotReloadFile:            envStr("HOT_RELOAD_FILE", ""),
-		HotReloadInterval:        envDuration("HOT_RELOAD_INTERVAL", 30*time.Second),
-		CardinalityEnabled:       envBool("CARDINALITY_ENABLED", false),
-		CardinalityLimit:         envInt("CARDINALITY_LIMIT", 200),
-		CardinalityBloomBits:     envInt("CARDINALITY_BLOOM_BITS", 100_000),
-		CardinalityBloomK:        envInt("CARDINALITY_BLOOM_K", 4),
-		SelfTracingEnabled:       envBool("SELF_TRACING_ENABLED", false),
-		ForecastEndpoint:         envStr("FORECAST_ENDPOINT", ""),
-		ForecastBatchSize:        envInt("FORECAST_BATCH_SIZE", 100),
-		ForecastFlushInterval:    envDuration("FORECAST_FLUSH_INTERVAL", 5*time.Second),
-		KafkaEnabled:             envBool("KAFKA_ENABLED", false),
-		KafkaBrokers:             envStringSlice("KAFKA_BROKERS", []string{"localhost:9092"}),
-		KafkaTopic:               envStr("KAFKA_TOPIC", "spans.error"),
-		KafkaMetricsTopic:        envStr("KAFKA_METRICS_TOPIC", "metrics"),
-		KafkaLogsTopic:           envStr("KAFKA_LOGS_TOPIC", "logs"),
-		KafkaDeployTopic:         envStr("KAFKA_DEPLOY_TOPIC", "deploys"),
-		KafkaRAGGroup:            envStr("KAFKA_RAG_GROUP", "rag-embedder"),
-		KafkaForecastGroup:       envStr("KAFKA_FORECAST_GROUP", "forecast-feeder"),
-		KafkaMetricForecastGroup: envStr("KAFKA_METRIC_FORECAST_GROUP", "metric-forecast-feeder"),
-		KafkaLogRAGGroup:         envStr("KAFKA_LOG_RAG_GROUP", "log-rag-embedder"),
-		KafkaForecastEndpoint:    envStr("KAFKA_FORECAST_ENDPOINT", ""),
-		SamplingConfigJSON:       envStr("SAMPLING_CONFIG_JSON", ""),
-		APIKey:                   envStr("API_KEY", ""),
-		WALDir:      envStr("WAL_DIR", "./wal"),
-		WALMaxBytes: int64(envInt("WAL_MAX_BYTES", 64<<20)),
+		DLQDir:                    envStr("DLQ_DIR", "./dlq"),
+		DLQRetentionDays:          envInt("DLQ_RETENTION_DAYS", 7),
+		DLQReplayInterval:         envDuration("DLQ_REPLAY_INTERVAL", 5*time.Minute),
+		CBFailureThreshold:        envInt("CB_FAILURE_THRESHOLD", 5),
+		CBCooldown:                envDuration("CB_COOLDOWN", 60*time.Second),
+		FlushWorkers:              envInt("FLUSH_WORKERS", 2),
+		SelfURL:                   envStr("SELF_URL", ""),
+		PeerURLs:                  envStringSlice("PEER_URLS", nil),
+		PeerCBFailureThreshold:    envInt("PEER_CB_FAILURE_THRESHOLD", 5),
+		PeerCBCooldown:            envDuration("PEER_CB_COOLDOWN", 30*time.Second),
+		BaselineEnabled:           envBool("BASELINE_ENABLED", true),
+		BaselineInterval:          envDuration("BASELINE_INTERVAL", time.Hour),
+		AnomalyEnabled:            envBool("ANOMALY_ENABLED", true),
+		AnomalyInterval:           envDuration("ANOMALY_INTERVAL", time.Minute),
+		AnomalyTrainInterval:      envDuration("ANOMALY_TRAIN_INTERVAL", 6*time.Hour),
+		AnomalyNTrees:             envInt("ANOMALY_N_TREES", 100),
+		AnomalyMaxSamples:         envInt("ANOMALY_MAX_SAMPLES", 256),
+		AnomalyZWarn:              envFloat64("ANOMALY_Z_WARN", 2.0),
+		AnomalyZCritical:          envFloat64("ANOMALY_Z_CRITICAL", 3.0),
+		AnomalyIFThreshold:        envFloat64("ANOMALY_IF_THRESHOLD", 0.65),
+		RCAEnabled:                envBool("RCA_ENABLED", true),
+		RCAInterval:               envDuration("RCA_INTERVAL", 2*time.Minute),
+		AlertWebhookURL:           envStr("ALERT_WEBHOOK_URL", ""),
+		AlertSlackWebhookURL:      envStr("ALERT_SLACK_WEBHOOK_URL", ""),
+		AlertInterval:             envDuration("ALERT_INTERVAL", time.Minute),
+		AlertMinSeverity:          envStr("ALERT_MIN_SEVERITY", "warning"),
+		HotReloadFile:             envStr("HOT_RELOAD_FILE", ""),
+		HotReloadInterval:         envDuration("HOT_RELOAD_INTERVAL", 30*time.Second),
+		CardinalityEnabled:        envBool("CARDINALITY_ENABLED", false),
+		CardinalityLimit:          envInt("CARDINALITY_LIMIT", 200),
+		CardinalityBloomBits:      envInt("CARDINALITY_BLOOM_BITS", 100_000),
+		CardinalityBloomK:         envInt("CARDINALITY_BLOOM_K", 4),
+		SelfTracingEnabled:        envBool("SELF_TRACING_ENABLED", false),
+		ForecastEndpoint:          envStr("FORECAST_ENDPOINT", ""),
+		ForecastBatchSize:         envInt("FORECAST_BATCH_SIZE", 100),
+		ForecastFlushInterval:     envDuration("FORECAST_FLUSH_INTERVAL", 5*time.Second),
+		KafkaEnabled:              envBool("KAFKA_ENABLED", false),
+		KafkaBrokers:              envStringSlice("KAFKA_BROKERS", []string{"localhost:9092"}),
+		KafkaTopic:                envStr("KAFKA_TOPIC", "spans.error"),
+		KafkaMetricsTopic:         envStr("KAFKA_METRICS_TOPIC", "metrics"),
+		KafkaLogsTopic:            envStr("KAFKA_LOGS_TOPIC", "logs"),
+		KafkaDeployTopic:          envStr("KAFKA_DEPLOY_TOPIC", "deploys"),
+		KafkaRAGGroup:             envStr("KAFKA_RAG_GROUP", "rag-embedder"),
+		KafkaForecastGroup:        envStr("KAFKA_FORECAST_GROUP", "forecast-feeder"),
+		KafkaMetricForecastGroup:  envStr("KAFKA_METRIC_FORECAST_GROUP", "metric-forecast-feeder"),
+		KafkaLogRAGGroup:          envStr("KAFKA_LOG_RAG_GROUP", "log-rag-embedder"),
+		KafkaForecastEndpoint:     envStr("KAFKA_FORECAST_ENDPOINT", ""),
+		SamplingConfigJSON:        envStr("SAMPLING_CONFIG_JSON", ""),
+		APIKey:                    envStr("API_KEY", ""),
+		WALDir:                    envStr("WAL_DIR", "./wal"),
+		WALMaxBytes:               int64(envInt("WAL_MAX_BYTES", 64<<20)),
 	}
 	// WAL_ENABLED 환경변수가 명시되지 않으면 DISABLE_CLICKHOUSE 값을 따른다.
 	if walEnv := os.Getenv("WAL_ENABLED"); walEnv != "" {

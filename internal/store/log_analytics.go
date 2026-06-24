@@ -241,7 +241,7 @@ func (s *LogAnalyticsStore) scanSearchRows(ctx context.Context, sql string, args
 
 // LogPattern은 반복 로그 패턴 그룹이다.
 type LogPattern struct {
-	Pattern       string `json:"pattern"`         // 정규화된 body 앞 120자
+	Pattern       string `json:"pattern"` // 정규화된 body 앞 120자
 	SeverityText  string `json:"severity_text"`
 	ServiceName   string `json:"service_name"`
 	Count         uint64 `json:"count"`
@@ -496,4 +496,3 @@ func buildWhereClause(conds []string) string {
 	}
 	return "WHERE " + strings.Join(conds, " AND ")
 }
-

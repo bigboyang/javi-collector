@@ -20,7 +20,7 @@ type DeploymentEvent struct {
 	ID          string    `json:"id"`
 	ServiceName string    `json:"service_name"`
 	Version     string    `json:"version"`
-	Environment string    `json:"environment"`  // "production" | "staging" | "dev"
+	Environment string    `json:"environment"` // "production" | "staging" | "dev"
 	DeployedBy  string    `json:"deployed_by"`
 	Description string    `json:"description"`
 	DeployedAt  time.Time `json:"deployed_at"`

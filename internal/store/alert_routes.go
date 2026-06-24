@@ -27,13 +27,13 @@ import (
 type AlertRoute struct {
 	ID                 string    `json:"id"`
 	Name               string    `json:"name"`
-	MatchService       string    `json:"match_service"`        // glob 패턴 ("payment-*"), 빈 = 전체
-	MatchSeverity      string    `json:"match_severity"`       // "", "warning", "critical"
-	MatchAnomalyType   string    `json:"match_anomaly_type"`   // "", "latency", "error_rate"
+	MatchService       string    `json:"match_service"`      // glob 패턴 ("payment-*"), 빈 = 전체
+	MatchSeverity      string    `json:"match_severity"`     // "", "warning", "critical"
+	MatchAnomalyType   string    `json:"match_anomaly_type"` // "", "latency", "error_rate"
 	SlackURL           string    `json:"slack_url"`
 	WebhookURL         string    `json:"webhook_url"`
-	Priority           int32     `json:"priority"`              // 낮을수록 높은 우선순위
-	EscalationAfterMin int32     `json:"escalation_after_min"`  // 0 = 에스컬레이션 없음
+	Priority           int32     `json:"priority"`             // 낮을수록 높은 우선순위
+	EscalationAfterMin int32     `json:"escalation_after_min"` // 0 = 에스컬레이션 없음
 	EscalateSlackURL   string    `json:"escalate_slack_url"`
 	EscalateWebhookURL string    `json:"escalate_webhook_url"`
 	Enabled            bool      `json:"enabled"`
@@ -72,12 +72,12 @@ func (r AlertRoute) HasEscalation() bool {
 type AlertEvent struct {
 	ID          string    `json:"id"`
 	AnomalyID   string    `json:"anomaly_id"`
-	RouteID     string    `json:"route_id"`    // 빈 문자열 = 레거시 기본 발송
+	RouteID     string    `json:"route_id"` // 빈 문자열 = 레거시 기본 발송
 	ServiceName string    `json:"service_name"`
 	Severity    string    `json:"severity"`
 	AnomalyType string    `json:"anomaly_type"`
 	FiredAt     time.Time `json:"fired_at"`
-	AckedAt     time.Time `json:"acked_at"`    // zero = ack 안 됨
+	AckedAt     time.Time `json:"acked_at"` // zero = ack 안 됨
 	Escalated   bool      `json:"escalated"`
 }
 

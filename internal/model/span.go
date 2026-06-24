@@ -27,10 +27,10 @@ type SpanData struct {
 	ReceivedAtMs  int64          `json:"receivedAtMs"`
 	// W3C Trace State: span 컨텍스트에 포함된 벤더별 트레이싱 메타데이터.
 	// OTLP Span.trace_state 필드에서 추출된다.
-	TraceState string     `json:"traceState,omitempty"`
+	TraceState string `json:"traceState,omitempty"`
 	// Links: 다른 Trace/Span에 대한 크로스-트레이스 연결 목록.
 	// OTLP Span.links 필드에서 추출된다.
-	Links      []SpanLink `json:"links,omitempty"`
+	Links []SpanLink `json:"links,omitempty"`
 }
 
 // DurationNano는 span의 소요 시간을 나노초로 반환한다.

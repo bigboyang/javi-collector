@@ -246,7 +246,7 @@ type HTTPServer struct {
 	logStore    store.LogStore
 	srv         *http.Server
 	ready       chan struct{} // close되면 readyz가 200을 반환한다
-	draining    atomic.Bool  // true이면 readyz가 503을 반환한다 (graceful shutdown 드레인)
+	draining    atomic.Bool   // true이면 readyz가 503을 반환한다 (graceful shutdown 드레인)
 
 	// traceRouter는 멀티 인스턴스 Tail Sampling 시 traceID 기반 라우팅을 담당한다.
 	// nil이면 라우팅 비활성화 (단일 인스턴스 또는 Sampling 미사용 배포).

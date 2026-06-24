@@ -59,11 +59,11 @@ var (
 // GRPCServer는 OTLP/gRPC 수신 서버다.
 // TraceService, MetricsService, LogsService, Health, Reflection을 단일 grpc.Server에 등록한다.
 type GRPCServer struct {
-	srv         *grpc.Server
-	health      *health.Server
-	ingester    *ingester.Ingester
-	addr        string
-	traceSvc    *traceServiceServer // SetTraceRouter에서 router 주입용
+	srv      *grpc.Server
+	health   *health.Server
+	ingester *ingester.Ingester
+	addr     string
+	traceSvc *traceServiceServer // SetTraceRouter에서 router 주입용
 }
 
 // NewGRPCServer는 OTLP gRPC 서버를 생성하고 서비스를 등록한다.

@@ -37,9 +37,9 @@ type SLODefinition struct {
 type SLOBurnAlert struct {
 	ServiceName string    `json:"service_name"`
 	SLOName     string    `json:"slo_name"`
-	BurnRate    float64   `json:"burn_rate"`  // 실제 불량률 / 에러 예산
-	Window      string    `json:"window"`     // "1h" | "6h"
-	Severity    string    `json:"severity"`   // "page" | "ticket"
+	BurnRate    float64   `json:"burn_rate"` // 실제 불량률 / 에러 예산
+	Window      string    `json:"window"`    // "1h" | "6h"
+	Severity    string    `json:"severity"`  // "page" | "ticket"
 	AlertedAt   time.Time `json:"alerted_at"`
 }
 
