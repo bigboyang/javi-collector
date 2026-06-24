@@ -230,7 +230,7 @@ type ClickHouseTraceStore struct {
 	flushCh chan []*model.SpanData // 조립된 배치를 flush worker에 전달하는 큐
 	cfg     ClickHouseConfig
 	dynCfg  atomic.Pointer[storeDynCfg] // 핫 리로드 가능한 배치 설정 (nil이면 cfg 사용)
-	done    chan struct{}                // 모든 flushWorker 종료 시 닫힘
+	done    chan struct{}               // 모든 flushWorker 종료 시 닫힘
 	dlq     *FileBackupWriter           // flush 실패 시 배치 보존 (nil이면 비활성화)
 	cb      *circuitBreaker             // 연속 실패 시 flush 차단 (nil이면 비활성화)
 }
@@ -661,7 +661,7 @@ LIMIT %d`, s.cfg.Database, where, limit)
 }
 
 // QueryBrokenTraces는 root span이 없는 트레이스를 감지한다.
-// traceID 기준으로 집계: parent_span_id=''인 span이 없는 trace = 브로큰 트레이스.
+// traceID 기준으로 집계: parent_span_id가 빈 문자열(empty string)인 span이 없는 trace = 브로큰 트레이스.
 // 계측 미설정, 샘플링 불일치, 또는 네트워크 손실이 원인일 수 있다.
 func (s *ClickHouseTraceStore) QueryBrokenTraces(ctx context.Context, service string, fromMs, toMs int64, limit int) ([]map[string]any, error) {
 	if limit <= 0 {
@@ -789,11 +789,11 @@ LIMIT %d`, s.cfg.Database, where, limit)
 	var result []map[string]any
 	for rows.Next() {
 		var (
-			traceID, spanID, serviceName string
+			traceID, spanID, serviceName   string
 			dbSystem, dbName, dbOp, dbStmt string
-			durationMs                   float64
-			startTime                    time.Time
-			statusCode                   int32
+			durationMs                     float64
+			startTime                      time.Time
+			statusCode                     int32
 		)
 		if err := rows.Scan(&traceID, &spanID, &serviceName,
 			&dbSystem, &dbName, &dbOp, &dbStmt,
@@ -859,16 +859,16 @@ LIMIT 500`, s.cfg.Database), traceID)
 			toMs = endMs
 		}
 		spans = append(spans, map[string]any{
-			"span_id":          spanID,
-			"parent_span_id":   parentSpanID,
-			"service_name":     svc,
-			"span_name":        spanName,
-			"start_ms":         startMs,
-			"duration_ms":      durationMs,
-			"status_code":      statusCode,
-			"exception_type":   excType,
+			"span_id":           spanID,
+			"parent_span_id":    parentSpanID,
+			"service_name":      svc,
+			"span_name":         spanName,
+			"start_ms":          startMs,
+			"duration_ms":       durationMs,
+			"status_code":       statusCode,
+			"exception_type":    excType,
 			"exception_message": excMsg,
-			"http_status_code": httpStatus,
+			"http_status_code":  httpStatus,
 		})
 	}
 	if err := spanRows.Err(); err != nil {
@@ -1395,7 +1395,7 @@ type ClickHouseMetricStore struct {
 	flushCh chan []*model.MetricData // 조립된 배치를 flush worker에 전달하는 큐
 	cfg     ClickHouseConfig
 	dynCfg  atomic.Pointer[storeDynCfg] // 핫 리로드 가능한 배치 설정
-	done    chan struct{}                // 모든 flushWorker 종료 시 닫힘
+	done    chan struct{}               // 모든 flushWorker 종료 시 닫힘
 	dlq     *FileBackupWriter           // flush 실패 시 배치 보존 (nil이면 비활성화)
 	cb      *circuitBreaker             // 연속 실패 시 flush 차단 (nil이면 비활성화)
 }
@@ -1552,9 +1552,9 @@ func (s *ClickHouseMetricStore) QueryMetrics(ctx context.Context, q MetricQuery)
 	var result []*model.MetricData
 	for rows.Next() {
 		var (
-			name, mtype, serviceName string
-			attrsMap                 map[string]string
-			value                    float64
+			name, mtype, serviceName    string
+			attrsMap                    map[string]string
+			value                       float64
 			timestampNano, receivedAtMs int64
 		)
 		if err := rows.Scan(&name, &mtype, &value, &attrsMap, &serviceName, &timestampNano, &receivedAtMs); err != nil {
@@ -1616,12 +1616,12 @@ func (s *ClickHouseMetricStore) QueryMetrics(ctx context.Context, q MetricQuery)
 
 	for hrows.Next() {
 		var (
-			metricName, serviceName string
-			bounds                  []float64
-			bucketCounts            []uint64
-			totalCount              uint64
-			totalSum                float64
-			attrsMap                map[string]string
+			metricName, serviceName     string
+			bounds                      []float64
+			bucketCounts                []uint64
+			totalCount                  uint64
+			totalSum                    float64
+			attrsMap                    map[string]string
 			timestampNano, receivedAtMs int64
 		)
 		if err := hrows.Scan(&metricName, &bounds, &bucketCounts, &totalCount, &totalSum, &attrsMap, &serviceName, &timestampNano, &receivedAtMs); err != nil {
@@ -2054,12 +2054,12 @@ func (s *ClickHouseMetricStore) flushHistogramMetrics(metrics []*model.MetricDat
 
 // ClickHouseLogStore는 LogData를 apm.logs 테이블에 배치 insert한다.
 type ClickHouseLogStore struct {
-	conn    driver.Conn            // 공유 커넥션 풀 (소유권 없음)
-	ch      chan *model.LogData    // 수신 데이터 채널
-	flushCh chan []*model.LogData  // 조립된 배치를 flush worker에 전달하는 큐
+	conn    driver.Conn           // 공유 커넥션 풀 (소유권 없음)
+	ch      chan *model.LogData   // 수신 데이터 채널
+	flushCh chan []*model.LogData // 조립된 배치를 flush worker에 전달하는 큐
 	cfg     ClickHouseConfig
 	dynCfg  atomic.Pointer[storeDynCfg] // 핫 리로드 가능한 배치 설정
-	done    chan struct{}                // 모든 flushWorker 종료 시 닫힘
+	done    chan struct{}               // 모든 flushWorker 종료 시 닫힘
 	dlq     *FileBackupWriter           // flush 실패 시 배치 보존 (nil이면 비활성화)
 	cb      *circuitBreaker             // 연속 실패 시 flush 차단 (nil이면 비활성화)
 }

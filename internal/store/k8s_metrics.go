@@ -28,18 +28,18 @@ import (
 
 // K8sPodMetric은 단일 Pod 리소스 메트릭 스냅샷을 나타낸다.
 type K8sPodMetric struct {
-	ServiceName        string    `json:"service_name"`
-	PodName            string    `json:"pod_name"`
-	NodeName           string    `json:"node_name"`
-	Namespace          string    `json:"namespace"`
-	Host               string    `json:"host"`
-	ContainerID        string    `json:"container_id"`
-	CPUUsageMillicore  float64   `json:"cpu_usage_millicore"`
-	CPULimitMillicore  float64   `json:"cpu_limit_millicore"`
-	MemoryUsageBytes   int64     `json:"memory_usage_bytes"`
-	MemoryLimitBytes   int64     `json:"memory_limit_bytes"`
-	MemoryRSSBytes     int64     `json:"memory_rss_bytes"`
-	Timestamp          time.Time `json:"timestamp"`
+	ServiceName       string    `json:"service_name"`
+	PodName           string    `json:"pod_name"`
+	NodeName          string    `json:"node_name"`
+	Namespace         string    `json:"namespace"`
+	Host              string    `json:"host"`
+	ContainerID       string    `json:"container_id"`
+	CPUUsageMillicore float64   `json:"cpu_usage_millicore"`
+	CPULimitMillicore float64   `json:"cpu_limit_millicore"`
+	MemoryUsageBytes  int64     `json:"memory_usage_bytes"`
+	MemoryLimitBytes  int64     `json:"memory_limit_bytes"`
+	MemoryRSSBytes    int64     `json:"memory_rss_bytes"`
+	Timestamp         time.Time `json:"timestamp"`
 }
 
 // K8sPodMetricsStore는 k8s_pod_metrics 테이블 CRUD를 담당한다.
@@ -188,16 +188,16 @@ ORDER BY pod_name`, s.db), service, fromMs, toMs)
 	var result []map[string]any
 	for rows.Next() {
 		var (
-			podName      string
-			nodeName     string
-			namespace    string
-			avgCPU       float64
-			maxCPU       float64
-			limitCPU     float64
-			avgMem       float64
-			maxMem       int64
-			limitMem     int64
-			lastSeen     time.Time
+			podName   string
+			nodeName  string
+			namespace string
+			avgCPU    float64
+			maxCPU    float64
+			limitCPU  float64
+			avgMem    float64
+			maxMem    int64
+			limitMem  int64
+			lastSeen  time.Time
 		)
 		if err := rows.Scan(&podName, &nodeName, &namespace,
 			&avgCPU, &maxCPU, &limitCPU,
@@ -206,16 +206,16 @@ ORDER BY pod_name`, s.db), service, fromMs, toMs)
 			return nil, err
 		}
 		result = append(result, map[string]any{
-			"pod_name":       podName,
-			"node_name":      nodeName,
-			"namespace":      namespace,
-			"avg_cpu_m":      avgCPU,
-			"max_cpu_m":      maxCPU,
-			"cpu_limit_m":    limitCPU,
-			"avg_mem_bytes":  avgMem,
-			"max_mem_bytes":  maxMem,
+			"pod_name":        podName,
+			"node_name":       nodeName,
+			"namespace":       namespace,
+			"avg_cpu_m":       avgCPU,
+			"max_cpu_m":       maxCPU,
+			"cpu_limit_m":     limitCPU,
+			"avg_mem_bytes":   avgMem,
+			"max_mem_bytes":   maxMem,
 			"mem_limit_bytes": limitMem,
-			"last_seen":      lastSeen,
+			"last_seen":       lastSeen,
 		})
 	}
 	return result, rows.Err()

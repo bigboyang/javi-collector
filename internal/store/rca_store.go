@@ -17,22 +17,22 @@ import (
 
 // RCAReport는 rca_reports 테이블의 단일 레코드다.
 type RCAReport struct {
-	ID               string    `json:"id"`
-	AnomalyID        string    `json:"anomaly_id"`
-	ServiceName      string    `json:"service_name"`
-	SpanName         string    `json:"span_name"`
-	AnomalyType      string    `json:"anomaly_type"`
-	Minute           time.Time `json:"minute"`
-	Severity         string    `json:"severity"`
-	ZScore           float64   `json:"z_score"`
-	CorrelatedSpans    string    `json:"correlated_spans"`    // JSON array
-	SimilarIncidents   string    `json:"similar_incidents"`   // JSON array
-	NearbyDeployments  string    `json:"nearby_deployments"`  // JSON array (GAP-04)
-	Hypothesis         string    `json:"hypothesis"`
-	LLMAnalysis      string    `json:"llm_analysis"`
-	Resolved         uint8     `json:"resolved"`
-	Feedback         string    `json:"feedback"`
-	CreatedAt        time.Time `json:"created_at"`
+	ID                string    `json:"id"`
+	AnomalyID         string    `json:"anomaly_id"`
+	ServiceName       string    `json:"service_name"`
+	SpanName          string    `json:"span_name"`
+	AnomalyType       string    `json:"anomaly_type"`
+	Minute            time.Time `json:"minute"`
+	Severity          string    `json:"severity"`
+	ZScore            float64   `json:"z_score"`
+	CorrelatedSpans   string    `json:"correlated_spans"`   // JSON array
+	SimilarIncidents  string    `json:"similar_incidents"`  // JSON array
+	NearbyDeployments string    `json:"nearby_deployments"` // JSON array (GAP-04)
+	Hypothesis        string    `json:"hypothesis"`
+	LLMAnalysis       string    `json:"llm_analysis"`
+	Resolved          uint8     `json:"resolved"`
+	Feedback          string    `json:"feedback"`
+	CreatedAt         time.Time `json:"created_at"`
 }
 
 // RCAStore는 rca_reports 테이블 조회/피드백 업데이트를 담당한다.

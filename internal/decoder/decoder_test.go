@@ -4,10 +4,10 @@ import (
 	"encoding/hex"
 	"testing"
 
-	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
 	collectorlogsv1 "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	collectormetricsv1 "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	collectortracev1 "go.opentelemetry.io/proto/otlp/collector/trace/v1"
+	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
 	logsv1 "go.opentelemetry.io/proto/otlp/logs/v1"
 	metricsv1 "go.opentelemetry.io/proto/otlp/metrics/v1"
 	resourcev1 "go.opentelemetry.io/proto/otlp/resource/v1"
@@ -323,9 +323,9 @@ func TestDecodeMetrics_Gauge(t *testing.T) {
 									Gauge: &metricsv1.Gauge{
 										DataPoints: []*metricsv1.NumberDataPoint{
 											{
-												Attributes:  []*commonv1.KeyValue{strKV("area", "heap")},
+												Attributes:   []*commonv1.KeyValue{strKV("area", "heap")},
 												TimeUnixNano: 1_000_000_000,
-												Value: &metricsv1.NumberDataPoint_AsDouble{AsDouble: 52428800},
+												Value:        &metricsv1.NumberDataPoint_AsDouble{AsDouble: 52428800},
 											},
 										},
 									},

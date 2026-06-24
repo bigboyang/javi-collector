@@ -105,11 +105,11 @@ type Ingester struct {
 	traceStore  store.TraceStore
 	metricStore store.MetricStore
 	logStore    store.LogStore
-	spanPub     SpanPublisher          // nil이면 span RAG/Forecast 비활성화
-	metricPub   MetricPublisher        // nil이면 metric Forecast 비활성화
-	logPub      LogPublisher           // nil이면 log RAG 비활성화
-	pipeline    *processor.Pipeline    // nil이면 프로세서 파이프라인 비활성화
-	selfTracer  *selftracing.Tracer    // nil이면 셀프 트레이싱 비활성화
+	spanPub     SpanPublisher       // nil이면 span RAG/Forecast 비활성화
+	metricPub   MetricPublisher     // nil이면 metric Forecast 비활성화
+	logPub      LogPublisher        // nil이면 log RAG 비활성화
+	pipeline    *processor.Pipeline // nil이면 프로세서 파이프라인 비활성화
+	selfTracer  *selftracing.Tracer // nil이면 셀프 트레이싱 비활성화
 
 	// atomic 카운터: /api/collector/stats 조회용 (단조 증가, reset 없음)
 	traceReceived  atomic.Int64

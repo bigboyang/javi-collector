@@ -145,12 +145,12 @@ func (t *Tracer) emit(sp *model.SpanData) {
 
 // SpanBuilder accumulates span fields and emits on End.
 type SpanBuilder struct {
-	tracer    *Tracer
-	traceID   string
-	spanID    string
-	name      string
-	start     time.Time
-	attrs     map[string]any
+	tracer  *Tracer
+	traceID string
+	spanID  string
+	name    string
+	start   time.Time
+	attrs   map[string]any
 }
 
 // StartSpan begins timing a pipeline operation and returns a SpanBuilder.

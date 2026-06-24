@@ -9,9 +9,10 @@
 //     — .tmp 파일로 쓰고 atomic rename해 데이터 손실 없이 교체
 //
 // 파일 레이아웃:
-//   {WALDir}/wal-traces.jsonl
-//   {WALDir}/wal-metrics.jsonl
-//   {WALDir}/wal-logs.jsonl
+//
+//	{WALDir}/wal-traces.jsonl
+//	{WALDir}/wal-metrics.jsonl
+//	{WALDir}/wal-logs.jsonl
 //
 // 장애 모드:
 //   - WAL 쓰기 실패 → 경고 로그만 남기고 메모리 저장은 계속 (graceful degradation)

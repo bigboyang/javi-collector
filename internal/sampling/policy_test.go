@@ -73,7 +73,7 @@ func TestEvaluate_ProbabilisticSampling_BoundaryRates(t *testing.T) {
 
 	// Rate=1.0: float64 overflow 없이 반드시 KEEP
 	cfg1 := &SamplingConfig{
-		Enabled: true,
+		Enabled:               true,
 		ProbabilisticSampling: ProbabilisticSamplingConfig{Enabled: true, Rate: 1.0},
 	}
 	if eval.Evaluate([]*model.SpanData{{TraceID: traceID}}, cfg1) != DecisionKeep {
@@ -82,7 +82,7 @@ func TestEvaluate_ProbabilisticSampling_BoundaryRates(t *testing.T) {
 
 	// Rate=0.0: 반드시 DROP
 	cfg0 := &SamplingConfig{
-		Enabled: true,
+		Enabled:               true,
 		ProbabilisticSampling: ProbabilisticSamplingConfig{Enabled: true, Rate: 0.0},
 	}
 	if eval.Evaluate([]*model.SpanData{{TraceID: "4bf92f3577b34da60000000000000001"}}, cfg0) != DecisionDrop {

@@ -25,17 +25,17 @@ import (
 
 // ProfilingSnapshot은 단일 프로파일링 스냅샷을 나타낸다.
 type ProfilingSnapshot struct {
-	ID          string    `json:"id"`
-	ServiceName string    `json:"service_name"`
-	ProfileType string    `json:"profile_type"` // "cpu" | "heap" | "wall" | "alloc"
-	Format      string    `json:"format"`       // "jfr" | "collapsed" | "pprof"
-	Payload     string    `json:"payload"`      // Base64 인코딩 또는 텍스트 (collapsed)
-	Host        string    `json:"host"`
-	K8sPod      string    `json:"k8s_pod"`
-	K8sNode     string    `json:"k8s_node"`
-	K8sNamespace string   `json:"k8s_namespace"`
-	DurationMs  int64     `json:"duration_ms"`
-	SampledAt   time.Time `json:"sampled_at"`
+	ID           string    `json:"id"`
+	ServiceName  string    `json:"service_name"`
+	ProfileType  string    `json:"profile_type"` // "cpu" | "heap" | "wall" | "alloc"
+	Format       string    `json:"format"`       // "jfr" | "collapsed" | "pprof"
+	Payload      string    `json:"payload"`      // Base64 인코딩 또는 텍스트 (collapsed)
+	Host         string    `json:"host"`
+	K8sPod       string    `json:"k8s_pod"`
+	K8sNode      string    `json:"k8s_node"`
+	K8sNamespace string    `json:"k8s_namespace"`
+	DurationMs   int64     `json:"duration_ms"`
+	SampledAt    time.Time `json:"sampled_at"`
 }
 
 // ProfilingStore는 profiling_snapshots 테이블 CRUD를 담당한다.

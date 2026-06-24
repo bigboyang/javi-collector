@@ -37,18 +37,18 @@ func main() {
 	// DisableClickHouse=true 이면 인메모리 링버퍼로 fallback한다.
 	// 프로덕션에서는 DISABLE_CLICKHOUSE=false (기본값)로 ClickHouse를 사용한다.
 	var (
-		traceStore      store.TraceStore
-		metricStore     store.MetricStore
-		logStore        store.LogStore
-		chConn          driver.Conn                  // ClickHouse 공유 커넥션 (RCA Engine 등에서 재사용)
-		catalogStore         *store.ServiceCatalogStore    // Gap 4: 서비스 카탈로그
-		errorGroupStore      *store.ErrorGroupStore        // Gap 2: 에러 그룹 집계
-		sloStore             *store.SLOStore               // Gap 3: SLO/SLI + Burn-Rate
-		rcaStore             *store.RCAStore               // P1: RCA 결과 조회
-		deploymentEventStore *store.DeploymentEventStore   // GAP-04: 배포 이벤트 상관 분석
-		logAnalyticsStore    *store.LogAnalyticsStore      // GAP-06: Log Analytics
-		profilingStore       *store.ProfilingStore         // GAP-07: Continuous Profiling
-		k8sPodMetricsStore   *store.K8sPodMetricsStore    // GAP-08 확장: K8s Pod 리소스 메트릭
+		traceStore           store.TraceStore
+		metricStore          store.MetricStore
+		logStore             store.LogStore
+		chConn               driver.Conn                 // ClickHouse 공유 커넥션 (RCA Engine 등에서 재사용)
+		catalogStore         *store.ServiceCatalogStore  // Gap 4: 서비스 카탈로그
+		errorGroupStore      *store.ErrorGroupStore      // Gap 2: 에러 그룹 집계
+		sloStore             *store.SLOStore             // Gap 3: SLO/SLI + Burn-Rate
+		rcaStore             *store.RCAStore             // P1: RCA 결과 조회
+		deploymentEventStore *store.DeploymentEventStore // GAP-04: 배포 이벤트 상관 분석
+		logAnalyticsStore    *store.LogAnalyticsStore    // GAP-06: Log Analytics
+		profilingStore       *store.ProfilingStore       // GAP-07: Continuous Profiling
+		k8sPodMetricsStore   *store.K8sPodMetricsStore   // GAP-08 확장: K8s Pod 리소스 메트릭
 	)
 
 	if cfg.DisableClickHouse {
