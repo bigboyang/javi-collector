@@ -167,7 +167,7 @@ type Config struct {
 	// KAFKA_ENABLED=false이고 FORECAST_ENDPOINT가 설정되면 ForecastForwarder로 직접 HTTP 전송한다.
 	KafkaEnabled      bool
 	KafkaBrokers      []string // 콤마 구분 브로커 목록 (KAFKA_BROKERS, 기본 "localhost:9092")
-	KafkaTopic        string   // span 이벤트 토픽 (KAFKA_TOPIC, 기본 "spans.error")
+	KafkaTopic        string   // span 이벤트 토픽 (KAFKA_TOPIC, 기본 "spans.all" — 다운스트림 javi-forecast 소비 토픽)
 	KafkaMetricsTopic string   // metric 이벤트 토픽 (KAFKA_METRICS_TOPIC, 기본 "metrics")
 	KafkaLogsTopic    string   // log 이벤트 토픽 (KAFKA_LOGS_TOPIC, 기본 "logs")
 	KafkaDeployTopic  string   // 배포 이벤트 토픽 (KAFKA_DEPLOY_TOPIC, 기본 "deploys")
@@ -259,7 +259,7 @@ func Load() (*Config, error) {
 		ForecastFlushInterval:    envDuration("FORECAST_FLUSH_INTERVAL", 5*time.Second),
 		KafkaEnabled:             envBool("KAFKA_ENABLED", false),
 		KafkaBrokers:             envStringSlice("KAFKA_BROKERS", []string{"localhost:9092"}),
-		KafkaTopic:               envStr("KAFKA_TOPIC", "spans.error"),
+		KafkaTopic:               envStr("KAFKA_TOPIC", "spans.all"),
 		KafkaMetricsTopic:        envStr("KAFKA_METRICS_TOPIC", "metrics"),
 		KafkaLogsTopic:           envStr("KAFKA_LOGS_TOPIC", "logs"),
 		KafkaDeployTopic:         envStr("KAFKA_DEPLOY_TOPIC", "deploys"),

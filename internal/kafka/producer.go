@@ -2,7 +2,7 @@
 //
 // 아키텍처 (collector는 Producer만 담당, 컨슈머는 다운스트림 javi-forecast 소관):
 //
-//	Ingester → SpanProducer   → Kafka "spans.error"  ─┐
+//	Ingester → SpanProducer   → Kafka "spans.all"    ─┐
 //	         → MetricProducer → Kafka "metrics"        ├─→ 다운스트림 javi-forecast
 //	         → LogProducer    → Kafka "logs"          ─┘   (RAG embedder + Forecast 컨슈머)
 //
@@ -10,7 +10,7 @@
 //
 //	KAFKA_ENABLED=true                        (기본: false)
 //	KAFKA_BROKERS=localhost:9092              (콤마 구분 브로커 목록)
-//	KAFKA_TOPIC=spans.error                   (기본값)
+//	KAFKA_TOPIC=spans.all                     (기본값)
 //	KAFKA_METRICS_TOPIC=metrics               (기본값)
 //	KAFKA_LOGS_TOPIC=logs                     (기본값)
 package kafka

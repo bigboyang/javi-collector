@@ -335,7 +335,7 @@ func main() {
 	//     미설정 시 발행 비활성 (ingester가 nil 가드로 스킵)
 	//
 	//   KAFKA_ENABLED=true:
-	//     SpanProducer   → Kafka "spans.error" → 다운스트림 컨슈머 (RAG + Forecast)
+	//     SpanProducer   → Kafka "spans.all"   → 다운스트림 컨슈머 (RAG + Forecast)
 	//     MetricProducer → Kafka "metrics"      → 다운스트림 컨슈머 (Forecast)
 	//     LogProducer    → Kafka "logs"         → 다운스트림 컨슈머
 	var spanPub ingester.SpanPublisher
