@@ -1,26 +1,18 @@
 // Package kafka는 signal(span/metric/log) 기반 팬아웃 파이프라인을 제공한다.
 //
-// 아키텍처:
+// 아키텍처 (collector는 Producer만 담당, 컨슈머는 다운스트림 javi-forecast 소관):
 //
-//	Ingester → SpanProducer   → Kafka "spans.error"
-//	                                ├─ RAGConsumer             → EmbedPipeline → Qdrant
-//	                                └─ ForecastConsumer        → Forecast Server
-//	         → MetricProducer → Kafka "metrics"
-//	                                └─ MetricForecastConsumer  → Forecast Server
-//	         → LogProducer    → Kafka "logs"
-//	                                └─ LogRAGConsumer          → EmbedPipeline → Qdrant (ERROR+)
+//	Ingester → SpanProducer   → Kafka "spans.all"    ─┐
+//	         → MetricProducer → Kafka "metrics"        ├─→ 다운스트림 javi-forecast
+//	         → LogProducer    → Kafka "logs"          ─┘   (RAG embedder + Forecast 컨슈머)
 //
 // 운영 설정:
 //
 //	KAFKA_ENABLED=true                        (기본: false)
 //	KAFKA_BROKERS=localhost:9092              (콤마 구분 브로커 목록)
-//	KAFKA_TOPIC=spans.error                   (기본값)
+//	KAFKA_TOPIC=spans.all                     (기본값)
 //	KAFKA_METRICS_TOPIC=metrics               (기본값)
 //	KAFKA_LOGS_TOPIC=logs                     (기본값)
-//	KAFKA_RAG_GROUP=rag-embedder              (기본값)
-//	KAFKA_FORECAST_GROUP=forecast-feeder      (기본값)
-//	KAFKA_METRIC_FORECAST_GROUP=metric-forecast-feeder (기본값)
-//	KAFKA_LOG_RAG_GROUP=log-rag-embedder      (기본값)
 package kafka
 
 import (

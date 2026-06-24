@@ -331,13 +331,13 @@ func main() {
 	// Publisher 결정: Kafka 활성화 여부에 따라 팬아웃 방식이 달라진다.
 	//
 	//   KAFKA_ENABLED=false (기본):
-	//     spanPub   → DirectSpanPublisher (RAG)  [+ ForecastForwarder if FORECAST_ENDPOINT 설정]
-	//     metricPub → ForecastForwarder (if FORECAST_ENDPOINT 설정)
+	//     FORECAST_ENDPOINT 설정 시 spanPub·metricPub → ForecastForwarder (직접 HTTP)
+	//     미설정 시 발행 비활성 (ingester가 nil 가드로 스킵)
 	//
 	//   KAFKA_ENABLED=true:
-	//     SpanProducer   → Kafka "spans.error" → [RAG + Forecast consumers]
-	//     MetricProducer → Kafka "metrics"      → [MetricForecast consumer]
-	//     LogProducer    → Kafka "logs"         → [LogRAG consumer]
+	//     SpanProducer   → Kafka "spans.all"   → 다운스트림 컨슈머 (RAG + Forecast)
+	//     MetricProducer → Kafka "metrics"      → 다운스트림 컨슈머 (Forecast)
+	//     LogProducer    → Kafka "logs"         → 다운스트림 컨슈머
 	var spanPub ingester.SpanPublisher
 	var metricPub ingester.MetricPublisher
 	var logPub ingester.LogPublisher

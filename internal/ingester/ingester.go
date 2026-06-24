@@ -63,8 +63,8 @@ var (
 	}, []string{"signal"})
 )
 
-// SpanPublisher는 span 이벤트를 하류(RAG, Forecast 등)로 발행하는 인터페이스다.
-//   - DirectSpanPublisher: 채널 기반 EmbedPipeline에 직접 제출 (Kafka 미사용 시)
+// SpanPublisher는 span 이벤트를 하류(다운스트림 javi-forecast 등)로 발행하는 인터페이스다.
+//   - forecast.ForecastForwarder: javi-forecast로 직접 HTTP 전송 (Kafka 미사용 시)
 //   - kafka.SpanProducer: Kafka 토픽에 발행 (팬아웃 필요 시)
 type SpanPublisher interface {
 	Publish(sp *model.SpanData)
@@ -118,8 +118,8 @@ type Ingester struct {
 }
 
 // New는 Ingester를 생성한다.
-// pub은 nil이면 RAG/Forecast 기능이 비활성화된다.
-// pub이 *DirectSpanPublisher이면 채널 기반 직접 적재, *kafka.SpanProducer이면 Kafka 팬아웃.
+// pub은 nil이면 하류 발행(Forecast/RAG)이 비활성화된다.
+// pub이 *forecast.ForecastForwarder이면 직접 HTTP 전송, *kafka.SpanProducer이면 Kafka 팬아웃.
 func New(ts store.TraceStore, ms store.MetricStore, ls store.LogStore, pub SpanPublisher) *Ingester {
 	return &Ingester{
 		traceStore:  ts,
@@ -286,8 +286,8 @@ func (ing *Ingester) storeSpans(ctx context.Context, spans []*model.SpanData) (i
 		}
 	}
 
-	// RAG / Forecast 파이프라인: span 이벤트를 비동기로 발행 (non-blocking)
-	// SpanPublisher 구현에 따라 직접 EmbedPipeline 제출 또는 Kafka 발행.
+	// 하류 발행: span 이벤트를 비동기로 발행 (non-blocking)
+	// SpanPublisher 구현에 따라 ForecastForwarder 직접 HTTP 전송 또는 Kafka 발행.
 	if ing.spanPub != nil {
 		for _, sp := range spans {
 			ing.spanPub.Publish(sp)
