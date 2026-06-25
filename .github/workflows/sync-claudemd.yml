@@ -1,8 +1,9 @@
 name: Keep CLAUDE.md in sync with PR
 
 # main 대상 PR 이 열리거나 새 커밋이 푸시될 때 동작.
-# ① 기계적 구간: 스크립트가 재생성 (AI 불필요)
-# ② 판단 구간: Claude 가 diff 보고 서술형 내용만 갱신
+# ① 기계적 구간: 스크립트가 CLAUDE.md 의 마커 구간 재생성 (AI 불필요)
+# ② 판단 구간: Claude 가 diff 보고 CLAUDE.md 서술형 내용만 갱신 (AI 에이전트용·간결)
+# ③ 사람용 문서: Claude 가 docs/ARCHITECTURE.md 를 생성/갱신 (사람이 읽기 쉬운 상세 설명)
 # 결과를 같은 PR 브랜치에 커밋한다.
 on:
   pull_request:
@@ -66,13 +67,46 @@ jobs:
           CLAUDE.md 외의 어떤 파일도 수정하지 마라." \
             --allowedTools "Read,Edit,Bash(git diff:*),Bash(git log:*)"
 
-      # ── ①+② 결과를 같은 PR 브랜치에 커밋 ──
+      # ── ③ 사람용 상세 문서: docs/ARCHITECTURE.md 생성/갱신 ──
+      # CLAUDE.md 가 AI 에이전트용 간결 문서라면, 이건 사람이 처음 읽고
+      # 프로젝트 전체를 파악하도록 돕는 풀어쓴 온보딩 문서다.
+      - name: 사람용 문서 갱신 (Claude)
+        if: steps.guard.outputs.skip != 'true' && steps.exists.outputs.ok == 'true'
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          claude -p "이 레포의 사람용 상세 문서 'docs/ARCHITECTURE.md' 를 만들거나 갱신하라.
+
+          [목적] 이 문서는 프로젝트에 처음 합류한 사람 개발자가 코드를 빠르게 파악하도록 돕는다.
+          CLAUDE.md(AI 에이전트용 간결 문서)와 달리, 풀어서 친절하게 설명하는 산문체로 쓴다.
+
+          [작업 방식]
+          - 'docs/ARCHITECTURE.md' 가 없으면: 레포 전체를 Read/Glob/Grep 으로 살펴보고 처음부터 작성하라.
+          - 이미 있으면: 'git diff origin/main...HEAD' 로 이번 PR 변경을 확인하고,
+            그 변경이 영향을 준 부분만 갱신하라. 변경과 무관한 부분은 그대로 두라.
+
+          [포함할 내용]
+          1. 프로젝트가 무엇을 하고 왜 존재하는지(한두 문단)
+          2. 전체 아키텍처 — 주요 컴포넌트와 그들이 어떻게 맞물려 도는지 (가능하면 ASCII 다이어그램)
+          3. 데이터/요청 흐름 — 입력이 들어와 결과가 나오기까지의 경로
+          4. 핵심 디렉터리·모듈별 역할과 책임 (왜 그렇게 나눴는지 포함)
+          5. 로컬 개발 시작법 (필요 도구, 환경, 자주 쓰는 명령)
+          6. 알아두면 좋은 함정·주의사항·설계상 트레이드오프
+
+          [규칙]
+          - 사실에 근거해 쓰고, 추측이면 추측이라고 밝혀라. 코드에 없는 내용을 지어내지 마라.
+          - 'docs/ARCHITECTURE.md' 외의 어떤 파일도 수정하지 마라(특히 CLAUDE.md 는 건드리지 마라).
+          - 문서 맨 위에 '> 이 문서는 PR 마다 자동 생성/갱신됩니다.' 안내 한 줄을 둬라." \
+            --allowedTools "Read,Write,Edit,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(ls:*),Bash(find:*),Bash(cat:*)"
+
+      # ── ①+②+③ 결과를 같은 PR 브랜치에 커밋 ──
       - name: 변경됐으면 커밋
         if: steps.guard.outputs.skip != 'true' && steps.exists.outputs.ok == 'true'
         run: |
-          git diff --quiet -- CLAUDE.md && { echo "변경 없음"; exit 0; }
+          mkdir -p docs
+          git add CLAUDE.md docs/ARCHITECTURE.md 2>/dev/null || true
+          git diff --cached --quiet && { echo "변경 없음"; exit 0; }
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add CLAUDE.md
-          git commit -m "docs: PR 변경 반영해 CLAUDE.md 갱신 [claude-docs]"
+          git commit -m "docs: PR 변경 반영해 CLAUDE.md·ARCHITECTURE.md 갱신 [claude-docs]"
           git push origin HEAD:${{ github.event.pull_request.head.ref }}
