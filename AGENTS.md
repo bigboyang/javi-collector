@@ -26,6 +26,8 @@ javi 관측 데이터 수집기. 들어온 텔레메트리를 처리해 **ClickH
 
 > 코딩 컨벤션·주의사항을 여기에 적어두세요. PR로 코드가 바뀌면 이 영역은 GitHub Actions(Claude)가 자동 보강합니다.
 
+- `AGENTS.md`는 codex용으로 CI가 CLAUDE.md를 그대로 복사하는 미러 파일입니다(파일 상단에 `<!-- AUTO-MIRROR -->` 마커가 있을 때만 동작). 내용을 바꾸려면 CLAUDE.md를 수정하세요, AGENTS.md를 직접 고치지 마세요.
+
 <!-- AUTO-GENERATED:start (스크립트가 관리. 직접 수정 금지) -->
 
 _아래 구간은 스크립트가 자동 생성합니다. 직접 수정하지 마세요._
