@@ -3,6 +3,7 @@ name: Keep CLAUDE.md in sync with PR
 # main 대상 PR 이 열리거나 새 커밋이 푸시될 때 동작.
 # ① 기계적 구간: 스크립트가 재생성 (AI 불필요)
 # ② 판단 구간: Claude 가 diff 보고 서술형 내용만 갱신
+# ③ AGENTS.md 미러: CLAUDE.md 를 codex 용 AGENTS.md 로 복사 (마커 있을 때만)
 # 결과를 같은 PR 브랜치에 커밋한다.
 on:
   pull_request:
@@ -55,7 +56,6 @@ jobs:
         if: steps.guard.outputs.skip != 'true' && steps.exists.outputs.ok == 'true'
         env:
           # Pro/Max 구독 토큰으로 인증 (claude setup-token 으로 발급).
-          # API 크레딧 대신 구독 한도를 사용한다.
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
           claude -p "이 브랜치가 origin/main 대비 바꾼 내용을 'git diff origin/main...HEAD' 로 확인하라.
@@ -66,13 +66,26 @@ jobs:
           CLAUDE.md 외의 어떤 파일도 수정하지 마라." \
             --allowedTools "Read,Edit,Bash(git diff:*),Bash(git log:*)"
 
-      # ── ①+② 결과를 같은 PR 브랜치에 커밋 ──
+      # ── ③ AGENTS.md 미러 (codex용): 마커 있는 경우에만 CLAUDE.md 복사 ──
+      - name: AGENTS.md 미러링
+        if: steps.guard.outputs.skip != 'true' && steps.exists.outputs.ok == 'true'
+        run: |
+          M="<!-- AUTO-MIRROR of CLAUDE.md — 직접 수정 금지 (codex/AGENTS.md) -->"
+          if [ -f AGENTS.md ] && [ "$(head -n1 AGENTS.md)" = "$M" ]; then
+            { printf '%s\n\n' "$M"; cat CLAUDE.md; } > AGENTS.md
+            echo "AGENTS.md 미러링 완료"
+          else
+            echo "AGENTS.md 미러 대상 아님(마커 없음/파일 없음) → 생략"
+          fi
+
+      # ── 결과를 같은 PR 브랜치에 커밋 ──
       - name: 변경됐으면 커밋
         if: steps.guard.outputs.skip != 'true' && steps.exists.outputs.ok == 'true'
         run: |
-          git diff --quiet -- CLAUDE.md && { echo "변경 없음"; exit 0; }
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add CLAUDE.md
-          git commit -m "docs: PR 변경 반영해 CLAUDE.md 갱신 [claude-docs]"
+          [ -f AGENTS.md ] && git add AGENTS.md
+          if git diff --cached --quiet; then echo "변경 없음"; exit 0; fi
+          git commit -m "docs: PR 변경 반영해 CLAUDE.md/AGENTS.md 갱신 [claude-docs]"
           git push origin HEAD:${{ github.event.pull_request.head.ref }}
